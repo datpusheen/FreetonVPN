@@ -3,12 +3,11 @@
   "release_date": "2026-09-01",
   "title": "Freeton VPN Desktop Client v2.4",
   "changelog": [
-    "🚀 Khởi động tức thì (< 0.05s) với bộ nhớ đệm máy chủ (Server Cache)",
-    "🛡️ Đăng nhập an toàn qua Microsoft Edge / SRP và mã hóa Windows Credential Manager",
-    "⚡ Tự động cấp và làm mới cặp khóa WireGuard 1-Click",
-    "🌐 Đo Ping & đề xuất node tối ưu theo thời gian thực (Singapore, Nhật Bản, Hoa Kỳ...)",
-    "🎨 Giao diện bo góc Windows 11 mượt mà kèm nút công tắc iOS Pill Toggle",
-    "🔄 Tích hợp tính năng Tự động kiểm tra & Cập nhật phiên bản mới (Auto-Updater)"
+    "✨ Tích hợp tính năng Tự động kiểm tra & Cập nhật phiên bản mới (Auto-Updater)",
+    "⚙️ Bổ sung tùy chọn bật/tắt tự động cập nhật và nút kiểm tra bản mới trong Cài đặt",
+    "🎨 Tối ưu hóa giao diện thông báo cập nhật chuẩn Fluent Dark Theme bo góc",
+    "🚀 Nâng cao độ ổn định và tối ưu tốc độ làm mới cấu hình WireGuard",
+    "🐛 Sửa một số lỗi nhỏ liên quan đến giao diện và ngắt kết nối an toàn"
   ],
   "download_url": "https://github.com/datpusheen/FreetonVPN/releases/download/v2.4/FreetonVPN.exe",
   "file_size_bytes": 0,
