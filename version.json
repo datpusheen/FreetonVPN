@@ -1,0 +1,16 @@
+{
+  "version": "2.5",
+  "release_date": "2026-09-01",
+  "title": "Bản cập nhật Freeton VPN v2.5",
+  "changelog": [
+    "⚡ Tối ưu thuật toán đo Ping & chọn node nhanh hơn 30%",
+    "🛡️ Tự động làm mới chứng chỉ WireGuard trước khi hết hạn",
+    "🎨 Tinh chỉnh giao diện và sửa lỗi hiển thị trên Windows 11",
+    "🐛 Khắc phục lỗi crash khi chuyển đổi mạng đột ngột"
+  ],
+  "download_url": "https://github.com/your-username/proton-node-checker/releases/download/v2.5/FreetonVPN.exe",
+  "file_size_bytes": 18500000,
+  "sha256": "",
+  "mandatory": false,
+  "min_supported_version": "2.0"
+}
