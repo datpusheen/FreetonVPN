@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Freeton VPN - Client WireGuard Proton VPN Free Tốc Độ Cao Cho Windows</title>
+  <meta name="description" content="Trang chủ chính thức của Freeton VPN by pishun. Client WireGuard Desktop siêu nhẹ, tự động quét và chọn node Proton VPN Free tối ưu nhất cho Windows 10/11." />
+  <meta name="keywords" content="Freeton VPN, Proton VPN Free, WireGuard client, Proton node checker, pishun, VPN miễn phí tốc độ cao, Auto Updater" />
+  <meta name="author" content="pishun" />
+
+  <!-- OpenGraph Metadata -->
+  <meta property="og:title" content="Freeton VPN - Client WireGuard Tốc Độ Cao Cho Proton Free" />
+  <meta property="og:description" content="Khởi động tức thì, tự động quét ping, cấp key WireGuard 1-click và kết nối máy chủ Proton VPN Free nhanh nhất. Hoàn toàn miễn phí & mã nguồn mở." />
+  <meta property="og:type" content="website" />
+  <meta property="og:image" content="assets/images/logo.png" />
+  <meta property="og:url" content="https://github.com/datpusheen/FreetonVPN" />
+
+  <!-- Favicon (Trực tiếp từ freeton_icon.ico) -->
+  <link rel="icon" type="image/x-icon" href="assets/images/favicon.ico" />
+  <link rel="icon" type="image/png" sizes="256x256" href="assets/images/logo.png" />
+  <link rel="apple-touch-icon" href="assets/images/logo.png" />
+
+  <!-- Stylesheet -->
+  <link rel="stylesheet" href="assets/css/style.css" />
+</head>
+<body>
+
+  <!-- ==========================================================================
+       Header / Navigation Bar
+       ========================================================================== -->
+  <header class="site-header">
+    <div class="container nav-container">
+      <a href="#" class="brand-logo">
+        <img src="assets/images/logo.png" alt="Freeton VPN Logo" />
+        <div>
+          <span>Freeton VPN</span>
+          <span class="brand-sub">by pishun</span>
+        </div>
+      </a>
+
+      <!-- Desktop Navigation Menu -->
+      <ul class="nav-menu">
+        <li><a href="#features" class="nav-link">Tính năng</a></li>
+        <li><a href="#download" class="nav-link">Tải xuống</a></li>
+        <li><a href="#releases" class="nav-link">Release Notes</a></li>
+        <li><a href="#credits" class="nav-link">Credits & Pháp lý</a></li>
+      </ul>
+
+      <!-- Action Buttons -->
+      <div class="nav-actions">
+        <a href="https://github.com/datpusheen/FreetonVPN" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+          <span>GitHub</span>
+        </a>
+        <a href="#download" class="btn btn-primary btn-sm">
+          <span>⚡ Tải ngay (v2.4)</span>
+        </a>
+        <button class="mobile-toggle" aria-label="Mở menu điều hướng">
+          <span>☰</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Mobile Drawer Menu -->
+    <div class="mobile-drawer">
+      <a href="#features" class="nav-link">⚡ Tính năng nổi bật</a>
+      <a href="#download" class="nav-link">📥 Tải xuống (GUI Windows v2.4)</a>
+      <a href="#releases" class="nav-link">📋 Release Notes (v2.4)</a>
+      <a href="#credits" class="nav-link">🎖️ Credits & Pháp lý</a>
+      <a href="https://github.com/datpusheen/FreetonVPN" target="_blank" rel="noopener" class="nav-link">⭐ Mã nguồn GitHub</a>
+    </div>
+  </header>
+
+  <!-- ==========================================================================
+       Hero Section
+       ========================================================================== -->
+  <section class="hero-section">
+    <div class="container">
+      <div class="hero-grid">
+        <!-- Hero Left Content -->
+        <div class="hero-content">
+          <div class="badge badge-purple badge-pulse">
+            <span>✨ Phiên bản v2.4 Mới nhất • Hỗ trợ Auto-Updater & Server Cache</span>
+          </div>
+
+          <h1 class="hero-title">
+            Kết nối WireGuard <br />
+            <span class="gradient-text">Proton VPN Miễn Phí</span> <br />
+            Tối Ưu & Siêu Tốc
+          </h1>
+
+          <p class="hero-desc">
+            <strong>Freeton VPN</strong> là ứng dụng Desktop mã nguồn mở dành cho Windows, tự động quét đa luồng độ trễ ICMP và kết nối đường hầm WireGuard đến các máy chủ Proton VPN Free có tải thấp nhất. Khởi động tức thì (&lt; 0.05s) với giao diện Fluent & Material Dark Mode hiện đại.
+          </p>
+
+          <div class="hero-actions">
+            <a href="#download" class="btn btn-glow btn-lg">
+              <span>⬇️ Tải Freeton VPN v2.4 cho Windows</span>
+            </a>
+            <a href="https://github.com/datpusheen/FreetonVPN" target="_blank" rel="noopener" class="btn btn-secondary btn-lg">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+              <span>Xem trên GitHub</span>
+            </a>
+          </div>
+
+          <div class="hero-meta">
+            <div class="hero-meta-item">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+              <span>Không cần cài đặt (Portable .exe)</span>
+            </div>
+            <div class="hero-meta-item">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+              <span>Đăng nhập Edge & SRP 2FA</span>
+            </div>
+            <div class="hero-meta-item">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+              <span>Tự động Cập nhật (Auto-Updater)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Hero Right: Interactive App Mockup -->
+        <div class="mockup-container">
+          <div class="mockup-window">
+            <!-- Mockup Titlebar -->
+            <div class="mockup-titlebar">
+              <div class="mockup-dots">
+                <span class="mockup-dot red"></span>
+                <span class="mockup-dot yellow"></span>
+                <span class="mockup-dot green"></span>
+              </div>
+              <div class="mockup-app-title">
+                <img src="assets/images/logo.png" alt="Freeton Logo Icon" />
+                <span>Freeton VPN by pishun • v2.4</span>
+              </div>
+              <div style="width: 40px;"></div>
+            </div>
+
+            <!-- Mockup Body Content -->
+            <div class="mockup-body">
+              <!-- Active Connection Card -->
+              <div class="mockup-hero-box">
+                <div class="mockup-status-row">
+                  <div class="mockup-status-badge" id="mockupStatus">
+                    <span class="status-dot"></span> ĐÃ KẾT NỐI (BẢO VỆ)
+                  </div>
+                  <!-- Interactive Pill Toggle -->
+                  <div class="mockup-toggle-btn" id="mockupToggle" title="Bấm để bật/tắt kết nối mô phỏng">
+                    <div class="mockup-toggle-thumb"></div>
+                  </div>
+                </div>
+
+                <div class="mockup-current-server">
+                  <div class="server-flag-info">
+                    <span class="server-flag" id="mockupFlag">🇸🇬</span>
+                    <div>
+                      <div class="server-name" id="mockupServerName">SG-FREE#101001</div>
+                      <div class="server-country" id="mockupServerCountry">Singapore (Optimal)</div>
+                    </div>
+                  </div>
+                  <div class="server-stats">
+                    <span class="stat-ping" id="mockupPing">28 ms</span>
+                    <span>•</span>
+                    <span class="stat-load" id="mockupLoad">22% Tải</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Live Node List Preview -->
+              <div class="mockup-list-header">
+                <span>Danh sách Máy chủ Free tối ưu</span>
+                <span class="badge badge-green" style="font-size:0.68rem; padding:0.15rem 0.5rem;">Tự động cập nhật</span>
+              </div>
+
+              <div class="mockup-server-items">
+                <!-- Server 1 (Optimal) -->
+                <div class="mockup-server-row optimal" data-name="SG-FREE#101001" data-country="Singapore" data-flag="🇸🇬" data-ping="28 ms" data-load="22%">
+                  <div class="server-row-left">
+                    <span class="optimal-star">⭐</span>
+                    <span>🇸🇬 SG-FREE#101001</span>
+                  </div>
+                  <div class="server-stats">
+                    <span class="stat-ping">28 ms</span>
+                    <span class="stat-load">22%</span>
+                  </div>
+                </div>
+
+                <!-- Server 2 -->
+                <div class="mockup-server-row" data-name="JP-FREE#201015" data-country="Nhật Bản" data-flag="🇯🇵" data-ping="65 ms" data-load="34%">
+                  <div class="server-row-left">
+                    <span>🇯🇵 JP-FREE#201015</span>
+                  </div>
+                  <div class="server-stats">
+                    <span class="stat-ping">65 ms</span>
+                    <span class="stat-load">34%</span>
+                  </div>
+                </div>
+
+                <!-- Server 3 -->
+                <div class="mockup-server-row" data-name="NL-FREE#128032" data-country="Hà Lan" data-flag="🇳🇱" data-ping="155 ms" data-load="26%">
+                  <div class="server-row-left">
+                    <span>🇳🇱 NL-FREE#128032</span>
+                  </div>
+                  <div class="server-stats">
+                    <span class="stat-ping">155 ms</span>
+                    <span class="stat-load">26%</span>
+                  </div>
+                </div>
+
+                <!-- Server 4 -->
+                <div class="mockup-server-row" data-name="US-FREE#402110" data-country="Hoa Kỳ" data-flag="🇺🇸" data-ping="142 ms" data-load="41%">
+                  <div class="server-row-left">
+                    <span>🇺🇸 US-FREE#402110</span>
+                  </div>
+                  <div class="server-stats">
+                    <span class="stat-ping">142 ms</span>
+                    <span class="stat-load">41%</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==========================================================================
+       Features Section
+       ========================================================================== -->
+  <section class="section" id="features">
+    <div class="container">
+      <div class="section-header">
+        <div class="badge">Đặc điểm công nghệ</div>
+        <h2 class="section-title">Tại sao nên chọn <span class="gradient-text">Freeton VPN</span>?</h2>
+        <p class="section-subtitle">
+          Được tối ưu hóa đặc biệt cho người dùng Proton VPN Free, mang lại tốc độ tối đa, khởi động tức thì và trải nghiệm mượt mà nhất.
+        </p>
+      </div>
+
+      <div class="features-grid">
+        <!-- Feature 1 -->
+        <div class="feature-card">
+          <div class="feature-icon-box">⚡</div>
+          <h3 class="feature-title">Native WireGuard Engine</h3>
+          <p class="feature-desc">
+            Kết nối trực tiếp qua kernel driver WireGuard Windows Service, mang lại băng thông tối đa, ping thấp và độ ổn định vượt trội so với OpenVPN.
+          </p>
+        </div>
+
+        <!-- Feature 2 -->
+        <div class="feature-card">
+          <div class="feature-icon-box feature-icon-purple">🚀</div>
+          <h3 class="feature-title">Khởi động tức thì (&lt; 0.05s)</h3>
+          <p class="feature-desc">
+            Tích hợp bộ nhớ đệm thông minh (Server Cache), khởi chạy ứng dụng là có ngay danh sách máy chủ tối ưu mà không phải chờ quét lại từ đầu.
+          </p>
+        </div>
+
+        <!-- Feature 3 -->
+        <div class="feature-card">
+          <div class="feature-icon-box feature-icon-green">🎯</div>
+          <h3 class="feature-title">Smart Node Finder & Auto Ping</h3>
+          <p class="feature-desc">
+            Quét đa luồng toàn bộ server Tier 0 (Singapore, Nhật Bản, Hoa Kỳ, Hà Lan, Romania...), đo latency thời gian thực và tự động ghim server tốt nhất lên đầu.
+          </p>
+        </div>
+
+        <!-- Feature 4 -->
+        <div class="feature-card">
+          <div class="feature-icon-box">🔑</div>
+          <h3 class="feature-title">Đăng nhập 1-Click tiện lợi</h3>
+          <p class="feature-desc">
+            Hỗ trợ tự động trích xuất phiên đăng nhập từ Microsoft Edge hoặc đăng nhập qua giao thức SRP chuẩn mã hóa của Proton kèm hỗ trợ 2FA.
+          </p>
+        </div>
+
+        <!-- Feature 5 -->
+        <div class="feature-card">
+          <div class="feature-icon-box feature-icon-purple">🔄</div>
+          <h3 class="feature-title">Tự động Cập nhật (Auto-Updater)</h3>
+          <p class="feature-desc">
+            Tích hợp trình kiểm tra và tải cập nhật tự động từ GitHub Releases, giúp bạn luôn sở hữu những tính năng và bản vá mới nhất.
+          </p>
+        </div>
+
+        <!-- Feature 6 -->
+        <div class="feature-card">
+          <div class="feature-icon-box feature-icon-green">🛡️</div>
+          <h3 class="feature-title">Bảo mật & Windows Credential</h3>
+          <p class="feature-desc">
+            Session token được mã hóa và lưu trữ an toàn trong Windows Credential Manager. Mật khẩu không bao giờ được gửi ra ngoài và không lưu logs.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==========================================================================
+       Download Section (Chỉ bản GUI Windows)
+       ========================================================================== -->
+  <section class="section" id="download" style="background: radial-gradient(circle at 50% 50%, rgba(56, 189, 248, 0.04), transparent 70%);">
+    <div class="container">
+      <div class="section-header">
+        <div class="badge badge-green">Tải xuống chính thức</div>
+        <h2 class="section-title">Sẵn sàng trải nghiệm <span class="gradient-text">Freeton VPN</span>?</h2>
+        <p class="section-subtitle">
+          Tải bản cài đặt giao diện đồ họa GUI hoàn chỉnh cho Windows. Tải về và bấm chạy ngay, không cần cài đặt rườm rà.
+        </p>
+      </div>
+
+      <div class="download-card-wrapper">
+        <!-- Main GUI Download Card -->
+        <div class="download-main-card">
+          <div class="download-left">
+            <div class="download-meta-tags">
+              <span class="badge badge-green">v2.4 Mới nhất</span>
+              <span class="badge">Windows GUI</span>
+              <span class="badge badge-purple">Standalone Portable</span>
+            </div>
+
+            <h3 class="download-title">Freeton VPN Desktop Client</h3>
+            <p style="font-size: 0.92rem;">
+              Ứng dụng giao diện đầy đủ tính năng: Tự động đo ping, ghim máy chủ tối ưu, đăng nhập 1-click qua Edge, cấu hình và kích hoạt WireGuard chỉ với một nút gạt.
+            </p>
+
+            <div class="download-specs">
+              <div class="spec-row">
+                <span>Tên file:</span>
+                <strong>FreetonVPN.exe</strong>
+              </div>
+              <div class="spec-row">
+                <span>Phiên bản:</span>
+                <strong>v2.4 (Build 2026-09-01)</strong>
+              </div>
+              <div class="spec-row">
+                <span>Hệ điều hành:</span>
+                <strong>Windows 10 / Windows 11 (64-bit)</strong>
+              </div>
+              <div class="spec-row">
+                <span>Cập nhật:</span>
+                <strong>Tích hợp Auto-Updater qua GitHub</strong>
+              </div>
+            </div>
+          </div>
+
+          <div class="download-right">
+            <div class="download-icon-large">
+              <img src="assets/images/logo.png" alt="Freeton Icon" />
+            </div>
+
+            <div class="download-actions">
+              <a href="https://github.com/datpusheen/FreetonVPN/releases/download/v2.4/FreetonVPN.exe" class="btn btn-glow btn-lg" style="width:100%;">
+                <span>⚡ Tải FreetonVPN.exe (v2.4)</span>
+              </a>
+              <a href="dist/FreetonVPN.exe" download="FreetonVPN.exe" class="btn btn-secondary btn-sm" style="width:100%;">
+                <span>📦 Tải trực tiếp (Local Build)</span>
+              </a>
+            </div>
+
+            <div class="download-note">
+              <span>✓ Đã được kiểm duyệt an toàn, không chứa phần mềm độc hại.</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 3-Step Setup Guide -->
+        <div class="setup-steps-box">
+          <div class="setup-steps-title">
+            <span>🚀 3 Bước đơn giản để sử dụng Freeton VPN:</span>
+          </div>
+
+          <div class="steps-grid">
+            <div class="step-card">
+              <div class="step-num">1</div>
+              <div class="step-heading">Tải xuống file EXE</div>
+              <div class="step-text">Bấm nút tải file <code>FreetonVPN.exe</code> ở trên và lưu vào thư mục bất kỳ trên máy tính.</div>
+            </div>
+
+            <div class="step-card">
+              <div class="step-num">2</div>
+              <div class="step-heading">Đăng nhập tài khoản</div>
+              <div class="step-text">Mở ứng dụng, chọn <em>"Đăng nhập qua Edge"</em> hoặc nhập tài khoản Proton để ứng dụng đồng bộ danh sách node.</div>
+            </div>
+
+            <div class="step-card">
+              <div class="step-num">3</div>
+              <div class="step-heading">Gạt công tắc & Kết nối</div>
+              <div class="step-text">Chọn máy chủ (hoặc để tự động chọn server tốt nhất) và gạt công tắc để bắt đầu bảo vệ kết nối internet!</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==========================================================================
+       Release Notes Section
+       ========================================================================== -->
+  <section class="section" id="releases">
+    <div class="container">
+      <div class="section-header">
+        <div class="badge badge-purple">Nhật ký phiên bản</div>
+        <h2 class="section-title">Lịch sử phát triển & <span class="gradient-text">Release Notes</span></h2>
+        <p class="section-subtitle">
+          Theo dõi các bước tiến và cập nhật tính năng mới nhất của Freeton VPN qua từng giai đoạn phát triển.
+        </p>
+      </div>
+
+      <div class="release-timeline">
+        <!-- Release v2.4 -->
+        <div class="release-item">
+          <div class="release-marker"></div>
+          <div class="release-card">
+            <div class="release-card-header">
+              <div class="release-version-row">
+                <span class="release-ver">Freeton VPN v2.4</span>
+                <span class="badge badge-green">Bản mới nhất</span>
+              </div>
+              <span class="release-date">01/09/2026</span>
+            </div>
+
+            <ul class="release-list">
+              <li>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                <span><strong>Khởi động tức thì (&lt; 0.05s):</strong> Tích hợp bộ nhớ đệm máy chủ (Server Cache), khởi động app lập tức có ngay node tối ưu.</span>
+              </li>
+              <li>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                <span><strong>Tích hợp Auto-Updater:</strong> Tự động kiểm tra phiên bản mới từ GitHub Releases và hỗ trợ nâng cấp 1-click liền mạch.</span>
+              </li>
+              <li>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                <span><strong>Xuất cấu hình WireGuard (.conf):</strong> Cho phép xuất tệp cấu hình WireGuard để dễ dàng dùng cho điện thoại hoặc router.</span>
+              </li>
+              <li>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                <span><strong>Mở rộng Node khu vực Châu Á:</strong> Hỗ trợ đo Ping và tối ưu hoá đường truyền cho các node Singapore, Nhật Bản.</span>
+              </li>
+            </ul>
+          </div>
+        </div>
+
+        <!-- Release v2.2 -->
+        <div class="release-item past">
+          <div class="release-marker"></div>
+          <div class="release-card">
+            <div class="release-card-header">
+              <div class="release-version-row">
+                <span class="release-ver">Freeton VPN v2.2</span>
+                <span class="badge">Stable</span>
+              </div>
+              <span class="release-date">31/08/2026</span>
+            </div>
+
+            <ul class="release-list">
+              <li>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                <span><strong>Login Gate Screen:</strong> Bổ sung màn hình đăng nhập chuyên nghiệp, hỗ trợ tự động lấy cookie phiên từ Microsoft Edge hoặc đăng nhập SRP tài khoản/mật khẩu + 2FA.</span>
+              </li>
+              <li>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                <span><strong>Giao diện Rounded Squircle & iOS Pill Toggle:</strong> Thiết kế bo góc mềm mại chuẩn Windows 11 và công tắc dạng viên thuốc chống răng cưa mượt mà.</span>
+              </li>
+              <li>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                <span><strong>Phát hiện Server Tối ưu nhất:</strong> Tự động tìm kiếm và đóng khung nổi bật máy chủ <em>"⭐ Tối ưu nhất"</em> lên vị trí đầu tiên.</span>
+              </li>
+            </ul>
+          </div>
+        </div>
+
+        <!-- Release v2.1 -->
+        <div class="release-item past">
+          <div class="release-marker"></div>
+          <div class="release-card">
+            <div class="release-card-header">
+              <div class="release-version-row">
+                <span class="release-ver">Freeton VPN v2.1</span>
+                <span class="badge">WireGuard Auto</span>
+              </div>
+              <span class="release-date">Tháng 07/2026</span>
+            </div>
+
+            <ul class="release-list">
+              <li>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                <span><strong>WireGuard Service Integration:</strong> Tự động khởi chạy và điều khiển dịch vụ Windows Service <code>WireGuardTunnel$FreetonVPN</code> trực tiếp.</span>
+              </li>
+              <li>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                <span><strong>Tự động tạo Key WireGuard:</strong> Kết nối API Proton để tự động sinh khóa phiên X25519 và cấu hình tệp <code>.conf</code> chuẩn xác.</span>
+              </li>
+              <li>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                <span><strong>Khay hệ thống (System Tray):</strong> Bổ sung khả năng thu nhỏ cửa sổ xuống khay hệ thống, chạy ngầm tiện lợi.</span>
+              </li>
+            </ul>
+          </div>
+        </div>
+
+        <!-- Release v2.0 -->
+        <div class="release-item past">
+          <div class="release-marker"></div>
+          <div class="release-card">
+            <div class="release-card-header">
+              <div class="release-version-row">
+                <span class="release-ver">Freeton VPN v2.0</span>
+                <span class="badge">First GUI</span>
+              </div>
+              <span class="release-date">Tháng 06/2026</span>
+            </div>
+
+            <ul class="release-list">
+              <li>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                <span>Ra mắt giao diện người dùng đồ họa Desktop GUI Dark Theme đầu tiên.</span>
+              </li>
+              <li>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                <span>Tích hợp tính năng đo Ping ICMP đa luồng thời gian thực cho từng node.</span>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==========================================================================
+       Credits & Legal Disclaimer Section
+       ========================================================================== -->
+  <section class="section" id="credits" style="background: rgba(0,0,0,0.2);">
+    <div class="container">
+      <div class="section-header">
+        <div class="badge">Ghi nhận đóng góp</div>
+        <h2 class="section-title">Tác giả & <span class="gradient-text">Tuyên bố Pháp lý</span></h2>
+        <p class="section-subtitle">
+          Thông tin bản quyền tác giả và nguồn gốc các thư viện công nghệ cấu thành Freeton VPN.
+        </p>
+      </div>
+
+      <div class="credits-wrapper">
+        <div class="credits-grid">
+          <!-- Author Card -->
+          <div class="credit-card">
+            <div class="author-header">
+              <div class="author-avatar">P</div>
+              <div class="author-info">
+                <h4>pishun (@datpusheen)</h4>
+                <p>Nhà phát triển chính & Tác giả dự án Freeton VPN</p>
+              </div>
+            </div>
+            <p style="font-size: 0.9rem;">
+              Dự án được xây dựng với mục tiêu mang đến cho cộng đồng công cụ kết nối mạng riêng ảo mã nguồn mở, an toàn, ổn định và không thu thập dữ liệu cá nhân.
+            </p>
+            <div>
+              <a href="https://github.com/datpusheen/FreetonVPN" target="_blank" rel="noopener" class="btn btn-outline btn-sm">
+                <span>⭐ Theo dõi trên GitHub</span>
+              </a>
+            </div>
+          </div>
+
+          <!-- Technologies Card -->
+          <div class="credit-card">
+            <h4 style="font-size:1.15rem; margin-bottom: 0.5rem;">Công nghệ & Thư viện sử dụng</h4>
+            <p style="font-size: 0.85rem; color:var(--text-muted); margin-bottom: 1rem;">
+              Chân thành cảm ơn các dự án mã nguồn mở tuyệt vời:
+            </p>
+            <div class="tech-tags">
+              <span class="tech-tag">Python 3.10+</span>
+              <span class="tech-tag">WireGuard Windows</span>
+              <span class="tech-tag">proton-core (SRP)</span>
+              <span class="tech-tag">Playwright</span>
+              <span class="tech-tag">Cryptography (X25519)</span>
+              <span class="tech-tag">Windows Keyring</span>
+              <span class="tech-tag">Pillow (PIL)</span>
+              <span class="tech-tag">PyInstaller</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Legal Disclaimer Box -->
+        <div class="disclaimer-card">
+          <div class="disclaimer-icon">⚠️</div>
+          <div class="disclaimer-content">
+            <h4>TUYÊN BỐ PHÁP LÝ & MIỄN TRỪ TRÁCH NHIỆM (LEGAL DISCLAIMER)</h4>
+            <p>
+              <strong>Freeton VPN</strong> là một dự án mã nguồn mở độc lập và <strong>KHÔNG</strong> thuộc sở hữu, <strong>KHÔNG</strong> liên kết, cũng như <strong>KHÔNG</strong> được ủy quyền hay tài trợ bởi Proton AG hoặc Proton VPN. Tất cả tên nhãn hiệu, logo và thương hiệu liên quan (bao gồm Proton, Proton VPN, WireGuard) đều thuộc quyền sở hữu của các chủ sở hữu tương ứng. Phần mềm được cung cấp dưới dạng <em>"AS IS"</em> (nguyên trạng) nhằm mục đích học tập và nghiên cứu công nghệ.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==========================================================================
+       Site Footer
+       ========================================================================== -->
+  <footer class="site-footer">
+    <div class="container">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <div class="brand-logo">
+            <img src="assets/images/logo.png" alt="Freeton VPN Logo" />
+            <span>Freeton VPN</span>
+          </div>
+          <p class="footer-desc">
+            Client WireGuard Desktop siêu nhẹ, tự động chọn node tối ưu cho các cụm máy chủ Proton VPN Free.
+          </p>
+        </div>
+
+        <div class="footer-col">
+          <h5>Liên kết nhanh</h5>
+          <ul class="footer-links">
+            <li><a href="#features">Tính năng nổi bật</a></li>
+            <li><a href="#download">Tải xuống (GUI Windows v2.4)</a></li>
+            <li><a href="#releases">Release Notes (v2.4)</a></li>
+            <li><a href="#credits">Credits & Tác giả</a></li>
+          </ul>
+        </div>
+
+        <div class="footer-col">
+          <h5>Dự án & Cộng đồng</h5>
+          <ul class="footer-links">
+            <li><a href="https://github.com/datpusheen/FreetonVPN" target="_blank" rel="noopener">Mã nguồn GitHub</a></li>
+            <li><a href="https://github.com/datpusheen/FreetonVPN/releases" target="_blank" rel="noopener">GitHub Releases</a></li>
+            <li><a href="#credits">Tuyên bố pháp lý</a></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="footer-bottom">
+        <div>
+          <span>© 2026 <strong>Freeton VPN</strong> by pishun. All rights reserved.</span>
+        </div>
+        <div class="back-to-top">
+          <span>Lên đầu trang</span>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15"></polyline></svg>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <!-- JavaScript -->
+  <script src="assets/js/main.js"></script>
+</body>
+</html>
