@@ -10,8 +10,8 @@
     "🐛 Sửa một số lỗi nhỏ liên quan đến giao diện và ngắt kết nối an toàn"
   ],
   "download_url": "https://github.com/datpusheen/FreetonVPN/releases/download/v2.4/FreetonVPN.exe",
-  "file_size_bytes": 0,
-  "sha256": "",
+  "file_size_bytes": 68945803,
+  "sha256": "03c0275b2a2b06f4927611a295bf3955de639a4044181184ac08fae0f3af4738",
   "mandatory": false,
   "min_supported_version": "2.0"
 }
