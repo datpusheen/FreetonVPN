@@ -1,17 +1,15 @@
 {
-  "version": "2.4",
-  "release_date": "2026-09-01",
-  "title": "Freeton VPN Desktop Client v2.4",
+  "version": "2.4.1",
+  "release_date": "2026-09-03",
+  "title": "Freeton VPN Desktop Client v2.4.1",
   "changelog": [
-    "✨ Tích hợp tính năng Tự động kiểm tra & Cập nhật phiên bản mới (Auto-Updater)",
-    "⚙️ Bổ sung tùy chọn bật/tắt tự động cập nhật và nút kiểm tra bản mới trong Cài đặt",
-    "🎨 Tối ưu hóa giao diện thông báo cập nhật chuẩn Fluent Dark Theme bo góc",
-    "🚀 Nâng cao độ ổn định và tối ưu tốc độ làm mới cấu hình WireGuard",
-    "🐛 Sửa một số lỗi nhỏ liên quan đến giao diện và ngắt kết nối an toàn"
+    "🐛 Khắc phục sự cố xác thực mã hóa SRP (Secure Remote Password) khi đăng nhập",
+    "🛡️ Tối ưu hóa tương tác với GnuPG trong việc xử lý khóa mật mã",
+    "🚀 Cải thiện độ ổn định và tốc độ đăng nhập bằng tài khoản/mật khẩu trực tiếp"
   ],
-  "download_url": "https://github.com/datpusheen/FreetonVPN/releases/download/v2.4/FreetonVPN.exe",
+  "download_url": "https://github.com/datpusheen/FreetonVPN/releases/download/v2.4.1/FreetonVPN.exe",
   "file_size_bytes": 68945803,
-  "sha256": "03c0275b2a2b06f4927611a295bf3955de639a4044181184ac08fae0f3af4738",
+  "sha256": "e50c44325c1a092f6b410f611015e7926a5ebb332879464b463926cd6e71e594",
   "mandatory": false,
   "min_supported_version": "2.0"
 }
