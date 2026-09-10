@@ -1,15 +1,20 @@
 {
-  "version": "2.4.1",
-  "release_date": "2026-09-03",
-  "title": "Freeton VPN Desktop Client v2.4.1",
+  "version": "2.4.2",
+  "release_date": "2026-09-10",
+  "title": "Freeton VPN Desktop Client v2.4.2",
   "changelog": [
-    "🐛 Khắc phục sự cố xác thực mã hóa SRP (Secure Remote Password) khi đăng nhập",
-    "🛡️ Tối ưu hóa tương tác với GnuPG trong việc xử lý khóa mật mã",
-    "🚀 Cải thiện độ ổn định và tốc độ đăng nhập bằng tài khoản/mật khẩu trực tiếp"
+    "✅ Xác minh kết nối bằng handshake đúng peer và DNS qua WireGuard thay vì chỉ dựa vào trạng thái service",
+    "🛡️ Ổn định hóa thao tác kết nối/ngắt kết nối, dọn tunnel và xử lý Windows Service",
+    "⚡ Cải thiện quét server, đo ping, tính điểm tải và giữ lựa chọn server thủ công",
+    "🎨 Tối ưu animation, trạng thái giao diện và đóng ứng dụng an toàn hơn",
+    "📦 Bản dựng Windows độc lập, đã kèm đầy đủ Tcl/Tk"
   ],
-  "download_url": "https://github.com/datpusheen/FreetonVPN/releases/download/v2.4.1/FreetonVPN.exe",
-  "file_size_bytes": 68945803,
-  "sha256": "e50c44325c1a092f6b410f611015e7926a5ebb332879464b463926cd6e71e594",
+  "download_url": "https://github.com/datpusheen/FreetonVPN/releases/download/v2.4.2/FreetonVPN.exe",
+  "file_size_bytes": 68533168,
+  "sha256": "CC41541A17FCAACD49191FA5E624571445513CA20C7E37C9633C9D643A8872E3",
   "mandatory": false,
-  "min_supported_version": "2.0"
+  "min_supported_version": "2.0",
+  "ui_version": "2.4.2",
+  "ui_build_date": "2026-09-10",
+  "release_status": "published"
 }
