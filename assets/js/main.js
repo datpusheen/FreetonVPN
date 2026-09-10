@@ -4,12 +4,60 @@
  */
 
 document.addEventListener('DOMContentLoaded', () => {
+  initSiteMetadata();
   initNavbar();
   initMockupInteractive();
   initCopyButtons();
   initBackToTop();
   initSmoothScroll();
+  initScrollProgress();
+  initScrollReveal();
+  initCardSpotlight();
 });
+
+/* ========================================================================== 
+   Shared release metadata
+   ========================================================================== */
+async function initSiteMetadata() {
+  const fallback = {
+    ui_version: '2.4.2',
+    ui_build_date: '2026-09-10',
+    published_version: '2.4.1',
+    release_status: 'local-build',
+    download_url: 'https://github.com/datpusheen/FreetonVPN/releases/latest/download/FreetonVPN.exe',
+    local_build_url: '../dist/FreetonVPN.exe'
+  };
+
+  let metadata = fallback;
+  try {
+    const response = await fetch('assets/site.json', { cache: 'no-store' });
+    if (response.ok) metadata = { ...fallback, ...(await response.json()) };
+  } catch (_) {
+    // Opening index.html directly has no fetch origin; static fallback remains usable.
+  }
+
+  document.querySelectorAll('[data-site-version]').forEach(el => {
+    el.textContent = metadata.ui_version;
+  });
+  document.querySelectorAll('[data-site-build-date]').forEach(el => {
+    if (el.tagName === 'STRONG' || el.closest('.spec-row')) {
+      el.textContent = metadata.ui_build_date;
+    } else {
+      const date = new Date(`${metadata.ui_build_date}T00:00:00`);
+      el.textContent = Number.isNaN(date.getTime()) ? metadata.ui_build_date : date.toLocaleDateString('vi-VN');
+    }
+  });
+
+  const status = document.querySelector('[data-site-status] span');
+  if (status) {
+    status.textContent = metadata.release_status === 'local-build'
+      ? `Bản Windows hiện tại · UI ${metadata.ui_version} · đang hoàn thiện phát hành`
+      : `Bản ${metadata.published_version} · Windows desktop`;
+  }
+  document.querySelectorAll('[data-download-link]').forEach(link => {
+    link.href = metadata.download_url;
+  });
+}
 
 /* ==========================================================================
    Navbar & Mobile Menu
@@ -63,20 +111,29 @@ function initMockupInteractive() {
   const serverRows = document.querySelectorAll('.mockup-server-row');
 
   let isConnected = true;
+  let transitionTimer = null;
 
   if (toggleBtn) {
     toggleBtn.addEventListener('click', () => {
+      if (transitionTimer) clearTimeout(transitionTimer);
       isConnected = !isConnected;
+
       if (isConnected) {
         toggleBtn.classList.remove('off');
-        statusBadge.innerHTML = '<span class="status-dot"></span> ĐÃ KẾT NỐI (BẢO VỆ)';
-        statusBadge.style.color = '#34d399';
-        showToast('⚡ Freeton VPN: Đã kích hoạt kết nối WireGuard an toàn!');
+        // Show realistic quick connecting state
+        statusBadge.innerHTML = '<span class="status-dot connecting"></span> ĐANG KẾT NỐI...';
+        statusBadge.style.color = '#eab308';
+        
+        transitionTimer = setTimeout(() => {
+          statusBadge.innerHTML = '<span class="status-dot"></span> ĐÃ KẾT NỐI';
+          statusBadge.style.color = '#8bd5c5';
+          showToast('Đã kết nối WireGuard thành công.');
+        }, 320);
       } else {
         toggleBtn.classList.add('off');
-        statusBadge.innerHTML = '<span class="status-dot" style="background:#64748b; box-shadow:none;"></span> CHƯA KẾT NỐI';
+        statusBadge.innerHTML = '<span class="status-dot disconnected"></span> CHƯA KẾT NỐI';
         statusBadge.style.color = '#94a3b8';
-        showToast('Freeton VPN: Đã ngắt kết nối đường hầm WireGuard.');
+        showToast('Đã ngắt kết nối WireGuard.');
       }
     });
   }
@@ -84,6 +141,9 @@ function initMockupInteractive() {
   // Allow clicking mock server rows
   serverRows.forEach(row => {
     row.addEventListener('click', () => {
+      serverRows.forEach(r => r.classList.remove('active-selection'));
+      row.classList.add('active-selection');
+
       const name = row.getAttribute('data-name');
       const country = row.getAttribute('data-country');
       const flag = row.getAttribute('data-flag');
@@ -99,10 +159,30 @@ function initMockupInteractive() {
       if (!isConnected && toggleBtn) {
         toggleBtn.click();
       } else {
-        showToast(`Đã chuyển sang máy chủ ${name} (${country}) - ${ping}`);
+        showToast(`Đã chọn ${name} · ${ping}`);
       }
     });
   });
+
+  // Windows caption controls feedback
+  const winClose = document.querySelector('.mockup-win-btn.mockup-win-close');
+  if (winClose) {
+    winClose.addEventListener('click', () => {
+      showToast('Cửa sổ sẽ thu nhỏ xuống khay hệ thống (System Tray).');
+    });
+  }
+
+  // Micro live-ping fluctuation simulation to give a real-time responsive feel
+  setInterval(() => {
+    if (!isConnected || !statPing) return;
+    const match = statPing.textContent.match(/^(\d+)\s*ms$/);
+    if (match) {
+      const currentVal = parseInt(match[1], 10);
+      const diff = (Math.random() > 0.5 ? 1 : -1) * (Math.random() < 0.35 ? 1 : 0);
+      const nextVal = Math.max(18, currentVal + diff);
+      statPing.textContent = `${nextVal} ms`;
+    }
+  }, 3800);
 }
 
 /* ==========================================================================
@@ -120,13 +200,13 @@ function initCopyButtons() {
       if (!textToCopy) return;
 
       navigator.clipboard.writeText(textToCopy).then(() => {
-        showToast(`✔ Đã sao chép ${label}: "${textToCopy}" vào bộ nhớ tạm!`);
+        showToast(`Đã sao chép ${label}.`);
         
         // Button visual feedback
         const originalText = btn.innerHTML;
         btn.innerHTML = '✔ Đã sao chép';
-        btn.style.borderColor = '#10b981';
-        btn.style.color = '#34d399';
+        btn.style.borderColor = '#8bd5c5';
+        btn.style.color = '#8bd5c5';
 
         setTimeout(() => {
           btn.innerHTML = originalText;
@@ -153,7 +233,12 @@ function showToast(message) {
 
   const toast = document.createElement('div');
   toast.className = 'toast';
-  toast.innerHTML = `<span>⚡</span> <span>${message}</span>`;
+  const icon = document.createElement('span');
+  icon.className = 'toast-mark';
+  icon.textContent = '·';
+  const content = document.createElement('span');
+  content.textContent = message;
+  toast.append(icon, content);
   container.appendChild(toast);
 
   setTimeout(() => {
@@ -193,5 +278,93 @@ function initSmoothScroll() {
         });
       }
     });
+  });
+}
+
+/* ==========================================================================
+   Scroll Progress Indicator
+   ========================================================================== */
+function initScrollProgress() {
+  const progressBar = document.getElementById('scrollProgressBar');
+  if (!progressBar) return;
+
+  let ticking = false;
+  const updateProgress = () => {
+    const scrollTop = window.scrollY || document.documentElement.scrollTop;
+    const docHeight = document.documentElement.scrollHeight - window.innerHeight;
+    const scrollPercent = docHeight > 0 ? (scrollTop / docHeight) * 100 : 0;
+    progressBar.style.width = `${Math.min(100, Math.max(0, scrollPercent))}%`;
+    ticking = false;
+  };
+
+  window.addEventListener('scroll', () => {
+    if (!ticking) {
+      window.requestAnimationFrame(updateProgress);
+      ticking = true;
+    }
+  }, { passive: true });
+
+  updateProgress();
+}
+
+/* ==========================================================================
+   Intersection Observer Scroll Reveal System
+   ========================================================================== */
+function initScrollReveal() {
+  const revealElements = document.querySelectorAll('.reveal');
+  if (!revealElements.length) return;
+
+  // If user prefers reduced motion or no IntersectionObserver support, reveal instantly
+  const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (prefersReducedMotion || !('IntersectionObserver' in window)) {
+    revealElements.forEach(el => el.classList.add('is-revealed'));
+    return;
+  }
+
+  // Auto-calculate stagger delays for child elements in .stagger-group
+  document.querySelectorAll('.stagger-group').forEach(group => {
+    const items = group.querySelectorAll('.reveal');
+    items.forEach((item, index) => {
+      const delay = Math.min(index * 90, 600);
+      item.style.setProperty('--stagger-delay', `${delay}ms`);
+    });
+  });
+
+  const observerOptions = {
+    root: null,
+    rootMargin: '0px 0px -40px 0px',
+    threshold: 0.08
+  };
+
+  const observer = new IntersectionObserver((entries, obs) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('is-revealed');
+        obs.unobserve(entry.target);
+      }
+    });
+  }, observerOptions);
+
+  revealElements.forEach(el => observer.observe(el));
+}
+
+/* ==========================================================================
+   Interactive Card Mouse Spotlight
+   ========================================================================== */
+function initCardSpotlight() {
+  if (!window.matchMedia('(hover: hover) and (pointer: fine)').matches) return;
+
+  const cards = document.querySelectorAll(
+    '.feature-card, .step-card, .release-card, .credit-card, .download-main-card'
+  );
+
+  cards.forEach(card => {
+    card.addEventListener('mousemove', (e) => {
+      const rect = card.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      card.style.setProperty('--mouse-x', `${x}px`);
+      card.style.setProperty('--mouse-y', `${y}px`);
+    }, { passive: true });
   });
 }

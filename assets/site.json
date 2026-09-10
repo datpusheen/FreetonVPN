@@ -1,0 +1,20 @@
+{
+  "product": "Freeton VPN",
+  "author": "pishun",
+  "ui_version": "2.4.2",
+  "ui_build_date": "2026-09-10",
+  "published_version": "2.4.1",
+  "published_date": "2026-09-03",
+  "release_status": "local-build",
+  "download_url": "https://github.com/datpusheen/FreetonVPN/releases/latest/download/FreetonVPN.exe",
+  "source_url": "https://github.com/datpusheen/FreetonVPN",
+  "local_build_url": "https://github.com/datpusheen/FreetonVPN/releases",
+  "platform": "Windows 10/11 · 64-bit",
+  "features": [
+    "WireGuard native",
+    "Server cache",
+    "Auto ping & node selection",
+    "Edge login / SRP 2FA",
+    "WireGuard config export"
+  ]
+}
