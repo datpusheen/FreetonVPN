@@ -1,20 +1,19 @@
 {
-  "version": "2.4.2",
-  "release_date": "2026-09-10",
-  "title": "Freeton VPN Desktop Client v2.4.2",
+  "version": "2.4.3",
+  "release_date": "2026-10-12",
+  "title": "Freeton VPN Desktop Client v2.4.3",
   "changelog": [
-    "✅ Xác minh kết nối bằng handshake đúng peer và DNS qua WireGuard thay vì chỉ dựa vào trạng thái service",
-    "🛡️ Ổn định hóa thao tác kết nối/ngắt kết nối, dọn tunnel và xử lý Windows Service",
-    "⚡ Cải thiện quét server, đo ping, tính điểm tải và giữ lựa chọn server thủ công",
-    "🎨 Tối ưu animation, trạng thái giao diện và đóng ứng dụng an toàn hơn",
-    "📦 Bản dựng Windows độc lập, đã kèm đầy đủ Tcl/Tk"
+    "🔧 Cập nhật bản Windows hiện tại đã được xác nhận kết nối WireGuard thành công",
+    "✅ Xác minh handshake đúng peer và DNS qua tunnel trước khi báo kết nối",
+    "🛡️ Giữ xử lý an toàn khi cài, xác minh và dọn WireGuard tunnel",
+    "📦 Bản dựng Windows độc lập, kèm đầy đủ Tcl/Tk"
   ],
-  "download_url": "https://github.com/datpusheen/FreetonVPN/releases/download/v2.4.2/FreetonVPN.exe",
-  "file_size_bytes": 68533168,
-  "sha256": "CC41541A17FCAACD49191FA5E624571445513CA20C7E37C9633C9D643A8872E3",
+  "download_url": "https://github.com/datpusheen/FreetonVPN/releases/download/v2.4.3/FreetonVPN.exe",
+  "file_size_bytes": 68524108,
+  "sha256": "212536DE099D5D0D2AFC9928D214E098CC3FF1462111B6F06F320241089F1C99",
   "mandatory": false,
   "min_supported_version": "2.0",
-  "ui_version": "2.4.2",
-  "ui_build_date": "2026-09-10",
+  "ui_version": "2.4.3",
+  "ui_build_date": "2026-10-12",
   "release_status": "published"
 }
