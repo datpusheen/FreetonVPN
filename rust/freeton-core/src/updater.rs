@@ -414,14 +414,36 @@ pub fn compute_file_sha256(file_path: &Path) -> Result<String, UpdateError> {
     Ok(encode_hex_lower(&hasher.finalize()))
 }
 
-fn build_updater_client() -> Result<Client, UpdateError> {
+/// HTTP connect timeout for update manifest and installer requests.
+pub const UPDATER_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Per-chunk socket read idle timeout during streaming installer downloads.
+pub const UPDATER_READ_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Overall maximum wall-clock ceiling for a full installer download (15 minutes).
+pub const UPDATER_TOTAL_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(900);
+
+fn build_updater_client_with(
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    total_timeout: Duration,
+) -> Result<Client, UpdateError> {
     Ok(Client::builder()
-        .connect_timeout(Duration::from_secs(8))
-        .timeout(Duration::from_secs(20))
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .timeout(total_timeout)
         .user_agent(format!(
             "FreetonVPN-Desktop-Updater/{APP_VERSION} (Windows)"
         ))
         .build()?)
+}
+
+fn build_updater_client() -> Result<Client, UpdateError> {
+    build_updater_client_with(
+        UPDATER_CONNECT_TIMEOUT,
+        UPDATER_READ_TIMEOUT,
+        UPDATER_TOTAL_DOWNLOAD_TIMEOUT,
+    )
 }
 
 fn cache_busted_url(raw_url: &str) -> String {
@@ -606,6 +628,21 @@ pub async fn download_and_verify_update(
     dest_dir: &Path,
     on_progress: impl Fn(u64, u64, f32),
 ) -> Result<UpdateAction, UpdateError> {
+    if !is_valid_sha256_hex(&info.sha256) {
+        return Ok(UpdateAction::OpenReleasePageInBrowser(release_page_url(
+            info,
+        )));
+    }
+    let client = build_updater_client()?;
+    download_and_verify_update_with_client(&client, info, dest_dir, on_progress).await
+}
+
+async fn download_and_verify_update_with_client(
+    client: &Client,
+    info: &UpdateInfo,
+    dest_dir: &Path,
+    on_progress: impl Fn(u64, u64, f32),
+) -> Result<UpdateAction, UpdateError> {
     let expected_sha = info.sha256.trim().to_ascii_lowercase();
     if !is_valid_sha256_hex(&expected_sha) {
         return Ok(UpdateAction::OpenReleasePageInBrowser(release_page_url(
@@ -623,7 +660,6 @@ pub async fn download_and_verify_update(
         let _ = fs::remove_file(&part_path);
     }
 
-    let client = build_updater_client()?;
     let mut response = client.get(download_url).send().await?.error_for_status()?;
     let total_size = response.content_length().unwrap_or(info.file_size_bytes);
 
@@ -1102,6 +1138,121 @@ mod tests {
 
         drop(recorded);
         let _ = fs::remove_dir_all(&dest_dir);
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_multi_chunk_streaming_respects_read_timeout_and_cleans_up_on_stall() {
+        assert_eq!(UPDATER_CONNECT_TIMEOUT, Duration::from_secs(8));
+        assert_eq!(UPDATER_READ_TIMEOUT, Duration::from_secs(20));
+        assert!(UPDATER_TOTAL_DOWNLOAD_TIMEOUT >= Duration::from_secs(600));
+
+        let chunks: [&[u8]; 5] = [
+            b"CHUNK1-",
+            b"CHUNK2-",
+            b"CHUNK3-",
+            b"CHUNK4-",
+            b"CHUNK5-FINAL",
+        ];
+        let full_payload: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        let expected_sha = encode_hex_lower(&Sha256::digest(&full_payload));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let base_url = format!("http://{addr}");
+        let payload_len = full_payload.len();
+
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let req = read_http_request(&mut socket).await;
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("");
+
+                    if path == "/slow-but-alive.exe" {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {payload_len}\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = socket.write_all(header.as_bytes()).await;
+                        for part in chunks {
+                            tokio::time::sleep(Duration::from_millis(55)).await;
+                            if socket.write_all(part).await.is_err() {
+                                break;
+                            }
+                            let _ = socket.flush().await;
+                        }
+                    } else if path == "/stalled.exe" {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {payload_len}\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = socket.write_all(header.as_bytes()).await;
+                        let _ = socket.write_all(chunks[0]).await;
+                        let _ = socket.flush().await;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                });
+            }
+        });
+
+        // Read timeout (140ms) is shorter than total slow transfer (~275ms across 5 chunks),
+        // proving `read_timeout` resets per chunk instead of enforcing a short total deadline.
+        let client = build_updater_client_with(
+            Duration::from_secs(2),
+            Duration::from_millis(140),
+            UPDATER_TOTAL_DOWNLOAD_TIMEOUT,
+        )
+        .expect("build updater client");
+
+        let alive_info = UpdateInfo {
+            version: "3.2.1".to_owned(),
+            release_date: "2026-12-20".to_owned(),
+            title: "Freeton VPN v3.2.1".to_owned(),
+            changelog: vec!["Stream test".to_owned()],
+            download_url: format!("{base_url}/slow-but-alive.exe"),
+            file_size_bytes: payload_len as u64,
+            sha256: expected_sha.clone(),
+            mandatory: false,
+            min_supported_version: "3.0.0".to_owned(),
+        };
+
+        let alive_dir = temp_dir("slow_alive_stream");
+        let action =
+            download_and_verify_update_with_client(&client, &alive_info, &alive_dir, |_, _, _| {})
+                .await
+                .expect("multi-chunk stream exceeding read_timeout total duration should succeed");
+        match action {
+            UpdateAction::LaunchVerifiedInstaller(path) => {
+                assert_eq!(path, alive_dir.join("slow-but-alive.exe"));
+                assert_eq!(fs::read(&path).expect("read verified file"), full_payload);
+            }
+            other => panic!("expected LaunchVerifiedInstaller, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&alive_dir);
+
+        // A genuinely stalled stream (>140ms between chunks) must error and delete `.part`.
+        let stalled_info = UpdateInfo {
+            download_url: format!("{base_url}/stalled.exe"),
+            ..alive_info
+        };
+        let stalled_dir = temp_dir("stalled_stream");
+        let err = download_and_verify_update_with_client(
+            &client,
+            &stalled_info,
+            &stalled_dir,
+            |_, _, _| {},
+        )
+        .await
+        .expect_err("stalled stream exceeding read_timeout must fail");
+        assert!(matches!(err, UpdateError::Network(_)));
+        assert_eq!(fs::read_dir(&stalled_dir).expect("read dir").count(), 0);
+        let _ = fs::remove_dir_all(&stalled_dir);
+
         server_task.abort();
     }
 }
