@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "freeton-core",
+    "freeton-service",
+    "freeton-app",
+]
+resolver = "2"
+
+[workspace.package]
+version = "3.0.0"
+edition = "2021"
+license = "MIT"

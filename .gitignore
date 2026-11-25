@@ -37,3 +37,9 @@ servers_cache.json
 .idea/
 Thumbs.db
 Desktop.ini
+
+# Rust workspace & staged WireGuard binaries
+rust/target/
+rust/build/
+rust/assets/bin/
+
