@@ -1,4 +1,6 @@
+pub mod api;
 pub mod srp;
+pub mod storage;
 
 /// Application version string for Freeton VPN.
 pub const APP_VERSION: &str = "3.0.0";
