@@ -1,0 +1,39 @@
+﻿# Virtual Environment
+.venv/
+.venv-windows/
+env/
+venv/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# PyInstaller Build Artifacts
+build/
+dist/
+*.spec
+!FreetonVPN.spec
+
+# Historical local builds (not source files)
+archive/legacy-builds/*.exe
+archive/legacy-builds/*.spec
+archive/legacy-builds/*.zip
+
+# Browser extension dependencies
+browser-extension/node_modules/
+
+# Worktrees & SDD scratch
+.worktrees/
+.superpowers/
+
+# Local runtime & cache
+*.log
+servers_cache.json
+.cache/
+
+# IDE & OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

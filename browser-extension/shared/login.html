@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Đăng nhập · Freeton Browser VPN</title>
+    <link rel="stylesheet" href="popup.css">
+    <link rel="stylesheet" href="login.css">
+  </head>
+  <body class="login-page">
+    <main class="app login-app">
+      <header class="header">
+        <div class="brand-mark" aria-hidden="true">F</div>
+        <div class="brand-copy">
+          <h1>Freeton <span>Browser VPN</span></h1>
+          <p>Proton VPN Free · HTTPS proxy</p>
+        </div>
+        <div class="header-actions">
+          <button id="exportLogs" class="small-button" type="button" title="Tải log chẩn đoán đã lọc thông tin nhạy cảm">Tải log</button>
+        </div>
+      </header>
+
+      <section id="status" class="status" role="status" aria-live="polite">
+        <span class="status-dot"></span>
+        <span id="statusText">Đang kiểm tra phiên Proton…</span>
+      </section>
+
+      <section id="authPanel" class="auth-panel">
+        <div class="auth-heading">
+          <strong id="authTitle">Đăng nhập Proton VPN</strong>
+          <p id="authDescription">Đăng nhập SRP trực tiếp với Proton. Mật khẩu chỉ được dùng trong lúc xác thực, không lưu trong extension hoặc log.</p>
+        </div>
+        <form id="loginForm" autocomplete="on">
+          <label class="auth-label" for="username">Username hoặc email Proton</label>
+          <input id="username" class="auth-input" name="username" type="text" autocomplete="username" required>
+          <label class="auth-label" for="password">Mật khẩu</label>
+          <input id="password" class="auth-input" name="password" type="password" autocomplete="current-password" required>
+          <button id="loginButton" class="primary-button auth-submit" type="submit">Đăng nhập bằng SRP</button>
+        </form>
+        <form id="twoFactorForm" hidden>
+          <label class="auth-label" for="twoFactorCode">Mã xác thực 2FA</label>
+          <input id="twoFactorCode" class="auth-input" name="one-time-code" type="text" inputmode="numeric" autocomplete="one-time-code" required>
+          <button id="twoFactorButton" class="primary-button auth-submit" type="submit">Xác nhận 2FA</button>
+        </form>
+        <section id="challengePanel" class="challenge-panel" hidden>
+          <strong>Xác minh Proton</strong>
+          <p id="challengeMessage">Hoàn tất xác minh trong cửa sổ Proton vừa mở rồi quay lại đây.</p>
+          <button id="openVerification" class="small-button" type="button">Mở cửa sổ xác minh Proton</button>
+        </section>
+        <p id="authMessage" class="auth-message" role="status" aria-live="polite" hidden></p>
+      </section>
+
+      <section id="successPanel" class="success-panel" hidden>
+        <div class="success-mark" aria-hidden="true">✓</div>
+        <strong>Đã đăng nhập Proton</strong>
+        <p>Phiên đã sẵn sàng. Đóng tab này rồi mở Freeton từ thanh công cụ để chọn quốc gia và kết nối.</p>
+      </section>
+
+      <footer class="footer login-footer">
+        <div class="footer-note">HTTPS proxy · chỉ lưu lượng browser · không tạo tunnel WireGuard</div>
+        <div class="diagnostic-controls">
+          <span>Log được giữ cục bộ; không gồm mật khẩu, phiên hoặc token.</span>
+          <button id="clearLogs" class="text-button" type="button" title="Xóa log đang lưu trên trình duyệt này">Xóa log</button>
+        </div>
+      </footer>
+    </main>
+    <script src="diagnostics.js"></script>
+    <script src="login.js"></script>
+  </body>
+</html>

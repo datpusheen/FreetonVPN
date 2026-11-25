@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Freeton Browser VPN",
+  "version": "0.1.7",
+  "description": "Kết nối trình duyệt qua HTTPS proxy của Proton VPN Free.",
+  "minimum_chrome_version": "111",
+  "permissions": ["privacy", "proxy", "storage", "webRequest", "webRequestAuthProvider"],
+  "host_permissions": [
+    "<all_urls>",
+    "https://api.protonmail.ch/*",
+    "https://api.protonvpn.ch/*",
+    "https://account.protonvpn.com/*",
+    "https://account.proton.me/*",
+    "https://verify.proton.me/*"
+  ],
+  "action": {
+    "default_title": "Freeton Browser VPN",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://verify.proton.me/*",
+        "https://account.proton.me/*",
+        "https://account.protonvpn.com/*"
+      ],
+      "js": ["verification-bridge.js"],
+      "run_at": "document_start"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "freeton-browser-vpn",
+  "private": true,
+  "version": "0.1.7",
+  "description": "Build-time crypto dependencies for Freeton Browser VPN",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "bcryptjs": "3.0.3",
+    "openpgp": "6.3.2"
+  }
+}

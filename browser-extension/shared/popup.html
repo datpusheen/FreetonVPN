@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Freeton Browser VPN</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="app">
+      <header class="header">
+        <div class="brand-mark" aria-hidden="true">F</div>
+        <div class="brand-copy">
+          <h1>Freeton <span>Browser VPN</span></h1>
+          <p>Proton VPN Free · HTTPS proxy</p>
+        </div>
+        <div class="header-actions">
+          <button id="logout" class="small-button danger-button" type="button" hidden>Đăng xuất</button>
+          <button id="renew" class="small-button" type="button" hidden>Gia hạn</button>
+          <button id="disconnect" class="small-button danger-button" type="button" hidden>Ngắt</button>
+          <button id="exportLogs" class="small-button" type="button" title="Tải log chẩn đoán đã lọc thông tin nhạy cảm">Tải log</button>
+          <button id="refresh" class="icon-button" type="button" title="Quét lại" aria-label="Quét lại">↻</button>
+        </div>
+      </header>
+
+      <section id="status" class="status" role="status" aria-live="polite">
+        <span class="status-dot"></span>
+        <span id="statusText">Đang kiểm tra phiên Proton…</span>
+      </section>
+
+      <section id="authPanel" class="auth-panel" hidden>
+        <div class="auth-heading">
+          <strong id="authTitle">Đăng nhập Proton VPN</strong>
+          <p id="authDescription">Mở trang đăng nhập riêng để hoàn tất SRP, CAPTCHA hoặc 2FA. Popup này dùng để chọn máy chủ và bật/tắt kết nối sau khi đăng nhập.</p>
+        </div>
+        <p id="authMessage" class="auth-message" role="status" aria-live="polite" hidden></p>
+        <button id="openLoginPage" class="primary-button auth-submit" type="button">Mở trang đăng nhập riêng</button>
+      </section>
+
+      <div class="toolbar">
+        <label class="search-box">
+          <span aria-hidden="true">⌕</span>
+          <input id="search" type="search" placeholder="Tìm node, thành phố…" autocomplete="off">
+        </label>
+        <select id="country" aria-label="Lọc theo quốc gia">
+          <option value="">Mọi quốc gia</option>
+        </select>
+      </div>
+
+      <section id="summary" class="summary" hidden></section>
+      <section id="nodes" class="nodes" aria-label="Danh sách máy chủ"></section>
+
+      <div id="empty" class="empty" hidden>
+        <div class="empty-icon" aria-hidden="true">⌁</div>
+        <strong id="emptyTitle">Chưa có dữ liệu node</strong>
+        <p id="emptyMessage">Mở Proton VPN và đăng nhập để quét danh sách máy chủ.</p>
+      </div>
+
+      <footer class="footer">
+        <div class="footer-note">HTTPS proxy · chỉ lưu lượng browser · không tạo tunnel WireGuard</div>
+        <div class="diagnostic-controls">
+          <span>Log giữ cục bộ; có browser và node, không gồm URL đầy đủ hay token/mật khẩu.</span>
+          <button id="clearLogs" class="text-button" type="button" title="Xóa log đang lưu trên trình duyệt này">Xóa log</button>
+        </div>
+      </footer>
+    </main>
+    <script src="diagnostics.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>
