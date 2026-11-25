@@ -362,17 +362,31 @@ pub fn select_free_servers_with_wg(
 
 /// Builds and validates a Proton human verification URL with `ForceWebMessaging=1` appended.
 pub fn extract_human_verification(details: &Value) -> Result<(String, Vec<String>), ApiError> {
-    let methods: Vec<String> = details
+    let parse_methods = |val: &Value| -> Vec<String> {
+        val.as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .take(8)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let primary_methods = details
         .get("Methods")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .take(8)
-                .collect()
-        })
+        .map(parse_methods)
         .unwrap_or_default();
+    let methods = if primary_methods.is_empty() {
+        details
+            .get("HumanVerificationMethods")
+            .map(parse_methods)
+            .unwrap_or_default()
+    } else {
+        primary_methods
+    };
 
     let mut url = if let Some(web_url) = details
         .get("WebUrl")
@@ -1467,6 +1481,33 @@ mod tests {
             Some("1")
         );
         assert_eq!(fb_pairs.get("token").map(String::as_str), Some("tok-only"));
+    }
+
+    #[test]
+    fn test_human_verification_uses_human_verification_methods_when_methods_absent() {
+        let details = serde_json::json!({
+            "HumanVerificationMethods": ["captcha", "ownership-email"],
+            "HumanVerificationToken": "hv-only-methods-token"
+        });
+        let (url, methods) = extract_human_verification(&details)
+            .expect("extracts HumanVerificationMethods fallback");
+        assert_eq!(methods, vec!["captcha", "ownership-email"]);
+        let parsed = Url::parse(&url).expect("valid fallback url");
+        assert_eq!(parsed.scheme(), "https");
+        assert_eq!(parsed.host_str(), Some("verify.proton.me"));
+        let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(
+            pairs.get("methods").map(String::as_str),
+            Some("captcha,ownership-email")
+        );
+        assert_eq!(
+            pairs.get("token").map(String::as_str),
+            Some("hv-only-methods-token")
+        );
+        assert_eq!(
+            pairs.get("ForceWebMessaging").map(String::as_str),
+            Some("1")
+        );
     }
 
     #[tokio::test]

@@ -155,18 +155,34 @@ where
             if let Some(i) = n.as_i64() {
                 Ok(i)
             } else if let Some(f) = n.as_f64() {
-                Ok(f as i64)
+                if f.is_finite() {
+                    Ok(f as i64)
+                } else {
+                    Err(serde::de::Error::custom(format!(
+                        "non-finite expiration number: {n}"
+                    )))
+                }
             } else {
                 Err(serde::de::Error::custom(format!(
                     "invalid integer expiration: {n}"
                 )))
             }
         }
-        Some(serde_json::Value::String(s)) => s
-            .trim()
-            .parse::<f64>()
-            .map(|f| f as i64)
-            .map_err(|e| serde::de::Error::custom(format!("invalid expiration string: {e}"))),
+        Some(serde_json::Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(0);
+            }
+            let parsed = trimmed
+                .parse::<f64>()
+                .map_err(|e| serde::de::Error::custom(format!("invalid expiration string: {e}")))?;
+            if !parsed.is_finite() {
+                return Err(serde::de::Error::custom(format!(
+                    "non-finite expiration string: {trimmed}"
+                )));
+            }
+            Ok(parsed as i64)
+        }
         Some(other) => Err(serde::de::Error::custom(format!(
             "unexpected expiration value: {other}"
         ))),
@@ -939,6 +955,31 @@ mod tests {
         .expect("numeric port legacy json");
         assert_eq!(numeric_port.port, "51820");
         assert!(!numeric_port.animations_enabled);
+    }
+
+    #[test]
+    fn test_client_config_expiration_empty_string_and_non_finite_handling() {
+        let empty_exp: ClientConfig = serde_json::from_str(
+            r#"{"private_key":"keep-me","address":"10.9.0.2/32","expiration":""}"#,
+        )
+        .expect("empty string expiration should default to 0 without wiping config");
+        assert_eq!(empty_exp.private_key, "keep-me");
+        assert_eq!(empty_exp.address, "10.9.0.2/32");
+        assert_eq!(empty_exp.expiration, 0);
+
+        let whitespace_exp: ClientConfig =
+            serde_json::from_str(r#"{"private_key":"keep-ws","expiration":"   "}"#)
+                .expect("whitespace expiration should default to 0");
+        assert_eq!(whitespace_exp.private_key, "keep-ws");
+        assert_eq!(whitespace_exp.expiration, 0);
+
+        for invalid in ["NaN", "inf", "-inf", "Infinity"] {
+            let payload = format!(r#"{{"private_key":"k","expiration":"{invalid}"}}"#);
+            assert!(
+                serde_json::from_str::<ClientConfig>(&payload).is_err(),
+                "non-finite expiration {invalid:?} must be rejected"
+            );
+        }
     }
 
     #[test]
