@@ -5,3 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = "0.23"
+bcrypt = "0.19"
+ed25519-dalek = { version = "3.0", features = ["pkcs8", "pem"] }
+num-bigint = "0.5"
+pgp = "0.21"
+pkcs8 = { version = "0.11", features = ["pem", "std"] }
+rand = "0.10"
+sha2 = "0.11"
+thiserror = "2.0"
+zeroize = { version = "1.9", features = ["derive"] }
