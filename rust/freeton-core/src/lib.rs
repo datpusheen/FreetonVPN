@@ -3,6 +3,7 @@ pub mod ping;
 pub mod srp;
 pub mod storage;
 pub mod updater;
+pub mod wg;
 
 /// Application version string for Freeton VPN.
 pub const APP_VERSION: &str = "3.0.0";
