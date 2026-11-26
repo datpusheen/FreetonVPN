@@ -1306,11 +1306,109 @@ mod tests {
 
     #[test]
     fn test_capture_script_enforces_proton_event_origin_filter() {
-        assert!(CAPTCHA_CAPTURE_SCRIPT.contains("event.origin"));
-        assert!(CAPTCHA_CAPTURE_SCRIPT.contains("isAllowedOrigin"));
-        assert!(CAPTCHA_CAPTURE_SCRIPT.contains(r"proton\.me"));
-        assert!(CAPTCHA_CAPTURE_SCRIPT.contains(r"protonvpn\.com"));
+        assert!(CAPTCHA_CAPTURE_SCRIPT.contains(
+            r"const ALLOWED_ORIGIN_RE = /^https:\/\/([a-z0-9-]+\.)*(proton\.me|protonvpn\.com)$/i;"
+        ));
+        assert!(CAPTCHA_CAPTURE_SCRIPT.contains(
+            r#"const isAllowedOrigin = (origin) =>
+    typeof origin === "string" &&
+    ((origin === window.location.origin && /^https:\/\//i.test(origin)) ||
+      ALLOWED_ORIGIN_RE.test(origin));"#
+        ));
         assert!(CAPTCHA_CAPTURE_SCRIPT.contains("if (!isAllowedOrigin(event.origin)) return;"));
+
+        let js_harness = r#"
+const script = process.env.FREETON_CAPTCHA_SCRIPT;
+if (!script) throw new Error("missing FREETON_CAPTCHA_SCRIPT");
+
+let subHandler = null;
+global.window = {
+  location: { origin: "https://verify.proton.me" },
+  chrome: { webview: { postMessage: () => { throw new Error("subframe should not post"); } } },
+  addEventListener: (ev, fn) => { if (ev === "message") subHandler = fn; },
+  top: {},
+};
+new Function(script)();
+if (subHandler !== null) {
+  throw new Error("expected non-top frame not to register message listener");
+}
+
+let handler = null;
+const posted = [];
+global.window = {
+  location: { origin: "https://verify.proton.me" },
+  chrome: { webview: { postMessage: (v) => posted.push(v) } },
+  addEventListener: (ev, fn) => { if (ev === "message") handler = fn; },
+};
+global.window.top = global.window;
+new Function(script)();
+if (typeof handler !== "function") {
+  throw new Error("expected top-level frame to register message listener");
+}
+
+const tok1 = "hv_token_0123456789abcdef_1";
+const tok2 = "hv_token_0123456789abcdef_2";
+const tok3 = "hv_token_0123456789abcdef_3";
+
+for (const badOrigin of [
+  "https://newassets.hcaptcha.com",
+  "https://hcaptcha.com",
+  "http://verify.proton.me",
+  "https://verify.proton.me.evil.com",
+  "https://evilproton.me",
+  "https://verify.proton.me:8443",
+  "null",
+  "",
+]) {
+  handler({ origin: badOrigin, data: tok1 });
+  handler({ origin: badOrigin, data: { token: tok1 } });
+  handler({ origin: badOrigin, data: JSON.stringify({ Token: tok1 }) });
+}
+handler({ origin: "https://verify.proton.me", data: "https://verify.proton.me/path_over_20_chars" });
+handler({ origin: "https://verify.proton.me", data: "short" });
+handler({ origin: "https://verify.proton.me", data: JSON.stringify({ type: "height", height: 500 }) });
+if (posted.length !== 0) {
+  throw new Error("unexpected forward from untrusted origin/payload: " + JSON.stringify(posted));
+}
+
+handler({ origin: "https://verify-api.proton.me", data: { token: tok1 } });
+handler({ origin: "https://verify.proton.me", data: tok2 });
+handler({ origin: "https://account.protonvpn.com", data: JSON.stringify({ HumanVerificationToken: tok3 }) });
+
+const expected = JSON.stringify([tok1, tok2, tok3]);
+if (JSON.stringify(posted) !== expected) {
+  throw new Error("expected " + expected + ", got " + JSON.stringify(posted));
+}
+"#;
+
+        let mut child = match std::process::Command::new("node")
+            .arg("-")
+            .env("FREETON_CAPTCHA_SCRIPT", CAPTCHA_CAPTURE_SCRIPT)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => panic!("failed to launch node to verify CAPTCHA_CAPTURE_SCRIPT: {err}"),
+        };
+
+        {
+            use std::io::Write;
+            let stdin = child.stdin.as_mut().expect("piped stdin");
+            stdin
+                .write_all(js_harness.as_bytes())
+                .expect("write JS harness to node stdin");
+        }
+        let output = child.wait_with_output().expect("wait for node process");
+        assert!(
+            output.status.success(),
+            "node verification failed (status: {:?})\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
