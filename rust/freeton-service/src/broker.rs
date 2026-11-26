@@ -14,7 +14,7 @@ use freeton_core::wg::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
-use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
+use tokio::sync::{watch, Mutex as AsyncMutex};
 use tracing::{error, info, warn};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::FALSE;
@@ -38,9 +38,17 @@ use crate::tunnel_runner::{
 pub const BROKER_SERVICE_NAME: &str = "FreetonVPNService";
 pub const BROKER_SERVICE_DISPLAY_NAME: &str = "Freeton VPN Service";
 pub const BROKER_SERVICE_DESCRIPTION: &str = "Privileged WireGuard tunnel broker for Freeton VPN";
-pub const PIPE_SDDL_DACL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+/// SDDL DACL for `\\.\pipe\FreetonVPNService`:
+/// - `SY` (LocalSystem) & `BA` (Administrators): `GA` (Generic All)
+/// - `IU` (Interactive Users): `0x0012019b` (`FILE_GENERIC_READ | FILE_WRITE_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES`,
+///   deliberately omitting `FILE_CREATE_PIPE_INSTANCE` (`0x0004`) to prevent unprivileged pipe-squatting).
+///
+/// Interactive User clients open the pipe using `FILE_READ_DATA | FILE_WRITE_DATA` (or
+/// `tokio::net::windows::named_pipe::ClientOptions::new().read(true).write(true)`).
+pub const PIPE_SDDL_DACL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0012019b;;;IU)";
 pub const HANDSHAKE_MAX_AGE_SECS: i64 = 180;
 pub const MAX_IPC_LINE_BYTES: usize = 64 * 1024;
+pub const MAX_CONSECUTIVE_PIPE_FAILURES: u32 = 8;
 
 const SERVICE_RUNNING_STATE: u32 = 4;
 
@@ -303,9 +311,12 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
         }
     }
 
-    pub async fn handle_session_logoff(&self) -> Result<(), String> {
-        info!("Windows session logoff detected; tearing down active tunnel");
-        self.teardown_locked().await
+    pub async fn handle_session_change(&self, reason: SessionChangeReason) -> Result<(), String> {
+        if should_teardown_on_session_change(reason) {
+            info!("Windows session change ({reason:?}) detected; tearing down active tunnel");
+            self.teardown_locked().await?;
+        }
+        Ok(())
     }
 
     pub async fn shutdown_for_service_stop(&self) {
@@ -748,6 +759,66 @@ where
     }
 }
 
+pub(crate) fn should_teardown_on_session_change(reason: SessionChangeReason) -> bool {
+    matches!(
+        reason,
+        SessionChangeReason::SessionLogoff | SessionChangeReason::ConsoleDisconnect
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipeServerBackoff {
+    pub initial: Duration,
+    pub max: Duration,
+    pub max_consecutive_failures: u32,
+}
+
+impl Default for PipeServerBackoff {
+    fn default() -> Self {
+        Self {
+            initial: Duration::from_millis(50),
+            max: Duration::from_secs(2),
+            max_consecutive_failures: MAX_CONSECUTIVE_PIPE_FAILURES,
+        }
+    }
+}
+
+impl PipeServerBackoff {
+    fn delay_for_attempt(&self, failure_count: u32) -> Duration {
+        let shift = failure_count.saturating_sub(1).min(10);
+        let factor = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
+        self.initial.saturating_mul(factor).min(self.max)
+    }
+}
+
+pub trait PipeInstance: AsyncRead + AsyncWrite + Unpin + Send + 'static {
+    fn accept_client<'a>(&'a mut self) -> BoxFuture<'a, io::Result<()>>;
+}
+
+impl PipeInstance for NamedPipeServer {
+    fn accept_client<'a>(&'a mut self) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move { self.connect().await })
+    }
+}
+
+pub trait PipeServerFactory: Send + Sync + 'static {
+    type Pipe: PipeInstance;
+    fn create_pipe(&self, first_instance: bool) -> io::Result<Self::Pipe>;
+}
+
+struct WindowsPipeFactory {
+    pipe_name: String,
+    sddl: String,
+}
+
+impl PipeServerFactory for WindowsPipeFactory {
+    type Pipe = NamedPipeServer;
+
+    fn create_pipe(&self, first_instance: bool) -> io::Result<Self::Pipe> {
+        create_secured_pipe_server(&self.pipe_name, &self.sddl, first_instance)
+    }
+}
+
 async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
     if *rx.borrow() {
         return;
@@ -759,12 +830,56 @@ async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
     }
 }
 
-pub async fn run_pipe_server<R: TunnelRuntime>(
-    pipe_name: String,
+async fn create_next_pipe_with_retry<F: PipeServerFactory>(
+    factory: &F,
+    shutdown: &mut watch::Receiver<bool>,
+    backoff: PipeServerBackoff,
+    consecutive_failures: &mut u32,
+) -> io::Result<Option<F::Pipe>> {
+    loop {
+        if *shutdown.borrow() {
+            return Ok(None);
+        }
+        match factory.create_pipe(false) {
+            Ok(next) => return Ok(Some(next)),
+            Err(err) => {
+                *consecutive_failures = consecutive_failures.saturating_add(1);
+                if *consecutive_failures >= backoff.max_consecutive_failures {
+                    error!(
+                        "pipe instance creation failed {} consecutive times: {err}",
+                        *consecutive_failures
+                    );
+                    return Err(err);
+                }
+                let delay = backoff.delay_for_attempt(*consecutive_failures);
+                warn!(
+                    "transient named pipe creation error (attempt {}/{}): {err}; retrying in {:?}",
+                    *consecutive_failures, backoff.max_consecutive_failures, delay
+                );
+                tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(shutdown) => return Ok(None),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
+    }
+}
+
+pub async fn run_pipe_accept_loop<F, R>(
+    initial_server: F::Pipe,
+    factory: Arc<F>,
     broker: Arc<TunnelBroker<R>>,
     mut shutdown: watch::Receiver<bool>,
-) -> io::Result<()> {
-    let mut server = create_secured_pipe_server(&pipe_name, PIPE_SDDL_DACL, true)?;
+    backoff: PipeServerBackoff,
+) -> io::Result<()>
+where
+    F: PipeServerFactory,
+    R: TunnelRuntime,
+{
+    let mut server = initial_server;
+    let mut consecutive_failures = 0u32;
+
     loop {
         if *shutdown.borrow() {
             break;
@@ -774,26 +889,246 @@ pub async fn run_pipe_server<R: TunnelRuntime>(
             _ = wait_for_shutdown(&mut shutdown) => {
                 break;
             }
-            conn = server.connect() => {
+            conn = server.accept_client() => {
                 match conn {
                     Ok(()) => {
                         let connected_stream = server;
-                        server = create_secured_pipe_server(&pipe_name, PIPE_SDDL_DACL, false)?;
                         let broker_clone = Arc::clone(&broker);
                         tokio::spawn(async move {
                             serve_pipe_stream(connected_stream, broker_clone).await;
                         });
+                        match create_next_pipe_with_retry(
+                            factory.as_ref(),
+                            &mut shutdown,
+                            backoff,
+                            &mut consecutive_failures,
+                        )
+                        .await?
+                        {
+                            Some(next_server) => {
+                                consecutive_failures = 0;
+                                server = next_server;
+                            }
+                            None => break,
+                        }
                     }
                     Err(err) => {
-                        warn!("named pipe accept error: {err}");
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        server = create_secured_pipe_server(&pipe_name, PIPE_SDDL_DACL, false)?;
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        if consecutive_failures >= backoff.max_consecutive_failures {
+                            error!(
+                                "named pipe accept failed {} consecutive times: {err}",
+                                consecutive_failures
+                            );
+                            return Err(err);
+                        }
+                        let delay = backoff.delay_for_attempt(consecutive_failures);
+                        warn!(
+                            "transient named pipe accept error (attempt {}/{}): {err}; retrying in {:?}",
+                            consecutive_failures, backoff.max_consecutive_failures, delay
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_shutdown(&mut shutdown) => break,
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                        match create_next_pipe_with_retry(
+                            factory.as_ref(),
+                            &mut shutdown,
+                            backoff,
+                            &mut consecutive_failures,
+                        )
+                        .await?
+                        {
+                            Some(next_server) => {
+                                server = next_server;
+                            }
+                            None => break,
+                        }
                     }
                 }
             }
         }
     }
     Ok(())
+}
+
+trait ServiceStatusReporter: Send + Sync {
+    fn set_status(
+        &self,
+        state: ServiceState,
+        controls_accepted: ServiceControlAccept,
+        wait_hint: Duration,
+        exit_code: ServiceExitCode,
+    ) -> Result<(), String>;
+}
+
+struct ScmStatusReporter(service_control_handler::ServiceStatusHandle);
+
+impl ServiceStatusReporter for ScmStatusReporter {
+    fn set_status(
+        &self,
+        state: ServiceState,
+        controls_accepted: ServiceControlAccept,
+        wait_hint: Duration,
+        exit_code: ServiceExitCode,
+    ) -> Result<(), String> {
+        self.0
+            .set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: state,
+                controls_accepted,
+                exit_code,
+                checkpoint: 0,
+                wait_hint,
+                process_id: None,
+            })
+            .map_err(|e| format!("SetServiceStatus({state:?}) failed: {e}"))
+    }
+}
+
+async fn run_broker_lifecycle<F, S, R>(
+    status_reporter: &S,
+    pipe_factory: Arc<F>,
+    broker: Arc<TunnelBroker<R>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    mut session_rx: tokio::sync::mpsc::UnboundedReceiver<SessionChangeReason>,
+    backoff: PipeServerBackoff,
+) -> Result<(), String>
+where
+    F: PipeServerFactory,
+    S: ServiceStatusReporter,
+    R: TunnelRuntime,
+{
+    status_reporter.set_status(
+        ServiceState::StartPending,
+        ServiceControlAccept::empty(),
+        Duration::from_secs(5),
+        ServiceExitCode::Win32(0),
+    )?;
+
+    // Bind initial pipe instance BEFORE transitioning SCM to Running; fail startup if bind fails.
+    let initial_pipe = match pipe_factory.create_pipe(true) {
+        Ok(pipe) => pipe,
+        Err(err) => {
+            let msg = format!("failed creating initial IPC pipe instance: {err}");
+            let _ = status_reporter.set_status(
+                ServiceState::Stopped,
+                ServiceControlAccept::empty(),
+                Duration::ZERO,
+                ServiceExitCode::Win32(1),
+            );
+            return Err(msg);
+        }
+    };
+
+    let (internal_stop_tx, internal_stop_rx) = watch::channel(false);
+
+    let session_broker = Arc::clone(&broker);
+    let mut session_shutdown = shutdown_rx.clone();
+    let mut session_internal_stop = internal_stop_rx.clone();
+    let session_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut session_shutdown) => break,
+                _ = wait_for_shutdown(&mut session_internal_stop) => break,
+                maybe_reason = session_rx.recv() => {
+                    match maybe_reason {
+                        Some(reason) => {
+                            if let Err(err) = session_broker.handle_session_change(reason).await {
+                                warn!("session change ({reason:?}) teardown error: {err}");
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    });
+
+    let pipe_broker = Arc::clone(&broker);
+    let pipe_shutdown = shutdown_rx.clone();
+    let mut pipe_task = tokio::spawn(async move {
+        run_pipe_accept_loop(
+            initial_pipe,
+            pipe_factory,
+            pipe_broker,
+            pipe_shutdown,
+            backoff,
+        )
+        .await
+    });
+
+    if let Err(err) = status_reporter.set_status(
+        ServiceState::Running,
+        ServiceControlAccept::STOP
+            | ServiceControlAccept::SHUTDOWN
+            | ServiceControlAccept::SESSION_CHANGE,
+        Duration::ZERO,
+        ServiceExitCode::Win32(0),
+    ) {
+        let _ = internal_stop_tx.send(true);
+        pipe_task.abort();
+        let _ = session_task.await;
+        let _ = pipe_task.await;
+        broker.shutdown_for_service_stop().await;
+        let _ = status_reporter.set_status(
+            ServiceState::Stopped,
+            ServiceControlAccept::empty(),
+            Duration::ZERO,
+            ServiceExitCode::Win32(1),
+        );
+        return Err(err);
+    }
+
+    let mut lifecycle_result: Result<(), String> = Ok(());
+    let mut pipe_finished = false;
+    tokio::select! {
+        biased;
+        _ = wait_for_shutdown(&mut shutdown_rx) => {}
+        pipe_res = &mut pipe_task => {
+            pipe_finished = true;
+            match pipe_res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    lifecycle_result = Err(format!("pipe server failed unrecoverably: {err}"));
+                }
+                Err(err) => {
+                    lifecycle_result = Err(format!("pipe server task panicked: {err}"));
+                }
+            }
+        }
+    }
+
+    let _ = internal_stop_tx.send(true);
+    let _ = status_reporter.set_status(
+        ServiceState::StopPending,
+        ServiceControlAccept::empty(),
+        Duration::from_secs(15),
+        ServiceExitCode::Win32(0),
+    );
+
+    let _ = session_task.await;
+    if !pipe_finished {
+        if let Ok(Err(err)) = pipe_task.await {
+            warn!("pipe server stopped with error: {err}");
+        }
+    }
+    broker.shutdown_for_service_stop().await;
+
+    let exit_code = if lifecycle_result.is_ok() {
+        ServiceExitCode::Win32(0)
+    } else {
+        ServiceExitCode::Win32(1)
+    };
+    let _ = status_reporter.set_status(
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+        Duration::ZERO,
+        exit_code,
+    );
+
+    lifecycle_result
 }
 
 define_windows_service!(ffi_broker_service_main, broker_service_main);
@@ -804,31 +1139,9 @@ fn broker_service_main(_arguments: Vec<OsString>) {
     }
 }
 
-fn set_service_status_checked(
-    handle: &service_control_handler::ServiceStatusHandle,
-    state: ServiceState,
-    controls_accepted: ServiceControlAccept,
-    wait_hint: Duration,
-    exit_code: ServiceExitCode,
-) -> Result<(), String> {
-    handle
-        .set_service_status(ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: state,
-            controls_accepted,
-            exit_code,
-            checkpoint: 0,
-            wait_hint,
-            process_id: None,
-        })
-        .map_err(|e| format!("SetServiceStatus({state:?}) failed: {e}"))
-}
-
 fn run_broker_service_inner() -> Result<(), String> {
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    let logoff_notify = Arc::new(Notify::new());
-
-    let logoff_for_handler = Arc::clone(&logoff_notify);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (session_tx, session_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
@@ -837,8 +1150,8 @@ fn run_broker_service_inner() -> Result<(), String> {
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::SessionChange(param) => {
-                if param.reason == SessionChangeReason::SessionLogoff {
-                    logoff_for_handler.notify_one();
+                if should_teardown_on_session_change(param.reason) {
+                    let _ = session_tx.send(param.reason);
                 }
                 ServiceControlHandlerResult::NoError
             }
@@ -849,14 +1162,7 @@ fn run_broker_service_inner() -> Result<(), String> {
 
     let status_handle = service_control_handler::register(BROKER_SERVICE_NAME, event_handler)
         .map_err(|e| format!("register control handler failed: {e}"))?;
-
-    set_service_status_checked(
-        &status_handle,
-        ServiceState::StartPending,
-        ServiceControlAccept::empty(),
-        Duration::from_secs(5),
-        ServiceExitCode::Win32(0),
-    )?;
+    let reporter = ScmStatusReporter(status_handle);
 
     let service_exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let runtime = Arc::new(WindowsTunnelRuntime::new(
@@ -864,77 +1170,24 @@ fn run_broker_service_inner() -> Result<(), String> {
         service_exe,
     ));
     let broker = Arc::new(TunnelBroker::new(runtime, BrokerConfig::default()));
+    let pipe_factory = Arc::new(WindowsPipeFactory {
+        pipe_name: SERVICE_PIPE_NAME.to_owned(),
+        sddl: PIPE_SDDL_DACL.to_owned(),
+    });
 
     let tokio_rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("failed to create Tokio runtime: {e}"))?;
 
-    let exit_result: Result<(), String> = tokio_rt.block_on(async {
-        let logoff_broker = Arc::clone(&broker);
-        let mut logoff_shutdown = shutdown_rx.clone();
-        let logoff_task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = wait_for_shutdown(&mut logoff_shutdown) => break,
-                    _ = logoff_notify.notified() => {
-                        if let Err(err) = logoff_broker.handle_session_logoff().await {
-                            warn!("logoff tunnel teardown error: {err}");
-                        }
-                    }
-                }
-            }
-        });
-
-        let pipe_broker = Arc::clone(&broker);
-        let pipe_shutdown = shutdown_rx.clone();
-        let pipe_task = tokio::spawn(async move {
-            run_pipe_server(SERVICE_PIPE_NAME.to_owned(), pipe_broker, pipe_shutdown).await
-        });
-
-        set_service_status_checked(
-            &status_handle,
-            ServiceState::Running,
-            ServiceControlAccept::STOP
-                | ServiceControlAccept::SHUTDOWN
-                | ServiceControlAccept::SESSION_CHANGE,
-            Duration::ZERO,
-            ServiceExitCode::Win32(0),
-        )?;
-
-        wait_for_shutdown(&mut shutdown_rx).await;
-
-        let _ = set_service_status_checked(
-            &status_handle,
-            ServiceState::StopPending,
-            ServiceControlAccept::empty(),
-            Duration::from_secs(15),
-            ServiceExitCode::Win32(0),
-        );
-
-        let _ = logoff_task.await;
-        if let Ok(Err(err)) = pipe_task.await {
-            warn!("pipe server stopped with error: {err}");
-        }
-        broker.shutdown_for_service_stop().await;
-        Ok(())
-    });
-
-    let exit_code = if exit_result.is_ok() {
-        ServiceExitCode::Win32(0)
-    } else {
-        ServiceExitCode::Win32(1)
-    };
-    let _ = set_service_status_checked(
-        &status_handle,
-        ServiceState::Stopped,
-        ServiceControlAccept::empty(),
-        Duration::ZERO,
-        exit_code,
-    );
-
-    exit_result
+    tokio_rt.block_on(run_broker_lifecycle(
+        &reporter,
+        pipe_factory,
+        broker,
+        shutdown_rx,
+        session_rx,
+        PipeServerBackoff::default(),
+    ))
 }
 
 pub fn run_windows_service() -> Result<(), String> {
@@ -1451,7 +1704,7 @@ mod tests {
         );
         assert!(runtime.conf_path(DEFAULT_TUNNEL_NAME).exists());
         broker
-            .handle_session_logoff()
+            .handle_session_change(SessionChangeReason::SessionLogoff)
             .await
             .expect("session logoff teardown");
         assert!(!runtime.conf_path(DEFAULT_TUNNEL_NAME).exists());
@@ -1533,6 +1786,497 @@ mod tests {
         drop(write_half);
         drop(reader);
         server_task.await.expect("server task finishes cleanly");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct MockPipeInstance {
+        stream: tokio::io::DuplexStream,
+        accept_result: Option<io::Result<()>>,
+        pend_accept: bool,
+    }
+
+    impl MockPipeInstance {
+        fn ready(stream: tokio::io::DuplexStream, accept_result: io::Result<()>) -> Self {
+            Self {
+                stream,
+                accept_result: Some(accept_result),
+                pend_accept: false,
+            }
+        }
+
+        fn pending(stream: tokio::io::DuplexStream) -> Self {
+            Self {
+                stream,
+                accept_result: None,
+                pend_accept: true,
+            }
+        }
+    }
+
+    impl PipeInstance for MockPipeInstance {
+        fn accept_client<'a>(&'a mut self) -> BoxFuture<'a, io::Result<()>> {
+            let pend = self.pend_accept;
+            let res = self.accept_result.take();
+            Box::pin(async move {
+                if pend {
+                    std::future::pending::<io::Result<()>>().await
+                } else {
+                    res.unwrap_or(Ok(()))
+                }
+            })
+        }
+    }
+
+    impl AsyncRead for MockPipeInstance {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for MockPipeInstance {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            Pin::new(&mut self.stream).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
+    struct MockPipeFactory {
+        create_results: Mutex<VecDeque<io::Result<MockPipeInstance>>>,
+        calls: Mutex<Vec<bool>>,
+    }
+
+    impl MockPipeFactory {
+        fn new(results: Vec<io::Result<MockPipeInstance>>) -> Self {
+            Self {
+                create_results: Mutex::new(VecDeque::from(results)),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PipeServerFactory for MockPipeFactory {
+        type Pipe = MockPipeInstance;
+
+        fn create_pipe(&self, first_instance: bool) -> io::Result<Self::Pipe> {
+            self.calls.lock().expect("lock").push(first_instance);
+            self.create_results
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "exhausted mock pipes",
+                    ))
+                })
+        }
+    }
+
+    struct MockStatusReporter {
+        states: Mutex<Vec<(ServiceState, u32)>>,
+    }
+
+    impl MockStatusReporter {
+        fn new() -> Self {
+            Self {
+                states: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn states(&self) -> Vec<(ServiceState, u32)> {
+            self.states.lock().expect("lock").clone()
+        }
+    }
+
+    impl ServiceStatusReporter for MockStatusReporter {
+        fn set_status(
+            &self,
+            state: ServiceState,
+            _controls_accepted: ServiceControlAccept,
+            _wait_hint: Duration,
+            exit_code: ServiceExitCode,
+        ) -> Result<(), String> {
+            let code = match exit_code {
+                ServiceExitCode::Win32(c) => c,
+                ServiceExitCode::ServiceSpecific(c) => c,
+            };
+            self.states.lock().expect("lock").push((state, code));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pipe_startup_failure_prevents_running_and_transient_errors_retry() {
+        let dir = unique_temp_dir("pipe_startup_retry");
+        let runtime = Arc::new(MockRuntime::new(dir.clone(), 1_700_000_500));
+        let broker = Arc::new(TunnelBroker::new(runtime.clone(), test_config()));
+
+        // Part A: Initial pipe bind failure prevents ServiceState::Running.
+        let failing_factory = Arc::new(MockPipeFactory::new(vec![Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "pipe squatted",
+        ))]));
+        let reporter = MockStatusReporter::new();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_session_tx, session_rx) = tokio::sync::mpsc::unbounded_channel();
+        let res = run_broker_lifecycle(
+            &reporter,
+            failing_factory.clone(),
+            Arc::clone(&broker),
+            shutdown_rx,
+            session_rx,
+            PipeServerBackoff {
+                initial: Duration::from_millis(1),
+                max: Duration::from_millis(4),
+                max_consecutive_failures: 3,
+            },
+        )
+        .await;
+        assert!(res.is_err());
+        assert_eq!(*failing_factory.calls.lock().expect("lock"), vec![true]);
+        let recorded = reporter.states();
+        assert!(!recorded.iter().any(|(st, _)| *st == ServiceState::Running));
+        assert_eq!(
+            recorded,
+            vec![(ServiceState::StartPending, 0), (ServiceState::Stopped, 1)]
+        );
+
+        // Part B: Transient accept & rebind errors retry with bounded backoff, serve a client,
+        // and only fail after max_consecutive_failures consecutive errors.
+        let (_unused_client, unused_server) = tokio::io::duplex(1024);
+        let (client_stream, ok_server) = tokio::io::duplex(4096);
+        let (_tail_client, tail_server) = tokio::io::duplex(1024);
+
+        let retry_factory = Arc::new(MockPipeFactory::new(vec![
+            Ok(MockPipeInstance::ready(
+                unused_server,
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "transient accept error",
+                )),
+            )),
+            Err(io::Error::other("transient rebind 1")),
+            Err(io::Error::other("transient rebind 2")),
+            Ok(MockPipeInstance::ready(ok_server, Ok(()))),
+            Ok(MockPipeInstance::ready(
+                tail_server,
+                Err(io::Error::other("terminal accept failure")),
+            )),
+            Err(io::Error::other("terminal rebind 1")),
+            Err(io::Error::other("terminal rebind 2")),
+        ]));
+
+        let retry_reporter = MockStatusReporter::new();
+        let (_shutdown_tx2, shutdown_rx2) = watch::channel(false);
+        let (_session_tx2, session_rx2) = tokio::sync::mpsc::unbounded_channel();
+        let backoff = PipeServerBackoff {
+            initial: Duration::from_millis(1),
+            max: Duration::from_millis(4),
+            max_consecutive_failures: 4,
+        };
+
+        let client_task = tokio::spawn(async move {
+            let (read_half, mut write_half) = tokio::io::split(client_stream);
+            let mut reader = BufReader::new(read_half);
+            let req = serde_json::to_string(&ServiceRequest::Status).expect("serialize");
+            write_half
+                .write_all(format!("{req}\n").as_bytes())
+                .await
+                .expect("write");
+            write_half.flush().await.expect("flush");
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read");
+            let decoded: ServiceResponse = serde_json::from_str(line.trim()).expect("parse");
+            assert_eq!(
+                decoded,
+                ServiceResponse::Status(TunnelHealthState::Disconnected)
+            );
+        });
+
+        let lifecycle_res = run_broker_lifecycle(
+            &retry_reporter,
+            retry_factory.clone(),
+            broker,
+            shutdown_rx2,
+            session_rx2,
+            backoff,
+        )
+        .await;
+        client_task.await.expect("client succeeded across retries");
+        assert!(lifecycle_res.is_err());
+        assert_eq!(
+            *retry_factory.calls.lock().expect("lock"),
+            vec![true, false, false, false, false, false, false, false]
+        );
+        let retry_states = retry_reporter.states();
+        assert!(retry_states
+            .iter()
+            .any(|(st, _)| *st == ServiceState::Running));
+        assert_eq!(
+            retry_states.last().copied(),
+            Some((ServiceState::Stopped, 1))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_pipe_sddl_omits_create_pipe_instance_and_allows_rw_data_client() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Security::{
+            AclSizeInformation, CreateWellKnownSid, EqualSid, GetAce, GetAclInformation,
+            GetSecurityDescriptorDacl, WinInteractiveSid, ACCESS_ALLOWED_ACE, ACL,
+            ACL_SIZE_INFORMATION, PSID,
+        };
+        use windows::Win32::Storage::FileSystem::{
+            FILE_CREATE_PIPE_INSTANCE, FILE_READ_DATA, FILE_WRITE_DATA,
+        };
+
+        assert_eq!(
+            PIPE_SDDL_DACL,
+            "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0012019b;;;IU)"
+        );
+
+        // 1. Inspect the parsed DACL ACE for Interactive Users (IU) directly.
+        let wide_sddl = to_wide_null(PIPE_SDDL_DACL).expect("wide sddl");
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(wide_sddl.as_ptr()),
+                SDDL_REVISION_1,
+                &mut sd,
+                None,
+            )
+            .expect("parse PIPE_SDDL_DACL");
+        }
+        let _sd_guard = LocalFreeGuard(sd.0);
+
+        let mut present = windows::core::BOOL(0);
+        let mut pacl: *mut ACL = core::ptr::null_mut();
+        let mut defaulted = windows::core::BOOL(0);
+        unsafe {
+            GetSecurityDescriptorDacl(sd, &mut present, &mut pacl, &mut defaulted)
+                .expect("GetSecurityDescriptorDacl");
+        }
+        assert!(present.as_bool() && !pacl.is_null());
+
+        let mut acl_info = ACL_SIZE_INFORMATION::default();
+        unsafe {
+            GetAclInformation(
+                pacl.cast_const(),
+                (&mut acl_info as *mut ACL_SIZE_INFORMATION).cast(),
+                u32::try_from(core::mem::size_of::<ACL_SIZE_INFORMATION>()).unwrap(),
+                AclSizeInformation,
+            )
+            .expect("GetAclInformation");
+        }
+
+        let mut iu_sid = vec![0u8; 68];
+        let mut iu_sid_len = u32::try_from(iu_sid.len()).unwrap();
+        let iu_psid = PSID(iu_sid.as_mut_ptr().cast());
+        unsafe {
+            CreateWellKnownSid(WinInteractiveSid, None, Some(iu_psid), &mut iu_sid_len)
+                .expect("WinInteractiveSid");
+        }
+
+        let mut found_iu_mask = None;
+        for idx in 0..acl_info.AceCount {
+            let mut pace: *mut core::ffi::c_void = core::ptr::null_mut();
+            unsafe {
+                GetAce(pacl.cast_const(), idx, &mut pace).expect("GetAce");
+            }
+            let ace = unsafe { &*(pace as *const ACCESS_ALLOWED_ACE) };
+            let sid_ptr = PSID(
+                ((&ace.SidStart as *const u32).cast::<u8>())
+                    .cast_mut()
+                    .cast(),
+            );
+            if unsafe { EqualSid(sid_ptr, iu_psid) }.is_ok() {
+                found_iu_mask = Some(ace.Mask);
+            }
+        }
+        let iu_mask = found_iu_mask.expect("IU ACE present in PIPE_SDDL_DACL");
+        assert_eq!(iu_mask, 0x0012_019b);
+        assert_eq!(
+            iu_mask & FILE_CREATE_PIPE_INSTANCE.0,
+            0,
+            "IU ACE must not grant FILE_CREATE_PIPE_INSTANCE"
+        );
+
+        // 2. Verify a local Named Pipe created with the IU-only 0x0012019b SDDL can be opened by a
+        //    client requesting FILE_READ_DATA | FILE_WRITE_DATA and rejects extra pipe instances.
+        let dir = unique_temp_dir("pipe_sddl_client");
+        let runtime = Arc::new(MockRuntime::new(dir.clone(), 1_700_000_500));
+        let broker = Arc::new(TunnelBroker::new(runtime, test_config()));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let pipe_name = format!(
+            r"\\.\pipe\FreetonVPNServiceTest_{}_{}",
+            std::process::id(),
+            nanos
+        );
+        let test_sddl = "D:(A;;GA;;;SY)(A;;0x0012019b;;;IU)";
+        let server = create_secured_pipe_server(&pipe_name, test_sddl, true)
+            .expect("create secured test pipe");
+
+        // Second pipe instance creation without SY/BA must fail with PermissionDenied when IU
+        // lacks FILE_CREATE_PIPE_INSTANCE.
+        let squatter = create_secured_pipe_server(&pipe_name, test_sddl, false);
+        assert!(
+            matches!(squatter, Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied),
+            "expected PermissionDenied for unprivileged pipe instance, got {squatter:?}"
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.connect().await.expect("accept local test client");
+            serve_pipe_stream(server, broker).await;
+        });
+
+        let pipe_name_for_client = pipe_name.clone();
+        let client_handle = tokio::task::spawn_blocking(move || -> ServiceResponse {
+            use std::io::{BufRead, BufReader as StdBufReader, Write};
+            let mut file = std::fs::OpenOptions::new()
+                .access_mode(FILE_READ_DATA.0 | FILE_WRITE_DATA.0)
+                .open(&pipe_name_for_client)
+                .expect("client opens pipe with FILE_READ_DATA | FILE_WRITE_DATA");
+            let req = serde_json::to_string(&ServiceRequest::Status).expect("serialize");
+            writeln!(file, "{req}").expect("write status");
+            file.flush().expect("flush");
+            let mut reader = StdBufReader::new(file);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read response");
+            serde_json::from_str(line.trim()).expect("deserialize response")
+        });
+
+        let resp = tokio::time::timeout(Duration::from_secs(5), client_handle)
+            .await
+            .expect("client pipe roundtrip timed out")
+            .expect("client task");
+        assert_eq!(
+            resp,
+            ServiceResponse::Status(TunnelHealthState::Disconnected)
+        );
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server pipe shutdown timed out")
+            .expect("server task");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_console_disconnect_tears_down_while_session_lock_keeps_tunnel() {
+        assert!(should_teardown_on_session_change(
+            SessionChangeReason::SessionLogoff
+        ));
+        assert!(should_teardown_on_session_change(
+            SessionChangeReason::ConsoleDisconnect
+        ));
+        assert!(!should_teardown_on_session_change(
+            SessionChangeReason::SessionLock
+        ));
+        assert!(!should_teardown_on_session_change(
+            SessionChangeReason::SessionUnlock
+        ));
+        assert!(!should_teardown_on_session_change(
+            SessionChangeReason::ConsoleConnect
+        ));
+
+        let dir = unique_temp_dir("console_disconnect");
+        let now = 1_700_000_500;
+        let runtime = Arc::new(MockRuntime::new(dir.clone(), now));
+        {
+            let mut st = runtime.inner.lock().expect("lock");
+            st.service_states = VecDeque::from([Ok(0), Ok(4)]);
+            st.current_service_state = 4;
+            st.default_uapi = Ok(uapi_with_handshake(&sample_key_hex(0xAB), now - 2));
+            st.default_dns = true;
+        }
+
+        let broker = Arc::new(TunnelBroker::new(runtime.clone(), test_config()));
+        assert_eq!(
+            broker
+                .handle_request(ServiceRequest::Connect(sample_spec()))
+                .await,
+            ServiceResponse::Ok
+        );
+        assert!(runtime.conf_path(DEFAULT_TUNNEL_NAME).exists());
+
+        // Drive events through run_broker_lifecycle's session channel as SCM would.
+        let (_client_unused, server_unused) = tokio::io::duplex(1024);
+        let factory = Arc::new(MockPipeFactory::new(vec![Ok(MockPipeInstance::pending(
+            server_unused,
+        ))]));
+        let reporter = MockStatusReporter::new();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (session_tx, session_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let broker_for_lifecycle = Arc::clone(&broker);
+        let lifecycle_task = tokio::spawn(async move {
+            run_broker_lifecycle(
+                &reporter,
+                factory,
+                broker_for_lifecycle,
+                shutdown_rx,
+                session_rx,
+                PipeServerBackoff::default(),
+            )
+            .await
+        });
+
+        // Wait briefly until Running is reached.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Win+L (SessionLock) must leave the active tunnel connected and .conf intact.
+        session_tx
+            .send(SessionChangeReason::SessionLock)
+            .expect("send SessionLock");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert!(runtime.conf_path(DEFAULT_TUNNEL_NAME).exists());
+        assert!(matches!(
+            broker.handle_request(ServiceRequest::Status).await,
+            ServiceResponse::Status(TunnelHealthState::Connected(_))
+        ));
+
+        // Fast User Switching (ConsoleDisconnect) must tear down the tunnel and delete .conf.
+        session_tx
+            .send(SessionChangeReason::ConsoleDisconnect)
+            .expect("send ConsoleDisconnect");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!runtime.conf_path(DEFAULT_TUNNEL_NAME).exists());
+        assert_eq!(
+            broker.handle_request(ServiceRequest::Status).await,
+            ServiceResponse::Status(TunnelHealthState::Disconnected)
+        );
+
+        let _ = shutdown_tx.send(true);
+        lifecycle_task
+            .await
+            .expect("lifecycle join")
+            .expect("clean service stop");
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -288,32 +288,64 @@ fn install_broker_service() -> Result<(), String> {
     Ok(())
 }
 
-fn uninstall_broker_service() -> Result<(), String> {
-    let tunnel_svc = tunnel_service_name(DEFAULT_TUNNEL_NAME);
-    stop_and_delete_service(&tunnel_svc).map_err(|e| e.to_string())?;
-    wait_for_scm_state(&tunnel_svc, 0, Duration::from_secs(15))?;
+trait UninstallOps {
+    fn stop_and_delete_service(&self, service_name: &str) -> Result<(), String>;
+    fn wait_for_service_absent(&self, service_name: &str) -> Result<(), String>;
+    fn remove_tunnels_dir(&self, dir: &Path) -> Result<(), String>;
+}
 
-    let tunnels_dir = default_tunnels_dir();
-    match fs::remove_dir_all(&tunnels_dir) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(format!("failed removing {}: {err}", tunnels_dir.display()));
-        }
+struct RealUninstallOps;
+
+impl UninstallOps for RealUninstallOps {
+    fn stop_and_delete_service(&self, service_name: &str) -> Result<(), String> {
+        stop_and_delete_service(service_name).map_err(|e| e.to_string())
     }
 
-    stop_and_delete_service(BROKER_SERVICE_NAME).map_err(|e| e.to_string())?;
-    match wait_for_scm_state(BROKER_SERVICE_NAME, 0, Duration::from_secs(15)) {
-        Ok(()) => {}
-        Err(err) => {
-            // Confirm it wasn't just absent already.
-            if query_service_state(BROKER_SERVICE_NAME).unwrap_or(0) != 0 {
-                return Err(err);
+    fn wait_for_service_absent(&self, service_name: &str) -> Result<(), String> {
+        match wait_for_scm_state(service_name, 0, Duration::from_secs(15)) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if query_service_state(service_name).unwrap_or(0) == 0 {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
             }
         }
     }
+
+    fn remove_tunnels_dir(&self, dir: &Path) -> Result<(), String> {
+        match fs::remove_dir_all(dir) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("failed removing {}: {err}", dir.display())),
+        }
+    }
+}
+
+fn uninstall_with_ops(ops: &dyn UninstallOps, tunnels_dir: &Path) -> Result<(), String> {
+    // 1. Stop and delete FreetonVPNService FIRST so pipe IPC closes and shutdown_for_service_stop runs.
+    ops.stop_and_delete_service(BROKER_SERVICE_NAME)?;
+    ops.wait_for_service_absent(BROKER_SERVICE_NAME)?;
+
+    // 2. Clean up any remaining WireGuardTunnel$FreetonVPN service.
+    let tunnel_svc = tunnel_service_name(DEFAULT_TUNNEL_NAME);
+    ops.stop_and_delete_service(&tunnel_svc)?;
+    ops.wait_for_service_absent(&tunnel_svc)?;
+
+    // 3. Remove %ProgramData%\FreetonVPN\tunnels\.
+    ops.remove_tunnels_dir(tunnels_dir)?;
     let _ = ERROR_SERVICE_DOES_NOT_EXIST;
-    info!("Uninstalled {BROKER_SERVICE_NAME} and cleaned up {tunnel_svc}");
+    Ok(())
+}
+
+fn uninstall_broker_service() -> Result<(), String> {
+    let tunnels_dir = default_tunnels_dir();
+    uninstall_with_ops(&RealUninstallOps, &tunnels_dir)?;
+    info!(
+        "Uninstalled {BROKER_SERVICE_NAME} and cleaned up {}",
+        tunnel_service_name(DEFAULT_TUNNEL_NAME)
+    );
     Ok(())
 }
 
@@ -386,5 +418,76 @@ mod tests {
         assert!(parse_cli_args(std::slice::from_ref(&exe)).is_err());
         assert!(parse_cli_args(&[exe.clone(), OsString::from("--tunnel")]).is_err());
         assert!(parse_cli_args(&[exe, OsString::from("--unknown")]).is_err());
+    }
+
+    struct MockUninstallOps {
+        events: std::sync::Mutex<Vec<String>>,
+        fail_on: Option<&'static str>,
+    }
+
+    impl MockUninstallOps {
+        fn new(fail_on: Option<&'static str>) -> Self {
+            Self {
+                events: std::sync::Mutex::new(Vec::new()),
+                fail_on,
+            }
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().expect("lock").clone()
+        }
+    }
+
+    impl UninstallOps for MockUninstallOps {
+        fn stop_and_delete_service(&self, service_name: &str) -> Result<(), String> {
+            let mut events = self.events.lock().expect("lock");
+            events.push(format!("stop_and_delete:{service_name}"));
+            if self.fail_on == Some(service_name) {
+                return Err(format!("failed stopping {service_name}"));
+            }
+            Ok(())
+        }
+
+        fn wait_for_service_absent(&self, service_name: &str) -> Result<(), String> {
+            self.events
+                .lock()
+                .expect("lock")
+                .push(format!("wait_absent:{service_name}"));
+            Ok(())
+        }
+
+        fn remove_tunnels_dir(&self, dir: &Path) -> Result<(), String> {
+            self.events
+                .lock()
+                .expect("lock")
+                .push(format!("remove_dir:{}", dir.display()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_uninstall_stops_broker_before_tunnel_and_tunnels_dir() {
+        let dir = PathBuf::from(r"C:\ProgramData\FreetonVPN\tunnels");
+        let ops = MockUninstallOps::new(None);
+        uninstall_with_ops(&ops, &dir).expect("uninstall succeeds");
+        assert_eq!(
+            ops.events(),
+            vec![
+                "stop_and_delete:FreetonVPNService",
+                "wait_absent:FreetonVPNService",
+                "stop_and_delete:WireGuardTunnel$FreetonVPN",
+                "wait_absent:WireGuardTunnel$FreetonVPN",
+                r"remove_dir:C:\ProgramData\FreetonVPN\tunnels",
+            ]
+        );
+
+        // If stopping the broker fails, tunnel cleanup and directory removal do not proceed.
+        let failing_ops = MockUninstallOps::new(Some("FreetonVPNService"));
+        let err = uninstall_with_ops(&failing_ops, &dir).expect_err("broker failure propagates");
+        assert!(err.contains("FreetonVPNService"));
+        assert_eq!(
+            failing_ops.events(),
+            vec!["stop_and_delete:FreetonVPNService"]
+        );
     }
 }

@@ -721,10 +721,7 @@ mod tests {
         assert!(validate_tunnel_name("bad\\name").is_err());
         assert!(validate_tunnel_name("").is_err());
 
-        for sddl in [
-            RESTRICTED_TUNNEL_DIR_SDDL,
-            "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)",
-        ] {
+        for sddl in [RESTRICTED_TUNNEL_DIR_SDDL, crate::broker::PIPE_SDDL_DACL] {
             let wide = to_wide_null(sddl).expect("wide sddl");
             let mut sd = PSECURITY_DESCRIPTOR::default();
             unsafe {
