@@ -712,6 +712,8 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
     ) -> Result<(), (&'static str, String)> {
         let deadline = Instant::now() + self.config.connect_timeout;
         let mut handshaken = false;
+        let mut saw_driver_state = false;
+        let mut last_uapi_err: Option<String> = None;
 
         while Instant::now() < deadline {
             if cancel.is_cancelled() {
@@ -751,10 +753,15 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
                 uapi_res = self.runtime.read_uapi_state(&self.config.tunnel_name) => {
                     match uapi_res {
                         Ok(uapi) => {
+                            saw_driver_state = true;
+                            last_uapi_err = None;
                             let stamp = parse_uapi_latest_handshake(&uapi, &info.x25519_pubkey);
                             is_fresh_handshake(stamp, self.runtime.now_unix())
                         }
-                        Err(_) => false,
+                        Err(err) => {
+                            last_uapi_err = Some(err);
+                            false
+                        }
                     }
                 }
             };
@@ -802,9 +809,18 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
                 "WireGuard đã bắt tay nhưng DNS qua VPN chưa phản hồi. Hãy kiểm tra DNS trong Cài đặt hoặc chọn máy chủ khác.".to_owned(),
             ))
         } else {
+            let detail = match last_uapi_err {
+                Some(err) if !saw_driver_state => {
+                    warn!(error = %err, "WireGuard driver/UAPI state unreadable during connect timeout");
+                    format!("\nChi tiết driver WireGuard: {err}")
+                }
+                _ => String::new(),
+            };
             Err((
                 "HANDSHAKE_TIMEOUT",
-                "Máy chủ chưa phản hồi handshake WireGuard. Hãy thử máy chủ khác, kiểm tra cổng UDP hoặc cấp lại WireGuard Key trong Cài đặt.".to_owned(),
+                format!(
+                    "Máy chủ chưa phản hồi handshake WireGuard. Hãy thử máy chủ khác, kiểm tra cổng UDP hoặc cấp lại WireGuard Key trong Cài đặt.{detail}"
+                ),
             ))
         }
     }

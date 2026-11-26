@@ -165,12 +165,40 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
         }
     }
 
-    // 2. Central Giant iOS Pill Switch Area
-    let bottom_reserved = 166.0;
-    let center_h = (ui.available_height() - bottom_reserved).max(150.0);
-    ui.allocate_ui(Vec2::new(ui.available_width(), center_h), |ui| {
-        ui.vertical_centered(|ui| {
-            ui.add_space(10.0);
+    // 2. Central Giant iOS Pill Switch Area + 3. Location Card + 4. Bottom Action Chips
+    // Measure/reserve footer cleanly so bottom buttons never clip below CentralPanel bounds, even
+    // when top banners (toast, loading bar, or UAC service repair) reduce available height.
+    let available_after_status = ui.available_height().max(0.0);
+    let compact = available_after_status < 330.0;
+    let footer_chips_h = 34.0;
+    let footer_bottom_pad = 4.0;
+    let server_card_est_h = if compact { 88.0 } else { 96.0 };
+    let between_card_and_chips = if compact { 6.0 } else { 8.0 };
+    let reserved_bottom =
+        server_card_est_h + between_card_and_chips + footer_chips_h + footer_bottom_pad;
+
+    let toggle_h = if compact { 62.0 } else { 70.0 };
+    let toggle_w = if compact { 122.0 } else { 136.0 };
+    let inner_gap_1 = if compact { 8.0 } else { 14.0 };
+    let inner_gap_2 = if compact { 8.0 } else { 12.0 };
+    let toggle_group_h = 30.0 + inner_gap_1 + toggle_h + inner_gap_2 + 16.0;
+
+    let center_room = (available_after_status - reserved_bottom).max(toggle_group_h);
+    let extra_center = (center_room - toggle_group_h).max(0.0);
+    let top_center_pad = (extra_center * 0.45).round();
+    let bottom_center_pad = (extra_center - top_center_pad).round();
+
+    ui.allocate_ui_with_layout(
+        Vec2::new(
+            ui.available_width(),
+            top_center_pad + toggle_group_h + bottom_center_pad,
+        ),
+        Layout::top_down(Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            if top_center_pad > 0.0 {
+                ui.add_space(top_center_pad);
+            }
 
             let now_unix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -203,7 +231,7 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
             };
             let _ = pill_button(ui, &timer_text, None, timer_style);
 
-            ui.add_space(16.0);
+            ui.add_space(inner_gap_1);
 
             let toggle_on =
                 state.tunnel_running || (state.is_connecting_vpn && !state.is_disconnecting_vpn);
@@ -212,26 +240,36 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
                 toggle_on,
                 state.is_connecting_vpn,
                 state.client_config.animations_enabled,
-                Vec2::new(136.0, 70.0),
+                Vec2::new(toggle_w, toggle_h),
             )
             .clicked()
             {
                 state.toggle_vpn();
             }
 
-            ui.add_space(14.0);
+            ui.add_space(inner_gap_2);
             ui.label(
                 RichText::new("WIREGUARD  /  KẾT NỐI MÃ HÓA")
                     .size(10.5)
                     .color(C_TEXT_DIM),
             );
-        });
-    });
+            if bottom_center_pad > 0.0 {
+                ui.add_space(bottom_center_pad);
+            }
+        },
+    );
 
     // 3. Selected Server / Location Card
-    let server_card_resp =
-        rounded_card(ui, C_CARD, C_BORDER, 14, Margin::symmetric(12, 10), |ui| {
+    let card_pad_y = if compact { 8 } else { 10 };
+    let server_card_resp = rounded_card(
+        ui,
+        C_CARD,
+        C_BORDER,
+        14,
+        Margin::symmetric(12, card_pad_y),
+        |ui| {
             ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 3.0;
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("VỊ TRÍ MÁY CHỦ")
@@ -248,8 +286,6 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
                     );
                 });
             });
-
-            ui.add_space(3.0);
 
             let (title, ping_text, ping_color, load_text) =
                 if let Some(srv) = &state.selected_server {
@@ -271,7 +307,7 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
                 };
 
             ui.label(RichText::new(title).size(14.0).strong().color(C_TEXT));
-            ui.add_space(5.0);
+            ui.add_space(2.0);
 
             ui.horizontal(|ui| {
                 let ping_pill = PillStyle {
@@ -310,73 +346,81 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
                     state.show_drawer_view();
                 }
             });
-        })
-        .response
-        .interact(Sense::click())
-        .on_hover_cursor(CursorIcon::PointingHand);
+        },
+    )
+    .response
+    .interact(Sense::click())
+    .on_hover_cursor(CursorIcon::PointingHand);
 
     if server_card_resp.clicked() {
         state.show_drawer_view();
     }
 
-    // 4. Bottom Action Chips
+    // 4. Bottom Action Chips — allocate an explicit 34px strip above bottom margin so Layout::bottom_up
+    // never mis-measures horizontal row height and clips buttons past CentralPanel bounds.
     ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
         ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            let show_export = state.client_config.debug_mode;
-            let count = if show_export { 4 } else { 3 };
-            let gap = 5.0;
-            ui.spacing_mut().item_spacing.x = gap;
-            let total_w = ui.available_width();
-            let btn_w = ((total_w - gap * (count - 1) as f32) / count as f32).max(58.0);
+        let row_w = ui.available_width();
+        ui.allocate_ui_with_layout(
+            Vec2::new(row_w, footer_chips_h),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                let show_export = state.client_config.debug_mode;
+                let count = if show_export { 4 } else { 3 };
+                let gap = 5.0;
+                ui.spacing_mut().item_spacing.x = gap;
+                let total_w = ui.available_width();
+                let btn_w = ((total_w - gap * (count - 1) as f32) / count as f32).max(58.0);
 
-            if show_export
-                && pill_button(ui, "💾 Xuất .conf", Some(btn_w), PillStyle::secondary(34.0))
-                    .clicked()
-            {
-                state.export_selected_conf();
-            }
-
-            if pill_button(ui, "Cài đặt", Some(btn_w), PillStyle::secondary(34.0)).clicked() {
-                state.open_settings_dialog();
-            }
-
-            if pill_button(ui, "Giới thiệu", Some(btn_w), PillStyle::secondary(34.0)).clicked()
-            {
-                state.open_about_dialog();
-            }
-
-            let logout_style = PillStyle {
-                fg: if state.is_logged_in {
-                    C_TEXT_MUTED
-                } else {
-                    C_ACCENT
-                },
-                hover_fg: if state.is_logged_in {
-                    C_DANGER
-                } else {
-                    C_ACCENT
-                },
-                hover_border: if state.is_logged_in {
-                    C_DANGER
-                } else {
-                    C_ACCENT
-                },
-                ..PillStyle::secondary(34.0)
-            };
-            let auth_lbl = if state.is_logged_in {
-                "Đăng xuất"
-            } else {
-                "🔑 Đăng nhập"
-            };
-            if pill_button(ui, auth_lbl, Some(btn_w), logout_style).clicked() {
-                if state.is_logged_in {
-                    state.request_logout(store);
-                } else {
-                    state.show_login_view();
+                if show_export
+                    && pill_button(ui, "💾 Xuất .conf", Some(btn_w), PillStyle::secondary(34.0))
+                        .clicked()
+                {
+                    state.export_selected_conf();
                 }
-            }
-        });
+
+                if pill_button(ui, "Cài đặt", Some(btn_w), PillStyle::secondary(34.0)).clicked()
+                {
+                    state.open_settings_dialog();
+                }
+
+                if pill_button(ui, "Giới thiệu", Some(btn_w), PillStyle::secondary(34.0)).clicked()
+                {
+                    state.open_about_dialog();
+                }
+
+                let logout_style = PillStyle {
+                    fg: if state.is_logged_in {
+                        C_TEXT_MUTED
+                    } else {
+                        C_ACCENT
+                    },
+                    hover_fg: if state.is_logged_in {
+                        C_DANGER
+                    } else {
+                        C_ACCENT
+                    },
+                    hover_border: if state.is_logged_in {
+                        C_DANGER
+                    } else {
+                        C_ACCENT
+                    },
+                    ..PillStyle::secondary(34.0)
+                };
+                let auth_lbl = if state.is_logged_in {
+                    "Đăng xuất"
+                } else {
+                    "🔑 Đăng nhập"
+                };
+                if pill_button(ui, auth_lbl, Some(btn_w), logout_style).clicked() {
+                    if state.is_logged_in {
+                        state.request_logout(store);
+                    } else {
+                        state.show_login_view();
+                    }
+                }
+            },
+        );
     });
 
     let _ = C_BG;
@@ -510,5 +554,122 @@ mod tests {
             rendered.contains("DNS qua VPN chưa phản hồi."),
             "expected tunnel_unverified_reason in rendered home text: {rendered}"
         );
+    }
+
+    #[test]
+    fn test_home_layout_fits_cleanly_inside_390x610_across_banner_states() {
+        use crate::state::{LoadingState, NoticeLevel, StatusNotice};
+        use freeton_core::api::ServerNode;
+
+        fn assert_fits_without_clipping(mut state: AppState, label: &str) {
+            let ctx = egui::Context::default();
+            let store = NoopStore;
+            let raw_input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(crate::ui::WINDOW_WIDTH, crate::ui::WINDOW_HEIGHT),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw_input, |ui| {
+                crate::ui::render_root(ui, &mut state, &store);
+            });
+            out.textures_delta.clear();
+
+            let mut max_widget_bottom = 0.0f32;
+            let mut max_text_bottom = 0.0f32;
+            fn visit_bounds(
+                shape: &egui::epaint::Shape,
+                max_widget_bottom: &mut f32,
+                max_text_bottom: &mut f32,
+            ) {
+                match shape {
+                    egui::epaint::Shape::Text(t) => {
+                        let bottom = t.pos.y + t.galley.size().y;
+                        *max_text_bottom = max_text_bottom.max(bottom);
+                        *max_widget_bottom = max_widget_bottom.max(bottom);
+                    }
+                    egui::epaint::Shape::Rect(r) => {
+                        // Exclude the full-window CentralPanel background/border rect itself (height == 610).
+                        if r.rect.height() < crate::ui::WINDOW_HEIGHT - 2.0 {
+                            *max_widget_bottom = max_widget_bottom.max(r.rect.max.y);
+                        }
+                    }
+                    egui::epaint::Shape::Vec(items) => {
+                        for item in items {
+                            visit_bounds(item, max_widget_bottom, max_text_bottom);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for clipped in &out.shapes {
+                visit_bounds(&clipped.shape, &mut max_widget_bottom, &mut max_text_bottom);
+            }
+
+            let panel_inner_bottom = crate::ui::WINDOW_HEIGHT - 12.0;
+            assert!(
+                max_widget_bottom <= panel_inner_bottom + 0.5,
+                "{label}: bottom widget edge {max_widget_bottom:.1} exceeds panel bottom {panel_inner_bottom:.1}"
+            );
+            assert!(
+                max_text_bottom <= panel_inner_bottom,
+                "{label}: bottom text edge {max_text_bottom:.1} exceeds panel bottom {panel_inner_bottom:.1}"
+            );
+        }
+
+        let sample_server = ServerNode {
+            name: "SG-FREE#17".to_owned(),
+            country: "SG".to_owned(),
+            city: "Singapore".to_owned(),
+            domain: "node-sg-17.protonvpn.net".to_owned(),
+            entry_ip: "149.40.50.10".to_owned(),
+            ping_target: "149.40.50.10".to_owned(),
+            x25519_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            load: Some(77.0),
+            ping_ms: Some(57.0),
+            ..ServerNode::default()
+        };
+
+        let clean_cfg = ClientConfig {
+            debug_mode: true,
+            ..Default::default()
+        };
+        let mut clean_state = AppState::new(
+            true,
+            Some("pishun@duck.com".to_owned()),
+            clean_cfg.clone(),
+            None,
+            vec![sample_server.clone()],
+        );
+        clean_state.selected_server = Some(sample_server.clone());
+        clean_state.window_visible = true;
+        assert_fits_without_clipping(clean_state, "clean home");
+
+        let mut busy_state = AppState::new(
+            true,
+            Some("pishun@duck.com".to_owned()),
+            clean_cfg,
+            None,
+            vec![sample_server.clone()],
+        );
+        busy_state.selected_server = Some(sample_server);
+        busy_state.window_visible = true;
+        busy_state.tunnel_running = true;
+        busy_state.tunnel_verified = false;
+        busy_state.tunnel_unverified_reason =
+            Some("Chưa có handshake WireGuard hợp lệ (hết hạn hoặc chưa bắt tay).".to_owned());
+        busy_state.service_health = ServiceHealthStatus::Unavailable("Pipe unavailable".to_owned());
+        busy_state.loading = LoadingState {
+            visible: true,
+            text: "Đang thiết lập WireGuard tunnel...".to_owned(),
+            progress: 0.6,
+            hide_at: None,
+        };
+        busy_state.info_toast = Some(StatusNotice {
+            text: "🛠 ĐÃ KÍCH HOẠT CHẾ ĐỘ DEBUG! Mở khóa Xuất .conf và chi tiết lỗi.".to_owned(),
+            level: NoticeLevel::Warning,
+        });
+        assert_fits_without_clipping(busy_state, "busy stacked-banner home");
     }
 }

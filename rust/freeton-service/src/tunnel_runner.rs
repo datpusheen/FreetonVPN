@@ -1,9 +1,11 @@
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -11,9 +13,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::ClientOptions;
 use windows::core::{s, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
-    ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOT_ACTIVE,
-    HANDLE, HLOCAL, LUID, WIN32_ERROR,
+    CloseHandle, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA,
+    ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_DOES_NOT_EXIST,
+    ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOT_ACTIVE, HANDLE, HLOCAL, LUID, WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SDDL_REVISION_1,
@@ -48,8 +50,64 @@ pub const RESTRICTED_TUNNEL_DIR_SDDL: &str = "O:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;
 const UAPI_PIPE_TIMEOUT: Duration = Duration::from_secs(2);
 const DELETE_ACCESS: u32 = 0x0001_0000;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+const WG_IOCTL_INITIAL_BUFFER_BYTES: usize = 512;
+const WG_IOCTL_MAX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const WG_IOCTL_PEER_HAS_PUBLIC_KEY: u32 = 1 << 0;
 
 type WireGuardTunnelServiceFn = unsafe extern "system" fn(*const u16) -> i32;
+type WireGuardOpenAdapterFn = unsafe extern "system" fn(*const u16) -> *mut core::ffi::c_void;
+type WireGuardCloseAdapterFn = unsafe extern "system" fn(*mut core::ffi::c_void);
+type WireGuardGetConfigurationFn =
+    unsafe extern "system" fn(*mut core::ffi::c_void, *mut u8, *mut u32) -> i32;
+
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct WireGuardIoctlInterface {
+    flags: u32,
+    listen_port: u16,
+    private_key: [u8; 32],
+    public_key: [u8; 32],
+    peers_count: u32,
+}
+
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct WireGuardIoctlPeer {
+    flags: u32,
+    reserved: u32,
+    public_key: [u8; 32],
+    preshared_key: [u8; 32],
+    persistent_keepalive: u16,
+    // SOCKADDR_INET (28 bytes, 4-byte aligned) preserves 2 bytes of implicit C alignment padding.
+    endpoint: [u32; 7],
+    tx_bytes: u64,
+    rx_bytes: u64,
+    last_handshake: u64,
+    allowed_ips_count: u32,
+}
+
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct WireGuardIoctlAllowedIp {
+    address: [u8; 16],
+    address_family: u16,
+    cidr: u8,
+    flags: u32,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<WireGuardIoctlInterface>() == 80);
+    assert!(core::mem::offset_of!(WireGuardIoctlInterface, peers_count) == 72);
+    assert!(core::mem::size_of::<WireGuardIoctlPeer>() == 136);
+    assert!(core::mem::offset_of!(WireGuardIoctlPeer, public_key) == 8);
+    assert!(core::mem::offset_of!(WireGuardIoctlPeer, endpoint) == 76);
+    assert!(core::mem::offset_of!(WireGuardIoctlPeer, tx_bytes) == 104);
+    assert!(core::mem::offset_of!(WireGuardIoctlPeer, rx_bytes) == 112);
+    assert!(core::mem::offset_of!(WireGuardIoctlPeer, last_handshake) == 120);
+    assert!(core::mem::offset_of!(WireGuardIoctlPeer, allowed_ips_count) == 128);
+    assert!(core::mem::size_of::<WireGuardIoctlAllowedIp>() == 24);
+};
 
 #[derive(Debug, Error)]
 pub enum TunnelError {
@@ -654,9 +712,236 @@ pub fn stop_and_delete_service(service_name: &str) -> Result<(), TunnelError> {
     Ok(())
 }
 
-/// Queries WireGuard's Windows UAPI named pipe (`get=1\n\n`) and reads lines until the blank-line
-/// terminator (`\n\n`) or EOF.
-pub async fn query_uapi_state(tunnel_name: &str) -> Result<String, TunnelError> {
+struct WireGuardNtApi {
+    open_adapter: WireGuardOpenAdapterFn,
+    close_adapter: WireGuardCloseAdapterFn,
+    get_configuration: WireGuardGetConfigurationFn,
+}
+
+unsafe impl Send for WireGuardNtApi {}
+unsafe impl Sync for WireGuardNtApi {}
+
+struct WireGuardAdapterGuard<'a> {
+    api: &'a WireGuardNtApi,
+    handle: *mut core::ffi::c_void,
+}
+
+impl Drop for WireGuardAdapterGuard<'_> {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                (self.api.close_adapter)(self.handle);
+            }
+        }
+    }
+}
+
+impl WireGuardNtApi {
+    pub(crate) fn load_from_dll_path(dll_path: &Path) -> Result<Self, TunnelError> {
+        if !dll_path.is_file() {
+            return Err(TunnelError::MissingDependency(format!(
+                "missing required sibling DLL {}",
+                dll_path.display()
+            )));
+        }
+
+        unsafe {
+            let _ = SetDefaultDllDirectories(
+                LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            );
+        }
+
+        let wide_dll = to_wide_null(dll_path.as_os_str())?;
+        // Keep wireguard.dll loaded for the service lifetime so cached proc pointers remain valid.
+        let module = unsafe { LoadLibraryW(PCWSTR(wide_dll.as_ptr())) }.map_err(|err| {
+            TunnelError::DllLoad(format!("failed loading {}: {err}", dll_path.display()))
+        })?;
+
+        let open_ptr =
+            unsafe { GetProcAddress(module, s!("WireGuardOpenAdapter")) }.ok_or_else(|| {
+                TunnelError::DllLoad(format!(
+                    "symbol WireGuardOpenAdapter not found in {}",
+                    dll_path.display()
+                ))
+            })?;
+        let close_ptr =
+            unsafe { GetProcAddress(module, s!("WireGuardCloseAdapter")) }.ok_or_else(|| {
+                TunnelError::DllLoad(format!(
+                    "symbol WireGuardCloseAdapter not found in {}",
+                    dll_path.display()
+                ))
+            })?;
+        let get_cfg_ptr = unsafe { GetProcAddress(module, s!("WireGuardGetConfiguration")) }
+            .ok_or_else(|| {
+                TunnelError::DllLoad(format!(
+                    "symbol WireGuardGetConfiguration not found in {}",
+                    dll_path.display()
+                ))
+            })?;
+
+        Ok(Self {
+            open_adapter: unsafe {
+                core::mem::transmute::<unsafe extern "system" fn() -> isize, WireGuardOpenAdapterFn>(
+                    open_ptr,
+                )
+            },
+            close_adapter: unsafe {
+                core::mem::transmute::<unsafe extern "system" fn() -> isize, WireGuardCloseAdapterFn>(
+                    close_ptr,
+                )
+            },
+            get_configuration: unsafe {
+                core::mem::transmute::<
+                    unsafe extern "system" fn() -> isize,
+                    WireGuardGetConfigurationFn,
+                >(get_cfg_ptr)
+            },
+        })
+    }
+
+    pub(crate) fn query_configuration_bytes(
+        &self,
+        tunnel_name: &str,
+    ) -> Result<Vec<u8>, TunnelError> {
+        validate_tunnel_name(tunnel_name)?;
+        let wide_name = to_wide_null(tunnel_name)?;
+        let handle = unsafe { (self.open_adapter)(wide_name.as_ptr()) };
+        if handle.is_null() {
+            let err = io::Error::last_os_error();
+            return Err(TunnelError::Pipe(format!(
+                "WireGuardOpenAdapter({tunnel_name}) failed: {err}"
+            )));
+        }
+        let _adapter_guard = WireGuardAdapterGuard { api: self, handle };
+
+        let mut buf_size = WG_IOCTL_INITIAL_BUFFER_BYTES;
+        for _ in 0..8 {
+            let mut buf = vec![0u64; buf_size.div_ceil(8)];
+            let mut reported_bytes = u32::try_from(buf.len() * 8).unwrap_or(u32::MAX);
+            let ok = unsafe {
+                (self.get_configuration)(handle, buf.as_mut_ptr().cast::<u8>(), &mut reported_bytes)
+            };
+            if ok != 0 {
+                let actual_len = (reported_bytes as usize).min(buf.len() * 8);
+                let byte_slice =
+                    unsafe { core::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), actual_len) };
+                return Ok(byte_slice.to_vec());
+            }
+
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(ERROR_MORE_DATA.0 as i32) {
+                let needed = usize::try_from(reported_bytes).unwrap_or(0);
+                if needed == 0 || needed > WG_IOCTL_MAX_BUFFER_BYTES {
+                    return Err(TunnelError::Pipe(format!(
+                        "WireGuardGetConfiguration requested unreasonable buffer size ({needed} bytes)"
+                    )));
+                }
+                buf_size = needed.max(buf_size.saturating_mul(2));
+                continue;
+            }
+            return Err(TunnelError::Pipe(format!(
+                "WireGuardGetConfiguration({tunnel_name}) failed: {err}"
+            )));
+        }
+
+        Err(TunnelError::Pipe(format!(
+            "WireGuardGetConfiguration({tunnel_name}) exceeded buffer growth retries"
+        )))
+    }
+}
+
+fn shared_wireguard_nt_api() -> Result<&'static WireGuardNtApi, String> {
+    static API: OnceLock<Result<WireGuardNtApi, String>> = OnceLock::new();
+    let res = API.get_or_init(|| {
+        let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe_dir = exe_path
+            .parent()
+            .ok_or_else(|| "cannot resolve FreetonVPNService.exe directory".to_owned())?;
+        WireGuardNtApi::load_from_dll_path(&exe_dir.join("wireguard.dll"))
+            .map_err(|e| e.to_string())
+    });
+    match res {
+        Ok(api) => Ok(api),
+        Err(msg) => Err(msg.clone()),
+    }
+}
+
+fn filetime_100ns_to_unix_secs(filetime: u64) -> i64 {
+    if filetime <= WINDOWS_TO_UNIX_EPOCH_100NS {
+        0
+    } else {
+        i64::try_from((filetime - WINDOWS_TO_UNIX_EPOCH_100NS) / 10_000_000).unwrap_or(0)
+    }
+}
+
+/// Converts a binary `WireGuardGetConfiguration` buffer (`WIREGUARD_INTERFACE` + peers) into
+/// standard WireGuard UAPI key/value text consumable by `parse_uapi_latest_handshake`.
+pub(crate) fn parse_wireguard_nt_configuration_to_uapi(
+    bytes: &[u8],
+) -> Result<String, TunnelError> {
+    let iface_size = core::mem::size_of::<WireGuardIoctlInterface>();
+    let peer_size = core::mem::size_of::<WireGuardIoctlPeer>();
+    let allowed_ip_size = core::mem::size_of::<WireGuardIoctlAllowedIp>();
+
+    if bytes.len() < iface_size {
+        return Err(TunnelError::Pipe(format!(
+            "WireGuardGetConfiguration returned truncated header ({} bytes)",
+            bytes.len()
+        )));
+    }
+
+    let iface =
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<WireGuardIoctlInterface>()) };
+    let mut offset = iface_size;
+    let mut out = String::new();
+    let _ = writeln!(out, "listen_port={}", iface.listen_port);
+
+    for peer_idx in 0..iface.peers_count {
+        let peer_end = offset
+            .checked_add(peer_size)
+            .ok_or_else(|| TunnelError::Pipe("peer offset overflow".to_owned()))?;
+        if peer_end > bytes.len() {
+            return Err(TunnelError::Pipe(format!(
+                "WireGuardGetConfiguration truncated at peer {peer_idx}"
+            )));
+        }
+        let peer = unsafe {
+            core::ptr::read_unaligned(bytes[offset..].as_ptr().cast::<WireGuardIoctlPeer>())
+        };
+
+        if (peer.flags & WG_IOCTL_PEER_HAS_PUBLIC_KEY) != 0 {
+            let mut hex_key = String::with_capacity(64);
+            for b in peer.public_key {
+                let _ = write!(hex_key, "{b:02x}");
+            }
+            let _ = writeln!(out, "public_key={hex_key}");
+            let _ = writeln!(out, "tx_bytes={}", peer.tx_bytes);
+            let _ = writeln!(out, "rx_bytes={}", peer.rx_bytes);
+            let _ = writeln!(
+                out,
+                "last_handshake_time_sec={}",
+                filetime_100ns_to_unix_secs(peer.last_handshake)
+            );
+        }
+
+        let allowed_bytes = (peer.allowed_ips_count as usize)
+            .checked_mul(allowed_ip_size)
+            .ok_or_else(|| TunnelError::Pipe("allowed IPs size overflow".to_owned()))?;
+        offset = peer_end
+            .checked_add(allowed_bytes)
+            .ok_or_else(|| TunnelError::Pipe("allowed IPs offset overflow".to_owned()))?;
+        if offset > bytes.len() {
+            return Err(TunnelError::Pipe(format!(
+                "WireGuardGetConfiguration truncated allowed IPs for peer {peer_idx}"
+            )));
+        }
+    }
+
+    let _ = writeln!(out, "errno=0");
+    Ok(out)
+}
+
+async fn query_uapi_named_pipe(tunnel_name: &str) -> Result<String, TunnelError> {
     validate_tunnel_name(tunnel_name)?;
     let pipe_path = tunnel_uapi_pipe_name(tunnel_name);
     let client = ClientOptions::new()
@@ -707,6 +992,31 @@ pub async fn query_uapi_state(tunnel_name: &str) -> Result<String, TunnelError> 
     })
     .await
     .map_err(|_| TunnelError::Pipe("timed out reading WireGuard UAPI state".to_owned()))?
+}
+
+/// Queries WireGuard's runtime state via sibling `wireguard.dll` (`WireGuardOpenAdapter` +
+/// `WireGuardGetConfiguration`), falling back to the legacy UAPI named pipe only if `wireguard.dll`
+/// is unavailable or does not expose the adapter.
+pub async fn query_uapi_state(tunnel_name: &str) -> Result<String, TunnelError> {
+    validate_tunnel_name(tunnel_name)?;
+    let name_owned = tunnel_name.to_owned();
+    let nt_res = tokio::task::spawn_blocking(move || -> Result<String, TunnelError> {
+        let api = shared_wireguard_nt_api().map_err(TunnelError::DllLoad)?;
+        let bytes = api.query_configuration_bytes(&name_owned)?;
+        parse_wireguard_nt_configuration_to_uapi(&bytes)
+    })
+    .await
+    .map_err(|e| TunnelError::Pipe(format!("wireguard.dll query task panicked: {e}")))?;
+
+    match nt_res {
+        Ok(uapi) => Ok(uapi),
+        Err(nt_err) => {
+            if let Ok(pipe_uapi) = query_uapi_named_pipe(tunnel_name).await {
+                return Ok(pipe_uapi);
+            }
+            Err(nt_err)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -960,5 +1270,81 @@ mod tests {
         let _ = fs::remove_dir(&leaf_junction);
         let _ = fs::remove_dir(&sym_leaf);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_parse_wireguard_nt_configuration_to_uapi_roundtrips_handshake_timestamp() {
+        let peer_pubkey = [0xABu8; 32];
+        let unix_secs: u64 = 1_700_000_123;
+        let iface = WireGuardIoctlInterface {
+            flags: 0x07,
+            listen_port: 51820,
+            private_key: [0x11u8; 32],
+            public_key: [0x22u8; 32],
+            peers_count: 1,
+        };
+        let peer = WireGuardIoctlPeer {
+            flags: WG_IOCTL_PEER_HAS_PUBLIC_KEY,
+            reserved: 0,
+            public_key: peer_pubkey,
+            preshared_key: [0u8; 32],
+            persistent_keepalive: 25,
+            endpoint: [0u32; 7],
+            tx_bytes: 4096,
+            rx_bytes: 8192,
+            last_handshake: WINDOWS_TO_UNIX_EPOCH_100NS + unix_secs * 10_000_000,
+            allowed_ips_count: 1,
+        };
+        let allowed_ip = WireGuardIoctlAllowedIp {
+            address: [0u8; 16],
+            address_family: 2,
+            cidr: 0,
+            flags: 0,
+        };
+
+        let mut buf = Vec::new();
+        unsafe {
+            buf.extend_from_slice(core::slice::from_raw_parts(
+                (&raw const iface).cast::<u8>(),
+                core::mem::size_of::<WireGuardIoctlInterface>(),
+            ));
+            buf.extend_from_slice(core::slice::from_raw_parts(
+                (&raw const peer).cast::<u8>(),
+                core::mem::size_of::<WireGuardIoctlPeer>(),
+            ));
+            buf.extend_from_slice(core::slice::from_raw_parts(
+                (&raw const allowed_ip).cast::<u8>(),
+                core::mem::size_of::<WireGuardIoctlAllowedIp>(),
+            ));
+        }
+
+        let uapi = parse_wireguard_nt_configuration_to_uapi(&buf).expect("parse ioctl buffer");
+        assert!(uapi.contains("errno=0"));
+        let expected_hex = "ab".repeat(32);
+        assert_eq!(
+            freeton_core::wg::parse_uapi_latest_handshake(&uapi, &expected_hex),
+            unix_secs as i64
+        );
+
+        // Truncated header fails cleanly instead of reading out of bounds.
+        assert!(matches!(
+            parse_wireguard_nt_configuration_to_uapi(&buf[..10]),
+            Err(TunnelError::Pipe(_))
+        ));
+
+        // Verify staged wireguard.dll resolves OpenAdapter/CloseAdapter/GetConfiguration if present.
+        let staged_dll = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("assets")
+            .join("bin")
+            .join("wireguard.dll");
+        if staged_dll.is_file() {
+            let api =
+                WireGuardNtApi::load_from_dll_path(&staged_dll).expect("load staged wireguard.dll");
+            let err = api
+                .query_configuration_bytes("FreetonNonExistentAdapter999")
+                .expect_err("nonexistent adapter must return Pipe error");
+            assert!(matches!(err, TunnelError::Pipe(_)));
+        }
     }
 }
