@@ -56,8 +56,8 @@ async function initSiteMetadata() {
     published_version: '3.0.0',
     release_status: 'published',
     installer_filename: 'FreetonVPN-Setup-x64.exe',
-    installer_size_bytes: 8444515,
-    installer_sha256: 'be8e0d6581cd72744a0e43e0e99ee24d00adff8844a03a6858970bdaa6400029',
+    installer_size_bytes: 8453440,
+    installer_sha256: 'b1105c4555fa6e2382d0932d12528ac664df44014b6f5ce7c3aaba50f35ac3a4',
     download_url: 'https://github.com/datpusheen/FreetonVPN/releases/download/v3.0.0/FreetonVPN-Setup-x64.exe',
     version_manifest_url: 'https://raw.githubusercontent.com/datpusheen/FreetonVPN/refs/heads/main/version-rust.json',
     local_build_url: 'https://github.com/datpusheen/FreetonVPN/releases'

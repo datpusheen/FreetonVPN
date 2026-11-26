@@ -566,6 +566,49 @@ pub fn expected_part_filename(download_url: &str) -> String {
     format!("{filename}.part")
 }
 
+/// Validates a user-supplied custom update manifest URL (requires `https://`, or loopback `http://` for local tests).
+pub fn validate_manifest_url(raw_url: &str) -> Result<String, UpdateError> {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return Err(UpdateError::InvalidUrl(
+            "URL manifest cập nhật không được để trống.".to_owned(),
+        ));
+    }
+    let parsed = validate_download_url(trimmed)?;
+    Ok(parsed.to_string())
+}
+
+/// Fetches update metadata exclusively from a custom manifest URL without falling back to GitHub Releases.
+pub async fn fetch_custom_update_info(
+    manifest_url: &str,
+) -> Result<Option<UpdateInfo>, UpdateError> {
+    let validated = validate_manifest_url(manifest_url)?;
+    let client = build_updater_client()?;
+    let resp = client
+        .get(cache_busted_url(&validated))
+        .timeout(Duration::from_secs(6))
+        .header(
+            USER_AGENT,
+            format!("FreetonVPN-Desktop-Updater/{APP_VERSION}"),
+        )
+        .header(CACHE_CONTROL, "no-cache, no-store, must-revalidate")
+        .header(PRAGMA, "no-cache")
+        .header(EXPIRES, "0")
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(UpdateError::InvalidManifest(format!(
+            "Custom manifest URL returned HTTP {}",
+            resp.status().as_u16()
+        )));
+    }
+
+    let json_val: Value = resp.json().await?;
+    let info = parse_json_update_info(&json_val)?;
+    Ok(Some(info))
+}
+
 /// Fetches update metadata from `version-rust.json` first, falling back to the GitHub Releases
 /// API (and fetching any companion `.sha256` release asset) if the primary manifest fails.
 pub async fn fetch_update_info(
@@ -1483,5 +1526,72 @@ mod tests {
         hold.notify_one();
         server_task.abort();
         let _ = fs::remove_dir_all(&dest_dir);
+    }
+
+    #[tokio::test]
+    async fn test_validate_and_fetch_custom_update_manifest_without_production_fallback() {
+        assert!(validate_manifest_url("https://example.com/version-rust.json").is_ok());
+        assert!(validate_manifest_url("http://127.0.0.1:8080/version-rust.json").is_ok());
+        assert!(validate_manifest_url("http://localhost:8000/version.json").is_ok());
+        assert!(validate_manifest_url("http://example.com/version-rust.json").is_err());
+        assert!(validate_manifest_url("not a url").is_err());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let base_url = format!("http://{addr}");
+
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let base = base_url.clone();
+                tokio::spawn(async move {
+                    let req = read_http_request(&mut socket).await;
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("");
+                    if path.starts_with("/custom.json") {
+                        let body = serde_json::json!({
+                            "version": "3.9.0",
+                            "release_date": "2026-12-20",
+                            "title": "Dev Test v3.9.0",
+                            "changelog": ["Test manifest"],
+                            "download_url": format!("{base}/FreetonVPN-Setup-x64.exe"),
+                            "file_size_bytes": 123,
+                            "sha256": "a".repeat(64),
+                            "mandatory": false,
+                            "min_supported_version": "3.0.0"
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    } else {
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let ok_info = fetch_custom_update_info(&format!("http://{addr}/custom.json"))
+            .await
+            .expect("custom manifest fetch succeeds")
+            .expect("custom manifest parsed");
+        assert_eq!(ok_info.version, "3.9.0");
+
+        let err = fetch_custom_update_info(&format!("http://{addr}/missing.json"))
+            .await
+            .expect_err("custom URL 404 must error instead of falling back to GitHub");
+        assert!(matches!(err, UpdateError::InvalidManifest(_)));
+
+        server_task.abort();
     }
 }

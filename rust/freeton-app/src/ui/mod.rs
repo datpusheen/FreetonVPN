@@ -562,8 +562,8 @@ fn render_top_bar(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
         Vec2::new(ui.available_width(), 42.0),
         Layout::left_to_right(Align::Center),
         |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             render_brand_logo(ui, 26.0);
-            ui.add_space(6.0);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.add(
@@ -582,6 +582,7 @@ fn render_top_bar(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
             });
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
                 let close_style = PillStyle {
                     bg: C_CARD,
                     fg: C_TEXT_MUTED,
@@ -603,8 +604,6 @@ fn render_top_bar(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
                     ctx.send_viewport_cmd(ViewportCommand::Visible(false));
                 }
 
-                ui.add_space(4.0);
-
                 let refresh_style = PillStyle {
                     fg: if state.is_scanning { C_ACCENT } else { C_TEXT },
                     font_size: 14.0,
@@ -621,8 +620,6 @@ fn render_top_bar(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
                         state.show_login_view();
                     }
                 }
-
-                ui.add_space(4.0);
 
                 let chip_text = state.account_chip_text();
                 let chip_fg = if state.is_logged_in {
@@ -677,7 +674,12 @@ fn render_top_bar(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
         vec![header_bounds]
     };
 
-    let mut drag_started = false;
+    let primary_down = ctx.input(|i| i.pointer.primary_down());
+    if state.active_dialog != ActiveDialog::None || !primary_down {
+        state.window_drag_active = false;
+    }
+
+    let mut start_drag_now = false;
     for (idx, zone) in drag_zones.into_iter().enumerate() {
         if zone.width() <= 0.0 || zone.height() <= 0.0 {
             continue;
@@ -687,14 +689,15 @@ fn render_top_bar(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
             ui.scope_id().with(("top_bar_drag_zone", idx)),
             Sense::drag(),
         );
-        if resp.drag_started_by(egui::PointerButton::Primary) {
-            drag_started = true;
+        if resp.is_pointer_button_down_on() && primary_down && state.active_dialog == ActiveDialog::None
+        {
+            start_drag_now = true;
         }
     }
 
-    if drag_started {
+    if start_drag_now {
+        state.window_drag_active = true;
         state.user_has_custom_dragged = true;
-        ctx.send_viewport_cmd(ViewportCommand::StartDrag);
     }
 }
 
@@ -1098,14 +1101,43 @@ mod tests {
             );
             out3.textures_delta.clear();
 
-            let has_start_drag = |out: &egui::FullOutput| {
-                out.viewport_output
-                    .get(&egui::ViewportId::ROOT)
-                    .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::StartDrag))
-            };
-            let emitted_start_drag = has_start_drag(&out2) || has_start_drag(&out3);
+            let active_during_drag = state.window_drag_active;
 
-            (state.user_has_custom_dragged, emitted_start_drag)
+            let mut out4 = ctx.run_ui(
+                base_input(
+                    vec![egui::Event::PointerButton {
+                        pos: start_pos + drag_delta,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    0.06,
+                ),
+                |ui| {
+                    super::render_root(ui, &mut state, &store);
+                },
+            );
+            out4.textures_delta.clear();
+
+            let no_modal_start_drag = !out2
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::StartDrag))
+                && !out3
+                    .viewport_output
+                    .get(&egui::ViewportId::ROOT)
+                    .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::StartDrag));
+
+            assert!(
+                !state.window_drag_active,
+                "window_drag_active must clear when primary button releases"
+            );
+            assert!(
+                no_modal_start_drag,
+                "direct Win32 drag must not emit modal ViewportCommand::StartDrag"
+            );
+
+            (state.user_has_custom_dragged, active_during_drag)
         }
 
         // Empty middle space between brand header and account chip

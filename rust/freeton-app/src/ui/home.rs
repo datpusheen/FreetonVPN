@@ -171,7 +171,7 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
     let available_after_status = ui.available_height().max(0.0);
     let compact = available_after_status < 330.0;
     let footer_chips_h = 34.0;
-    let footer_bottom_pad = 4.0;
+    let footer_bottom_pad = 2.0;
     let server_card_est_h = if compact { 88.0 } else { 96.0 };
     let between_card_and_chips = if compact { 6.0 } else { 8.0 };
     let reserved_bottom =
@@ -179,13 +179,13 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
 
     let toggle_h = if compact { 62.0 } else { 70.0 };
     let toggle_w = if compact { 122.0 } else { 136.0 };
-    let inner_gap_1 = if compact { 8.0 } else { 14.0 };
+    let inner_gap_1 = if compact { 8.0 } else { 12.0 };
     let inner_gap_2 = if compact { 8.0 } else { 12.0 };
     let toggle_group_h = 30.0 + inner_gap_1 + toggle_h + inner_gap_2 + 16.0;
 
     let center_room = (available_after_status - reserved_bottom).max(toggle_group_h);
     let extra_center = (center_room - toggle_group_h).max(0.0);
-    let top_center_pad = (extra_center * 0.45).round();
+    let top_center_pad = (extra_center * 0.5).round();
     let bottom_center_pad = (extra_center - top_center_pad).round();
 
     ui.allocate_ui_with_layout(
@@ -330,6 +330,7 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
             ui.add_space(2.0);
 
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
                 let ping_pill = PillStyle {
                     bg: C_CARD_HIGH,
                     fg: ping_color,
@@ -346,8 +347,6 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
                 if pill_button(ui, &ping_text, None, ping_pill).clicked() {
                     state.show_drawer_view();
                 }
-
-                ui.add_space(6.0);
 
                 let load_pill = PillStyle {
                     bg: C_CARD_HIGH,
@@ -381,7 +380,6 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
     // 4. Bottom Action Chips — allocate an explicit 34px strip above bottom margin so Layout::bottom_up
     // never mis-measures horizontal row height and clips buttons past CentralPanel bounds.
     ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-        ui.add_space(2.0);
         let row_w = ui.available_width();
         ui.allocate_ui_with_layout(
             Vec2::new(row_w, footer_chips_h),
@@ -389,25 +387,27 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
             |ui| {
                 let show_export = state.client_config.debug_mode;
                 let count = if show_export { 4 } else { 3 };
-                let gap = 5.0;
+                let gap = 6.0;
                 ui.spacing_mut().item_spacing.x = gap;
                 let total_w = ui.available_width();
                 let btn_w = ((total_w - gap * (count - 1) as f32) / count as f32).max(58.0);
+                let chip_style = PillStyle {
+                    font_size: if show_export { 11.0 } else { 12.0 },
+                    pad_x: if show_export { 6.0 } else { 10.0 },
+                    ..PillStyle::secondary(34.0)
+                };
 
                 if show_export
-                    && pill_button(ui, "💾 Xuất .conf", Some(btn_w), PillStyle::secondary(34.0))
-                        .clicked()
+                    && pill_button(ui, "💾 Xuất .conf", Some(btn_w), chip_style).clicked()
                 {
                     state.export_selected_conf();
                 }
 
-                if pill_button(ui, "Cài đặt", Some(btn_w), PillStyle::secondary(34.0)).clicked()
-                {
+                if pill_button(ui, "Cài đặt", Some(btn_w), chip_style).clicked() {
                     state.open_settings_dialog();
                 }
 
-                if pill_button(ui, "Giới thiệu", Some(btn_w), PillStyle::secondary(34.0)).clicked()
-                {
+                if pill_button(ui, "Giới thiệu", Some(btn_w), chip_style).clicked() {
                     state.open_about_dialog();
                 }
 
@@ -427,7 +427,7 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
                     } else {
                         C_ACCENT
                     },
-                    ..PillStyle::secondary(34.0)
+                    ..chip_style
                 };
                 let auth_lbl = if state.is_logged_in {
                     "Đăng xuất"

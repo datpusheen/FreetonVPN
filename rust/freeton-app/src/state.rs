@@ -18,8 +18,9 @@ use freeton_core::storage::{
     KEYRING_ACCOUNT_WG_CONFIG, KEYRING_SERVICE_WG,
 };
 use freeton_core::updater::{
-    download_and_verify_update, expected_part_filename, fetch_update_info, is_newer_version,
-    UpdateAction, UpdateError, UpdateInfo,
+    download_and_verify_update, expected_part_filename, fetch_custom_update_info,
+    fetch_update_info, is_newer_version, validate_manifest_url, UpdateAction, UpdateError,
+    UpdateInfo,
 };
 use freeton_core::wg::{
     validate_address_list, validate_and_build_conf, validate_dns_list, validate_port_str,
@@ -524,6 +525,7 @@ pub struct SettingsDraft {
     pub address: String,
     pub dns: String,
     pub port: String,
+    pub custom_update_url: String,
     pub original_private_key: String,
     pub imported_from_conf: bool,
 }
@@ -541,6 +543,7 @@ impl SettingsDraft {
             address: cfg.address.clone(),
             dns: cfg.dns.clone(),
             port: cfg.port.clone(),
+            custom_update_url: cfg.custom_update_url.clone(),
             original_private_key: cfg.private_key.clone(),
             imported_from_conf: false,
         }
@@ -621,6 +624,7 @@ pub enum UiCommand {
     },
     CheckForUpdates {
         manual: bool,
+        manifest_url_override: Option<String>,
     },
     StartUpdateDownload {
         generation: u64,
@@ -890,6 +894,7 @@ pub struct AppState {
     pub settings_status_msg: Option<StatusNotice>,
     pub settings_middle_hold: MiddleHoldTracker,
     pub window_visible: bool,
+    pub window_drag_active: bool,
     pub user_has_custom_dragged: bool,
     pub drawer_scroll_to_top: bool,
     auth_generation_shared: Arc<AtomicU64>,
@@ -993,6 +998,7 @@ impl AppState {
             settings_status_msg: None,
             settings_middle_hold: MiddleHoldTracker::default(),
             window_visible: true,
+            window_drag_active: false,
             user_has_custom_dragged: false,
             drawer_scroll_to_top: false,
             auth_generation_shared,
@@ -1260,6 +1266,29 @@ impl AppState {
                     level: NoticeLevel::Error,
                 });
                 return;
+            }
+        };
+
+        let custom_update_raw = self.settings_draft.custom_update_url.trim();
+        cfg.custom_update_url = if custom_update_raw.is_empty() {
+            String::new()
+        } else {
+            match validate_manifest_url(custom_update_raw) {
+                Ok(url) => url,
+                Err(err) => {
+                    let msg = format!(
+                        "❌ Update Manifest URL không hợp lệ (cần https:// hoặc http://127.0.0.1 / localhost): {err}"
+                    );
+                    self.settings_status_msg = Some(StatusNotice {
+                        text: msg.clone(),
+                        level: NoticeLevel::Error,
+                    });
+                    self.info_toast = Some(StatusNotice {
+                        text: msg,
+                        level: NoticeLevel::Error,
+                    });
+                    return;
+                }
             }
         };
 
@@ -1640,13 +1669,45 @@ impl AppState {
         });
     }
 
-    pub fn check_for_updates(&mut self, manual: bool) {
+    fn dispatch_check_for_updates(&mut self, manual: bool, manifest_url_override: Option<String>) {
         if manual {
             self.update_check_pending = true;
             self.update_check_message = None;
         }
-        self.pending_commands
-            .push(UiCommand::CheckForUpdates { manual });
+        self.pending_commands.push(UiCommand::CheckForUpdates {
+            manual,
+            manifest_url_override,
+        });
+    }
+
+    pub fn check_for_updates(&mut self, manual: bool) {
+        let override_url = self.client_config.custom_update_url.trim().to_owned();
+        let opt = (!override_url.is_empty()).then_some(override_url);
+        self.dispatch_check_for_updates(manual, opt);
+    }
+
+    pub fn check_for_updates_with_override(&mut self, manual: bool, raw_url: &str) {
+        let trimmed = raw_url.trim();
+        if trimmed.is_empty() {
+            self.dispatch_check_for_updates(manual, None);
+            return;
+        }
+        match validate_manifest_url(trimmed) {
+            Ok(url) => self.dispatch_check_for_updates(manual, Some(url)),
+            Err(err) => {
+                let msg = format!(
+                    "❌ Update Manifest URL không hợp lệ (cần https:// hoặc http://127.0.0.1 / localhost): {err}"
+                );
+                self.settings_status_msg = Some(StatusNotice {
+                    text: msg.clone(),
+                    level: NoticeLevel::Error,
+                });
+                self.info_toast = Some(StatusNotice {
+                    text: msg,
+                    level: NoticeLevel::Error,
+                });
+            }
+        }
     }
 
     pub fn save_client_config(&mut self, config: ClientConfig) {
@@ -2691,8 +2752,11 @@ pub async fn handle_ui_command(
                 emit(tx, wake, WorkerEvent::PublicIpResolved { generation, ip });
             }
         }
-        UiCommand::CheckForUpdates { manual } => {
-            handle_check_updates(&deps, manual, tx, wake).await;
+        UiCommand::CheckForUpdates {
+            manual,
+            manifest_url_override,
+        } => {
+            handle_check_updates(&deps, manual, manifest_url_override, tx, wake).await;
         }
         UiCommand::StartUpdateDownload { generation, info } => {
             handle_start_update_download(&deps, generation, info, tx, wake).await;
@@ -3344,15 +3408,25 @@ async fn handle_disconnect(
 async fn handle_check_updates(
     deps: &WorkerDeps,
     manual: bool,
+    manifest_url_override: Option<String>,
     tx: &mpsc::UnboundedSender<WorkerEvent>,
     wake: &(dyn Fn() + Send + Sync),
 ) {
-    match fetch_update_info(
-        deps.update_manifest_url.as_deref(),
-        deps.update_repo.as_deref(),
-    )
-    .await
+    let result = if let Some(custom_url) = manifest_url_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
     {
+        fetch_custom_update_info(custom_url).await
+    } else {
+        fetch_update_info(
+            deps.update_manifest_url.as_deref(),
+            deps.update_repo.as_deref(),
+        )
+        .await
+    };
+
+    match result {
         Ok(Some(info)) if is_newer_version(APP_VERSION, &info.version) => {
             emit(tx, wake, WorkerEvent::UpdateAvailable { info });
         }
@@ -5279,5 +5353,46 @@ mod tests {
         assert!(follow_up_cmds
             .iter()
             .any(|c| matches!(c, UiCommand::RefreshStartupStatus)));
+    }
+
+    #[test]
+    fn test_custom_update_url_validation_persistence_and_check_dispatch() {
+        let mut state = AppState::new(
+            true,
+            Some("user@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            Vec::new(),
+        );
+        let _ = state.drain_commands();
+
+        state.open_settings_dialog();
+        state.settings_draft.custom_update_url = "http://insecure.example.com/v.json".to_owned();
+        state.save_settings_dialog();
+        assert_eq!(
+            state.active_dialog,
+            ActiveDialog::Settings,
+            "invalid non-loopback http custom_update_url must keep Settings open with error"
+        );
+        assert!(state.client_config.custom_update_url.is_empty());
+
+        state.settings_draft.custom_update_url = "  http://127.0.0.1:8080/version-rust.json  ".to_owned();
+        state.save_settings_dialog();
+        assert_eq!(state.active_dialog, ActiveDialog::None);
+        assert_eq!(
+            state.client_config.custom_update_url,
+            "http://127.0.0.1:8080/version-rust.json"
+        );
+
+        let _ = state.drain_commands();
+        state.check_for_updates(true);
+        let cmds = state.drain_commands();
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::CheckForUpdates {
+                manual: true,
+                manifest_url_override: Some(url),
+            } if url == "http://127.0.0.1:8080/version-rust.json"
+        )));
     }
 }

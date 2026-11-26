@@ -737,6 +737,7 @@ mod tests {
             animations_enabled: true,
             auto_check_update: true,
             debug_mode: false,
+            ..ClientConfig::default()
         }
     }
 

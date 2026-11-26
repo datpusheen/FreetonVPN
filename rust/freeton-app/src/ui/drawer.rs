@@ -195,7 +195,7 @@ pub fn render_drawer_view(ui: &mut Ui, state: &mut AppState) {
 
     // 4. Sort Bar
     ui.horizontal(|ui| {
-        let gap = 3.0;
+        let gap = 4.0;
         ui.spacing_mut().item_spacing.x = gap;
         ui.label(
             RichText::new("Sắp xếp:")
@@ -335,7 +335,7 @@ fn render_server_row(
     is_connected: bool,
     debug_mode: bool,
 ) -> (bool, bool) {
-    let row_h = if is_best { 74.0 } else { SERVER_ROW_HEIGHT };
+    let row_h = if is_best { 72.0 } else { SERVER_ROW_HEIGHT };
     // Inside ScrollArea, leave a small gap for the floating scrollbar when not the top best card.
     let width = if is_best {
         ui.available_width().max(60.0)

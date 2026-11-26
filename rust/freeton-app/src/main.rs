@@ -15,16 +15,19 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, RECT, TRUE,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, POINT, RECT, TRUE,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE,
 };
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_LBUTTON,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetWindowRect, IsIconic, SetForegroundWindow, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
-    SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    FindWindowW, GetCursorPos, GetWindowRect, IsIconic, SetForegroundWindow, SetWindowPos,
+    ShowWindow, SystemParametersInfoW, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_RESTORE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
 };
 
 use state::{spawn_worker_runtime, AppState, UiCommand, WorkerDeps, WorkerEvent};
@@ -154,6 +157,30 @@ fn should_reveal_window(was_visible: bool, is_visible: bool, force_reveal: bool)
     is_visible && (!was_visible || force_reveal)
 }
 
+pub(crate) fn compute_window_drag_position(
+    start_win_x: i32,
+    start_win_y: i32,
+    start_cursor_x: i32,
+    start_cursor_y: i32,
+    cur_cursor_x: i32,
+    cur_cursor_y: i32,
+) -> (i32, i32) {
+    (
+        start_win_x + (cur_cursor_x - start_cursor_x),
+        start_win_y + (cur_cursor_y - start_cursor_y),
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveWindowDrag {
+    start_win_x: i32,
+    start_win_y: i32,
+    start_cursor_x: i32,
+    start_cursor_y: i32,
+    last_x: i32,
+    last_y: i32,
+}
+
 struct FreetonDesktopApp {
     state: AppState,
     store: Arc<dyn CredentialStore>,
@@ -163,6 +190,7 @@ struct FreetonDesktopApp {
     tray: Option<TrayController>,
     dwm_initialized: bool,
     last_window_visible: bool,
+    active_drag: Option<ActiveWindowDrag>,
 }
 
 impl FreetonDesktopApp {
@@ -204,6 +232,74 @@ impl FreetonDesktopApp {
             tray,
             dwm_initialized: false,
             last_window_visible,
+            active_drag: None,
+        }
+    }
+
+    fn sync_direct_window_drag(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let lbutton_down = unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 };
+        if !self.state.window_drag_active || !lbutton_down {
+            if self.active_drag.take().is_some() {
+                self.state.window_drag_active = false;
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+            }
+            return;
+        }
+
+        let Some(hwnd) = extract_hwnd(frame) else {
+            return;
+        };
+
+        let mut cursor = POINT::default();
+        if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+            return;
+        }
+
+        if self.active_drag.is_none() {
+            let mut win_rect = RECT::default();
+            if unsafe { GetWindowRect(hwnd, &mut win_rect) }.is_err() {
+                return;
+            }
+            unsafe {
+                SetCapture(hwnd);
+            }
+            self.active_drag = Some(ActiveWindowDrag {
+                start_win_x: win_rect.left,
+                start_win_y: win_rect.top,
+                start_cursor_x: cursor.x,
+                start_cursor_y: cursor.y,
+                last_x: win_rect.left,
+                last_y: win_rect.top,
+            });
+        }
+
+        if let Some(drag) = &mut self.active_drag {
+            let (new_x, new_y) = compute_window_drag_position(
+                drag.start_win_x,
+                drag.start_win_y,
+                drag.start_cursor_x,
+                drag.start_cursor_y,
+                cursor.x,
+                cursor.y,
+            );
+            if new_x != drag.last_x || new_y != drag.last_y {
+                drag.last_x = new_x;
+                drag.last_y = new_y;
+                let _ = unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        None,
+                        new_x,
+                        new_y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                };
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(8));
         }
     }
 
@@ -315,11 +411,14 @@ impl FreetonDesktopApp {
 impl eframe::App for FreetonDesktopApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.pump_events_and_commands(ctx, frame);
+        self.sync_direct_window_drag(ctx, frame);
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         render_root(ui, &mut self.state, self.store.as_ref());
+        let ctx = ui.ctx().clone();
+        self.sync_direct_window_drag(&ctx, frame);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -373,7 +472,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::should_reveal_window;
+    use super::{compute_window_drag_position, should_reveal_window};
 
     #[test]
     fn test_window_reveal_transition_handles_tray_and_background_events() {
@@ -381,5 +480,13 @@ mod tests {
         assert!(should_reveal_window(true, true, true));
         assert!(!should_reveal_window(true, true, false));
         assert!(!should_reveal_window(false, false, true));
+    }
+
+    #[test]
+    fn test_compute_window_drag_position_tracks_cursor_delta_1_to_1() {
+        assert_eq!(
+            compute_window_drag_position(1200, 300, 1300, 320, 1250, 365),
+            (1150, 345)
+        );
     }
 }

@@ -13,7 +13,7 @@ pub fn render_login_view(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(4.0);
 
     // 1. Hero Brand Card
-    rounded_card(ui, C_CARD, C_BORDER, 16, Margin::same(16), |ui| {
+    rounded_card(ui, C_CARD, C_BORDER, 14, Margin::same(14), |ui| {
         ui.set_width(ui.available_width());
         ui.vertical_centered(|ui| {
             crate::ui::render_brand_logo(ui, 42.0);
@@ -37,7 +37,7 @@ pub fn render_login_view(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(10.0);
 
     // 2. Login Prompt Card
-    rounded_card(ui, C_CARD_HIGH, C_BORDER, 12, Margin::same(12), |ui| {
+    rounded_card(ui, C_CARD_HIGH, C_BORDER, 14, Margin::same(14), |ui| {
         ui.set_width(ui.available_width());
         ui.label(
             RichText::new("🔒 YÊU CẦU ĐĂNG NHẬP")
@@ -60,7 +60,7 @@ pub fn render_login_view(ui: &mut Ui, state: &mut AppState) {
         );
     });
 
-    ui.add_space(14.0);
+    ui.add_space(12.0);
 
     // 3. Primary SRP Login CTA (Browser login permanently removed)
     let w = ui.available_width();
@@ -167,7 +167,14 @@ pub fn render_srp_view(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(2.0);
     rounded_card(ui, C_CARD, C_BORDER, 10, Margin::symmetric(8, 6), |ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("✉").size(12.5).color(C_TEXT_DIM));
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.allocate_ui_with_layout(
+                Vec2::new(18.0, 20.0),
+                Layout::centered_and_justified(egui::Direction::LeftToRight),
+                |ui| {
+                    ui.label(RichText::new("✉").size(12.5).color(C_TEXT_DIM));
+                },
+            );
             let resp = ui.add_sized(
                 Vec2::new(ui.available_width(), 20.0),
                 TextEdit::singleline(&mut state.srp_username)
@@ -193,8 +200,15 @@ pub fn render_srp_view(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(2.0);
     rounded_card(ui, C_CARD, C_BORDER, 10, Margin::symmetric(8, 6), |ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("🔒").size(12.5).color(C_TEXT_DIM));
-            let eye_w = 24.0;
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.allocate_ui_with_layout(
+                Vec2::new(18.0, 20.0),
+                Layout::centered_and_justified(egui::Direction::LeftToRight),
+                |ui| {
+                    ui.label(RichText::new("🔒").size(12.5).color(C_TEXT_DIM));
+                },
+            );
+            let eye_w = 22.0;
             let input_w = (ui.available_width() - eye_w - 6.0).max(80.0);
             let resp = ui.add_sized(
                 Vec2::new(input_w, 20.0),
@@ -214,7 +228,12 @@ pub fn render_srp_view(ui: &mut Ui, state: &mut AppState) {
                 C_TEXT_DIM
             };
             let eye_resp = ui
-                .label(RichText::new("👁").size(13.0).color(eye_color))
+                .allocate_ui_with_layout(
+                    Vec2::new(eye_w, 20.0),
+                    Layout::centered_and_justified(egui::Direction::LeftToRight),
+                    |ui| ui.label(RichText::new("👁").size(13.0).color(eye_color)),
+                )
+                .inner
                 .interact(Sense::click())
                 .on_hover_cursor(CursorIcon::PointingHand);
             if eye_resp.clicked() {
@@ -235,7 +254,14 @@ pub fn render_srp_view(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(2.0);
     rounded_card(ui, C_CARD, C_BORDER, 10, Margin::symmetric(8, 6), |ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("🛡").size(12.0).color(C_TEXT_DIM));
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.allocate_ui_with_layout(
+                Vec2::new(18.0, 20.0),
+                Layout::centered_and_justified(egui::Direction::LeftToRight),
+                |ui| {
+                    ui.label(RichText::new("🛡").size(12.0).color(C_TEXT_DIM));
+                },
+            );
             let resp = ui.add_sized(
                 Vec2::new(ui.available_width(), 20.0),
                 TextEdit::singleline(&mut state.srp_2fa)

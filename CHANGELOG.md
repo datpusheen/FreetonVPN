@@ -1,3 +1,13 @@
+# 3.0.0 — viết lại hoàn toàn bằng Rust gốc cho Windows x64 (2026-11-26)
+
+- Viết lại toàn bộ ứng dụng desktop bằng Rust x64 (`FreetonVPN.exe` với `eframe`/`egui` + dịch vụ nền `FreetonVPNService.exe`), loại bỏ Python, GPG, Playwright và PyInstaller.
+- Nhúng sẵn thư viện WireGuardNT (`tunnel.dll` v1.1.1 + `wireguard.dll` 1.1), hỗ trợ bật/tắt VPN không cần hỏi UAC và đọc thống kê handshake trực tiếp từ driver.
+- Triển khai xác thực Proton SRP + xác minh OpenPGP modulus thuần Rust, hỗ trợ 2FA và modal WebView2 CAPTCHA tích hợp; lưu token trong Windows Credential Manager.
+- Quét ping ICMP đa luồng bằng Win32 `IcmpSendEcho`, phân màu chỉ số ping/tải xanh-vàng-đỏ, xác minh handshake + DNS qua tunnel trước khi báo Đã kết nối.
+- Bổ sung giao diện cài đặt nâng cao (cấp key API, nhập `.conf`, tùy chỉnh DNS/Port, chạy cùng Windows, sửa dịch vụ), logo thương hiệu, hiệu ứng chuyển cảnh đối xứng, kéo cửa sổ trực tiếp bằng Win32 không khựng và bộ cài NSIS x64 (`FreetonVPN-Setup-x64.exe`).
+- Bổ sung tùy chọn `Update Manifest URL` ẩn trong Dev Mode (giữ chuột giữa 750ms ở Cài đặt) để kiểm thử cập nhật cục bộ/staging.
+- Tách kênh tự động cập nhật sang `version-rust.json` và đối chiếu SHA-256 nghiêm ngặt trước khi chạy trình cài đặt nâng cấp `/S`.
+
 # 2.4.3 — bản Windows đã xác nhận kết nối (2026-10-12)
 
 - Đóng gói lại client Windows hiện tại thành v2.4.3 sau khi xác nhận kết nối WireGuard thành công.

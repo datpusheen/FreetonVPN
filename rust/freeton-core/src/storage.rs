@@ -220,6 +220,8 @@ pub struct ClientConfig {
     pub auto_check_update: bool,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub debug_mode: bool,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub custom_update_url: String,
 }
 
 impl Default for ClientConfig {
@@ -234,6 +236,7 @@ impl Default for ClientConfig {
             animations_enabled: true,
             auto_check_update: true,
             debug_mode: false,
+            custom_update_url: String::new(),
         }
     }
 }
@@ -1148,6 +1151,21 @@ mod tests {
                 r"C:\Program Files\FreetonVPN\FreetonVPN.exe"
             )),
             r#""C:\Program Files\FreetonVPN\FreetonVPN.exe""#
+        );
+    }
+
+    #[test]
+    fn test_client_config_custom_update_url_roundtrips_and_defaults_empty() {
+        let legacy: ClientConfig = serde_json::from_str("{}").expect("deserialize empty legacy");
+        assert!(legacy.custom_update_url.is_empty());
+
+        let mut cfg = ClientConfig::default();
+        cfg.custom_update_url = "http://127.0.0.1:8080/version-rust.json".to_owned();
+        let encoded = serde_json::to_string(&cfg).expect("serialize");
+        let decoded: ClientConfig = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(
+            decoded.custom_update_url,
+            "http://127.0.0.1:8080/version-rust.json"
         );
     }
 }

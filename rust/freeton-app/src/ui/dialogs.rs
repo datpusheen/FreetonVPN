@@ -365,23 +365,24 @@ fn render_logout_confirm_dialog(ui: &mut Ui, state: &mut AppState, store: &dyn C
     );
     ui.add_space(14.0);
     ui.horizontal(|ui| {
-        if pill_button(ui, "Hủy", Some(110.0), PillStyle::secondary(32.0)).clicked() {
+        let gap = 8.0;
+        ui.spacing_mut().item_spacing.x = gap;
+        let half_w = ((ui.available_width() - gap) * 0.5).max(100.0);
+        if pill_button(ui, "Hủy", Some(half_w), PillStyle::secondary(32.0)).clicked() {
             state.close_dialog();
         }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let danger_style = PillStyle {
-                bg: C_DANGER,
-                fg: Color32::BLACK,
-                border: C_DANGER,
-                hover_bg: Color32::from_rgb(0xf4, 0xb8, 0xb8),
-                hover_fg: Color32::BLACK,
-                hover_border: C_DANGER,
-                ..PillStyle::accent(32.0)
-            };
-            if pill_button(ui, "Đăng xuất", Some(120.0), danger_style).clicked() {
-                state.request_logout(store);
-            }
-        });
+        let danger_style = PillStyle {
+            bg: C_DANGER,
+            fg: Color32::BLACK,
+            border: C_DANGER,
+            hover_bg: Color32::from_rgb(0xf4, 0xb8, 0xb8),
+            hover_fg: Color32::BLACK,
+            hover_border: C_DANGER,
+            ..PillStyle::accent(32.0)
+        };
+        if pill_button(ui, "Đăng xuất", Some(half_w), danger_style).clicked() {
+            state.request_logout(store);
+        }
     });
 }
 
@@ -441,21 +442,24 @@ fn render_about_dialog(ui: &mut Ui, state: &mut AppState) {
 
     ui.add_space(12.0);
     ui.horizontal(|ui| {
+        let gap = 8.0;
+        ui.spacing_mut().item_spacing.x = gap;
+        let total_w = ui.available_width();
+        let left_w = ((total_w - gap) * 0.56).round().max(150.0);
+        let right_w = (total_w - gap - left_w).max(100.0);
         let chk_label = if state.update_check_pending {
             "Đang kiểm tra..."
         } else {
             "🔄 Kiểm tra bản mới"
         };
-        if pill_button(ui, chk_label, Some(152.0), PillStyle::secondary(32.0)).clicked()
+        if pill_button(ui, chk_label, Some(left_w), PillStyle::secondary(32.0)).clicked()
             && !state.update_check_pending
         {
             state.check_for_updates(true);
         }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if pill_button(ui, "Đóng", Some(104.0), PillStyle::accent(32.0)).clicked() {
-                state.close_dialog();
-            }
-        });
+        if pill_button(ui, "Đóng", Some(right_w), PillStyle::accent(32.0)).clicked() {
+            state.close_dialog();
+        }
     });
 }
 
@@ -507,9 +511,73 @@ fn render_settings_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState
         .max_height(390.0)
         .auto_shrink([false, true])
         .show(ui, |ui| {
+            let section_w = (ui.available_width() - 6.0).max(120.0);
+            if state.client_config.debug_mode {
+                rounded_card(ui, C_SURFACE, C_BORDER, 10, Margin::same(10), |ui| {
+                    ui.set_width(section_w);
+                    ui.label(
+                        RichText::new("🛠️ CÀI ĐẶT DEV (DEV MODE)")
+                            .size(10.0)
+                            .strong()
+                            .color(C_ACCENT),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("UPDATE MANIFEST URL (ĐỂ TRỐNG = PRODUCTION)")
+                            .size(9.5)
+                            .strong()
+                            .color(C_TEXT_MUTED),
+                    );
+                    ui.add_space(2.0);
+                    rounded_card(ui, C_BG, C_BORDER, 8, Margin::symmetric(8, 5), |ui| {
+                        let url_w = ui.available_width().max(80.0);
+                        ui.add_sized(
+                            Vec2::new(url_w, 20.0),
+                            TextEdit::singleline(&mut state.settings_draft.custom_update_url)
+                                .frame(egui::Frame::NONE)
+                                .font(TextStyle::Monospace)
+                                .desired_width(url_w)
+                                .hint_text("https://... hoặc http://127.0.0.1:8000/version-rust.json")
+                                .text_color(C_TEXT),
+                        );
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let half_w = ((ui.available_width() - 6.0) * 0.5).max(100.0);
+                        let reset_style = PillStyle {
+                            font_size: 11.0,
+                            pad_x: 6.0,
+                            ..PillStyle::secondary(28.0)
+                        };
+                        if pill_button(ui, "↺ Mặc định", Some(half_w), reset_style).clicked() {
+                            state.settings_draft.custom_update_url.clear();
+                        }
+                        let test_lbl = if state.update_check_pending {
+                            "Đang kiểm tra..."
+                        } else {
+                            "🔄 Kiểm tra URL này"
+                        };
+                        let test_style = PillStyle {
+                            fg: C_ACCENT,
+                            font_size: 11.0,
+                            pad_x: 6.0,
+                            ..PillStyle::secondary(28.0)
+                        };
+                        if pill_button(ui, test_lbl, Some(half_w), test_style).clicked()
+                            && !state.update_check_pending
+                        {
+                            let draft_url = state.settings_draft.custom_update_url.clone();
+                            state.check_for_updates_with_override(true, &draft_url);
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+            }
+
             // Section 1: App Settings
             rounded_card(ui, C_SURFACE, C_BORDER, 10, Margin::same(10), |ui| {
-                ui.set_width(ui.available_width());
+                ui.set_width(section_w);
                 ui.label(
                     RichText::new("⚙️ CÀI ĐẶT ỨNG DỤNG")
                         .size(10.0)
@@ -649,7 +717,7 @@ fn render_settings_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState
 
             // Section 2: Service Health & Repair
             rounded_card(ui, C_SURFACE, C_BORDER, 10, Margin::same(10), |ui| {
-                ui.set_width(ui.available_width());
+                ui.set_width(section_w);
                 ui.label(
                     RichText::new("🔧 DỊCH VỤ NỀN WIREGUARD")
                         .size(10.0)
@@ -742,7 +810,7 @@ fn render_settings_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState
 
             // Section 3: WireGuard & Network
             rounded_card(ui, C_SURFACE, C_BORDER, 10, Margin::same(10), |ui| {
-                ui.set_width(ui.available_width());
+                ui.set_width(section_w);
                 ui.label(
                     RichText::new("🛡️ CÀI ĐẶT WIREGUARD & MẠNG")
                         .size(10.0)
@@ -869,15 +937,17 @@ fn render_settings_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState
 
     ui.add_space(10.0);
     ui.horizontal(|ui| {
-        if pill_button(ui, "Đóng", Some(104.0), PillStyle::secondary(32.0)).clicked() {
+        let gap = 8.0;
+        ui.spacing_mut().item_spacing.x = gap;
+        let total_w = ui.available_width();
+        let left_w = ((total_w - gap) * 0.36).round().max(100.0);
+        let right_w = (total_w - gap - left_w).max(140.0);
+        if pill_button(ui, "Đóng", Some(left_w), PillStyle::secondary(32.0)).clicked() {
             state.close_dialog();
         }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if pill_button(ui, "💾 Lưu & Áp dụng", Some(156.0), PillStyle::accent(32.0)).clicked()
-            {
-                state.save_settings_dialog();
-            }
-        });
+        if pill_button(ui, "💾 Lưu & Áp dụng", Some(right_w), PillStyle::accent(32.0)).clicked() {
+            state.save_settings_dialog();
+        }
     });
 }
 
@@ -1030,7 +1100,10 @@ fn render_update_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) 
                 );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if pill_button(ui, "Tiếp tục tải", Some(120.0), PillStyle::secondary(28.0))
+                    let gap = 6.0;
+                    ui.spacing_mut().item_spacing.x = gap;
+                    let half_w = ((ui.available_width() - gap) * 0.5).max(100.0);
+                    if pill_button(ui, "Tiếp tục tải", Some(half_w), PillStyle::secondary(28.0))
                         .clicked()
                     {
                         if let UpdateDialogPhase::Downloading { confirm_cancel, .. } =
@@ -1039,22 +1112,19 @@ fn render_update_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) 
                             *confirm_cancel = false;
                         }
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let danger_style = PillStyle {
-                            bg: C_DANGER,
-                            fg: Color32::BLACK,
-                            border: C_DANGER,
-                            hover_bg: Color32::from_rgb(0xf4, 0xb8, 0xb8),
-                            hover_fg: Color32::BLACK,
-                            hover_border: C_DANGER,
-                            font_size: 11.5,
-                            ..PillStyle::accent(28.0)
-                        };
-                        if pill_button(ui, "Xác nhận hủy", Some(120.0), danger_style).clicked()
-                        {
-                            state.cancel_update_download();
-                        }
-                    });
+                    let danger_style = PillStyle {
+                        bg: C_DANGER,
+                        fg: Color32::BLACK,
+                        border: C_DANGER,
+                        hover_bg: Color32::from_rgb(0xf4, 0xb8, 0xb8),
+                        hover_fg: Color32::BLACK,
+                        hover_border: C_DANGER,
+                        font_size: 11.5,
+                        ..PillStyle::accent(28.0)
+                    };
+                    if pill_button(ui, "Xác nhận hủy", Some(half_w), danger_style).clicked() {
+                        state.cancel_update_download();
+                    }
                 });
             });
         }
@@ -1063,26 +1133,28 @@ fn render_update_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) 
             ..
         } => {
             ui.horizontal(|ui| {
-                if pill_button(ui, "Hủy tải", Some(104.0), PillStyle::secondary(32.0)).clicked()
-                {
+                let gap = 8.0;
+                ui.spacing_mut().item_spacing.x = gap;
+                let total_w = ui.available_width();
+                let left_w = ((total_w - gap) * 0.34).round().max(96.0);
+                let right_w = (total_w - gap - left_w).max(160.0);
+                if pill_button(ui, "Hủy tải", Some(left_w), PillStyle::secondary(32.0)).clicked() {
                     if let UpdateDialogPhase::Downloading { confirm_cancel, .. } =
                         &mut state.update_phase
                     {
                         *confirm_cancel = true;
                     }
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let disabled_style = PillStyle {
-                        bg: C_CARD_HIGH,
-                        fg: C_TEXT_DIM,
-                        border: C_BORDER,
-                        hover_bg: C_CARD_HIGH,
-                        hover_fg: C_TEXT_DIM,
-                        hover_border: C_BORDER,
-                        ..PillStyle::accent(32.0)
-                    };
-                    let _ = pill_button(ui, "Đang tải...", Some(196.0), disabled_style);
-                });
+                let disabled_style = PillStyle {
+                    bg: C_CARD_HIGH,
+                    fg: C_TEXT_DIM,
+                    border: C_BORDER,
+                    hover_bg: C_CARD_HIGH,
+                    hover_fg: C_TEXT_DIM,
+                    hover_border: C_BORDER,
+                    ..PillStyle::accent(32.0)
+                };
+                let _ = pill_button(ui, "Đang tải...", Some(right_w), disabled_style);
             });
         }
         UpdateDialogPhase::Verifying | UpdateDialogPhase::LaunchingInstaller => {
@@ -1107,28 +1179,30 @@ fn render_update_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) 
         | UpdateDialogPhase::Cancelled
         | UpdateDialogPhase::Failed(_) => {
             ui.horizontal(|ui| {
+                let gap = 8.0;
+                ui.spacing_mut().item_spacing.x = gap;
+                let total_w = ui.available_width();
+                let left_w = ((total_w - gap) * 0.32).round().max(92.0);
+                let action_w = if info.mandatory {
+                    total_w
+                } else {
+                    (total_w - gap - left_w).max(180.0)
+                };
                 if !info.mandatory
-                    && pill_button(ui, "Để sau", Some(96.0), PillStyle::secondary(32.0)).clicked()
+                    && pill_button(ui, "Để sau", Some(left_w), PillStyle::secondary(32.0)).clicked()
                 {
                     state.close_dialog();
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let action_w = if info.mandatory {
-                        ui.available_width()
-                    } else {
-                        214.0
-                    };
-                    if pill_button(
-                        ui,
-                        "⚡ Cập nhật & Khởi động lại",
-                        Some(action_w),
-                        PillStyle::accent(32.0),
-                    )
-                    .clicked()
-                    {
-                        state.start_update_download();
-                    }
-                });
+                if pill_button(
+                    ui,
+                    "⚡ Cập nhật & Khởi động lại",
+                    Some(action_w),
+                    PillStyle::accent(32.0),
+                )
+                .clicked()
+                {
+                    state.start_update_download();
+                }
             });
         }
     }
@@ -1222,51 +1296,54 @@ fn render_service_repair_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut Ap
     ui.add_space(12.0);
     let busy = state.service_repair_phase == ServiceRepairPhase::LaunchingAndWaiting;
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        if !busy && pill_button(ui, "Đóng", Some(74.0), PillStyle::secondary(32.0)).clicked() {
-            state.close_dialog();
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if is_healthy {
-                if pill_button(ui, "Xong", Some(120.0), PillStyle::accent(32.0)).clicked() {
-                    state.close_dialog();
-                }
-            } else if busy {
-                let disabled_style = PillStyle {
-                    bg: C_CARD_HIGH,
-                    fg: C_TEXT_DIM,
-                    border: C_BORDER,
-                    hover_bg: C_CARD_HIGH,
-                    hover_fg: C_TEXT_DIM,
-                    hover_border: C_BORDER,
-                    ..PillStyle::accent(32.0)
-                };
-                let _ = pill_button(
-                    ui,
-                    "Đang sửa dịch vụ...",
-                    Some(ui.available_width()),
-                    disabled_style,
-                );
-            } else {
-                let repair_style = PillStyle {
-                    font_size: 11.0,
-                    pad_x: 6.0,
-                    ..PillStyle::accent(32.0)
-                };
-                if pill_button(ui, "🔧 Sửa dịch vụ (UAC)", Some(142.0), repair_style).clicked()
-                {
-                    state.start_service_repair();
-                }
-                let recheck_style = PillStyle {
-                    font_size: 11.0,
-                    pad_x: 6.0,
-                    ..PillStyle::secondary(32.0)
-                };
-                if pill_button(ui, "↻ Kiểm tra", Some(82.0), recheck_style).clicked() {
-                    state.request_status_refresh();
-                }
+        let total_w = ui.available_width();
+        if busy {
+            let disabled_style = PillStyle {
+                bg: C_CARD_HIGH,
+                fg: C_TEXT_DIM,
+                border: C_BORDER,
+                hover_bg: C_CARD_HIGH,
+                hover_fg: C_TEXT_DIM,
+                hover_border: C_BORDER,
+                ..PillStyle::accent(32.0)
+            };
+            let _ = pill_button(ui, "Đang sửa dịch vụ...", Some(total_w), disabled_style);
+        } else if is_healthy {
+            let gap = 8.0;
+            ui.spacing_mut().item_spacing.x = gap;
+            let half_w = ((total_w - gap) * 0.5).max(100.0);
+            if pill_button(ui, "Đóng", Some(half_w), PillStyle::secondary(32.0)).clicked() {
+                state.close_dialog();
             }
-        });
+            if pill_button(ui, "Xong", Some(half_w), PillStyle::accent(32.0)).clicked() {
+                state.close_dialog();
+            }
+        } else {
+            let gap = 6.0;
+            ui.spacing_mut().item_spacing.x = gap;
+            let close_w = 74.0;
+            let recheck_w = ((total_w - close_w - gap * 2.0) * 0.375).round().max(84.0);
+            let repair_w = (total_w - close_w - recheck_w - gap * 2.0).max(136.0);
+            if pill_button(ui, "Đóng", Some(close_w), PillStyle::secondary(32.0)).clicked() {
+                state.close_dialog();
+            }
+            let recheck_style = PillStyle {
+                font_size: 11.0,
+                pad_x: 6.0,
+                ..PillStyle::secondary(32.0)
+            };
+            if pill_button(ui, "↻ Kiểm tra", Some(recheck_w), recheck_style).clicked() {
+                state.request_status_refresh();
+            }
+            let repair_style = PillStyle {
+                font_size: 11.0,
+                pad_x: 6.0,
+                ..PillStyle::accent(32.0)
+            };
+            if pill_button(ui, "🔧 Sửa dịch vụ (UAC)", Some(repair_w), repair_style).clicked() {
+                state.start_service_repair();
+            }
+        }
     });
 }
 
@@ -1328,27 +1405,28 @@ fn render_error_detail_dialog(ui: &mut Ui, state: &mut AppState) {
 
     ui.add_space(12.0);
     ui.horizontal(|ui| {
-        if state.client_config.debug_mode
-            && !detail.is_empty()
-            && pill_button(
-                ui,
-                "📋 Sao chép lỗi",
-                Some(124.0),
-                PillStyle::secondary(32.0),
-            )
-            .clicked()
-        {
-            ui.ctx().copy_text(detail.clone());
-            state.info_toast = Some(StatusNotice {
-                text: "Đã sao chép chi tiết lỗi.".to_owned(),
-                level: NoticeLevel::Info,
-            });
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if pill_button(ui, "Đóng", Some(104.0), PillStyle::accent(32.0)).clicked() {
+        let gap = 8.0;
+        ui.spacing_mut().item_spacing.x = gap;
+        let total_w = ui.available_width();
+        let show_copy = state.client_config.debug_mode && !detail.is_empty();
+        if show_copy {
+            let copy_w = ((total_w - gap) * 0.44).round().max(118.0);
+            let close_w = (total_w - gap - copy_w).max(100.0);
+            if pill_button(ui, "📋 Sao chép lỗi", Some(copy_w), PillStyle::secondary(32.0))
+                .clicked()
+            {
+                ui.ctx().copy_text(detail.clone());
+                state.info_toast = Some(StatusNotice {
+                    text: "Đã sao chép chi tiết lỗi.".to_owned(),
+                    level: NoticeLevel::Info,
+                });
+            }
+            if pill_button(ui, "Đóng", Some(close_w), PillStyle::accent(32.0)).clicked() {
                 state.close_dialog();
             }
-        });
+        } else if pill_button(ui, "Đóng", Some(total_w), PillStyle::accent(32.0)).clicked() {
+            state.close_dialog();
+        }
     });
 }
 
@@ -1998,6 +2076,75 @@ mod tests {
                 && repair_rect.max.y <= crate::ui::WINDOW_HEIGHT
                 && repair_rect.width() <= 356.0,
             "non-healthy ServiceRepair overflowed card bounds: {repair_rect:?}"
+        );
+    }
+
+    #[test]
+    fn test_settings_shows_update_manifest_url_only_in_dev_mode() {
+        use freeton_core::storage::{CredentialStore, StorageError};
+
+        struct NoopStore;
+        impl CredentialStore for NoopStore {
+            fn get_password(&self, _: &str, _: &str) -> Result<Option<String>, StorageError> {
+                Ok(None)
+            }
+            fn set_password(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+            fn delete_password(&self, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+        }
+
+        fn collect_dialog_text(debug_mode: bool) -> String {
+            let ctx = egui::Context::default();
+            let store = NoopStore;
+            let mut state = AppState::new(
+                true,
+                Some("user@proton.me".to_owned()),
+                ClientConfig {
+                    debug_mode,
+                    ..ClientConfig::default()
+                },
+                None,
+                Vec::new(),
+            );
+            state.open_settings_dialog();
+            let mut last_out = None;
+            for _ in 0..2 {
+                let raw_input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(crate::ui::WINDOW_WIDTH, crate::ui::WINDOW_HEIGHT),
+                    )),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(raw_input, |ui| {
+                    crate::ui::render_root(ui, &mut state, &store);
+                });
+                out.textures_delta.clear();
+                last_out = Some(out);
+            }
+            let out = last_out.expect("frame output");
+            let mut text = String::new();
+            for clipped in &out.shapes {
+                if let egui::epaint::Shape::Text(t) = &clipped.shape {
+                    text.push_str(t.galley.text());
+                    text.push('\n');
+                }
+            }
+            text
+        }
+
+        let normal_text = collect_dialog_text(false);
+        assert!(
+            !normal_text.contains("UPDATE MANIFEST URL"),
+            "Standard Settings must hide Update Manifest URL: {normal_text}"
+        );
+        let dev_text = collect_dialog_text(true);
+        assert!(
+            dev_text.contains("UPDATE MANIFEST URL"),
+            "Dev Mode Settings must show Update Manifest URL: {dev_text}"
         );
     }
 }
