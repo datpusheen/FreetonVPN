@@ -1,11 +1,16 @@
+# 3.0.1 — mượt kéo cửa sổ, đối xứng UI và Dev Update URL (2026-11-26)
+
+- Chuyển cơ chế kéo cửa sổ trên thanh tiêu đề sang Win32 trực tiếp (`GetCursorPos` + `SetCapture` + `SetWindowPos`), loại bỏ độ trễ modal loop gây khựng khi di chuyển app.
+- Căn chỉnh lại độ đối xứng và khoảng cách trên Top Bar, màn hình Home, form đăng nhập SRP, danh sách máy chủ và toàn bộ các hộp thoại (`Settings`, `About`, `Update`, `ServiceRepair`, `LogoutConfirm`, `ErrorDetail`).
+- Bổ sung trường `Update Manifest URL` ẩn trong Dev Mode (`Cài đặt`) cho phép nhập URL local/staging để kiểm thử cập nhật trước khi phát hành production.
+
 # 3.0.0 — viết lại hoàn toàn bằng Rust gốc cho Windows x64 (2026-11-26)
 
 - Viết lại toàn bộ ứng dụng desktop bằng Rust x64 (`FreetonVPN.exe` với `eframe`/`egui` + dịch vụ nền `FreetonVPNService.exe`), loại bỏ Python, GPG, Playwright và PyInstaller.
 - Nhúng sẵn thư viện WireGuardNT (`tunnel.dll` v1.1.1 + `wireguard.dll` 1.1), hỗ trợ bật/tắt VPN không cần hỏi UAC và đọc thống kê handshake trực tiếp từ driver.
 - Triển khai xác thực Proton SRP + xác minh OpenPGP modulus thuần Rust, hỗ trợ 2FA và modal WebView2 CAPTCHA tích hợp; lưu token trong Windows Credential Manager.
 - Quét ping ICMP đa luồng bằng Win32 `IcmpSendEcho`, phân màu chỉ số ping/tải xanh-vàng-đỏ, xác minh handshake + DNS qua tunnel trước khi báo Đã kết nối.
-- Bổ sung giao diện cài đặt nâng cao (cấp key API, nhập `.conf`, tùy chỉnh DNS/Port, chạy cùng Windows, sửa dịch vụ), logo thương hiệu, hiệu ứng chuyển cảnh đối xứng, kéo cửa sổ trực tiếp bằng Win32 không khựng và bộ cài NSIS x64 (`FreetonVPN-Setup-x64.exe`).
-- Bổ sung tùy chọn `Update Manifest URL` ẩn trong Dev Mode (giữ chuột giữa 750ms ở Cài đặt) để kiểm thử cập nhật cục bộ/staging.
+- Bổ sung giao diện cài đặt nâng cao (cấp key API, nhập `.conf`, tùy chỉnh DNS/Port, chạy cùng Windows, sửa dịch vụ), logo thương hiệu, hiệu ứng chuyển cảnh đối xứng và bộ cài NSIS x64 (`FreetonVPN-Setup-x64.exe`).
 - Tách kênh tự động cập nhật sang `version-rust.json` và đối chiếu SHA-256 nghiêm ngặt trước khi chạy trình cài đặt nâng cấp `/S`.
 
 # 2.4.3 — bản Windows đã xác nhận kết nối (2026-10-12)

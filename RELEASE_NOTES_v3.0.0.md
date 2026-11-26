@@ -20,9 +20,9 @@
   * Quét ping ICMP đa luồng bằng Win32 `IcmpSendEcho`, phân màu chỉ số ping/tải (xanh/vàng/đỏ), giữ cache và giữ lựa chọn thủ công.
   * Chỉ báo **Đã kết nối** sau khi xác minh đúng WireGuard handshake và DNS phản hồi qua tunnel; tự động dọn dẹp tunnel nếu kết nối lỗi.
 * **Giao diện & Tiện ích mới**:
-  * Gắn logo thương hiệu Freeton VPN ở top bar, màn hình đăng nhập và hộp thoại About; kéo cửa sổ trực tiếp bằng Win32 (`GetCursorPos` + `SetWindowPos`) mượt mà không khựng.
-  * Căn chỉnh bố cục đối xứng trên các màn hình/hộp thoại cùng hiệu ứng chuyển cảnh mượt mà và badge ping/tải xanh-vàng-đỏ.
-  * Cài đặt nâng cao: cấp key WireGuard qua API, nhập tệp `.conf`, tùy chỉnh DNS/Port, khởi động cùng Windows, hộp thoại **Sửa dịch vụ** 1-click và ô nhập **Update Manifest URL** ẩn trong Dev Mode để test cập nhật cục bộ.
+  * Gắn logo thương hiệu Freeton VPN ở top bar, màn hình đăng nhập và hộp thoại About; kéo cửa sổ từ toàn bộ vùng trống top bar.
+  * Hiệu ứng chuyển cảnh đối xứng giữa các màn hình, hộp thoại, toast và thẻ máy chủ.
+  * Cài đặt nâng cao: cấp key WireGuard qua API, nhập tệp `.conf`, tùy chỉnh DNS/Port, khởi động cùng Windows và hộp thoại **Sửa dịch vụ** 1-click.
 * **Auto-Updater xác thực SHA-256 & Bộ cài NSIS x64**:
   * Kiểm tra cập nhật qua `version-rust.json` (tách riêng khỏi `version.json` của v2.x) và đối chiếu SHA-256 nghiêm ngặt trước khi chạy trình cài đặt nâng cấp `/S`.
 

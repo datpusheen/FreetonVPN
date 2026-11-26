@@ -13,17 +13,17 @@ fn main() {
         .set("CompanyName", "pishun")
         .set("InternalName", "FreetonVPN.exe")
         .set("OriginalFilename", "FreetonVPN.exe")
-        .set("FileVersion", "3.0.0.0")
-        .set("ProductVersion", "3.0.0.0")
-        .set_version_info(winresource::VersionInfo::FILEVERSION, 0x0003_0000_0000_0000)
+        .set("FileVersion", "3.0.1.0")
+        .set("ProductVersion", "3.0.1.0")
+        .set_version_info(winresource::VersionInfo::FILEVERSION, 0x0003_0000_0001_0000)
         .set_version_info(
             winresource::VersionInfo::PRODUCTVERSION,
-            0x0003_0000_0000_0000,
+            0x0003_0000_0001_0000,
         )
         .set_manifest(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="3.0.0.0" processorArchitecture="*" name="pishun.FreetonVPN" type="win32"/>
+  <assemblyIdentity version="3.0.1.0" processorArchitecture="*" name="pishun.FreetonVPN" type="win32"/>
   <description>Freeton VPN Desktop Client</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
