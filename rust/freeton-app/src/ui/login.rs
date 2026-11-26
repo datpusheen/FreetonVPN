@@ -16,7 +16,8 @@ pub fn render_login_view(ui: &mut Ui, state: &mut AppState) {
     rounded_card(ui, C_CARD, C_BORDER, 16, Margin::same(16), |ui| {
         ui.set_width(ui.available_width());
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("⚡").size(30.0).color(C_ACCENT));
+            crate::ui::render_brand_logo(ui, 42.0);
+            ui.add_space(4.0);
             ui.label(RichText::new(APP_NAME).size(20.0).strong().color(C_TEXT));
             ui.label(
                 RichText::new("by pishun • WireGuard Client")

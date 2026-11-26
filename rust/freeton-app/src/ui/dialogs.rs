@@ -387,7 +387,8 @@ fn render_logout_confirm_dialog(ui: &mut Ui, state: &mut AppState, store: &dyn C
 
 fn render_about_dialog(ui: &mut Ui, state: &mut AppState) {
     ui.vertical_centered(|ui| {
-        ui.label(RichText::new("⚡").size(28.0).color(C_ACCENT));
+        crate::ui::render_brand_logo(ui, 42.0);
+        ui.add_space(4.0);
         ui.label(RichText::new(APP_NAME).size(17.0).strong().color(C_TEXT));
         ui.label(
             RichText::new(format!("by pishun • v{APP_VERSION}"))

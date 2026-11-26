@@ -76,6 +76,46 @@ pub fn load_status_color(load_pct: Option<f64>) -> Color32 {
 pub const WINDOW_WIDTH: f32 = 390.0;
 pub const WINDOW_HEIGHT: f32 = 610.0;
 
+const BRAND_LOGO_PNG: &[u8] = include_bytes!("../../../../website/assets/images/logo.png");
+
+/// Loads and caches the embedded purple Freeton VPN logo texture on the `egui::Context`.
+pub fn brand_logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let tex_id = egui::Id::unique("freeton_brand_logo_texture");
+    if let Some(handle) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(tex_id)) {
+        return handle;
+    }
+
+    let color_image = match image::load_from_memory_with_format(BRAND_LOGO_PNG, image::ImageFormat::Png)
+    {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw())
+        }
+        Err(err) => {
+            warn!(error = %err, "failed to decode embedded brand logo PNG");
+            egui::ColorImage::filled([1, 1], Color32::from_rgb(0xc0, 0x84, 0xfc))
+        }
+    };
+
+    let handle = ctx.load_texture(
+        "freeton_brand_logo",
+        color_image,
+        egui::TextureOptions::LINEAR,
+    );
+    ctx.data_mut(|d| d.insert_temp(tex_id, handle.clone()));
+    handle
+}
+
+/// Renders the embedded purple Freeton VPN brand logo at the requested square logical size.
+pub fn render_brand_logo(ui: &mut Ui, size: f32) -> Response {
+    let tex = brand_logo_texture(ui.ctx());
+    ui.add(egui::Image::new(egui::load::SizedTexture::new(
+        tex.id(),
+        Vec2::splat(size),
+    )))
+}
+
 fn resolve_windows_fonts_dir(
     windir: Option<std::ffi::OsString>,
     system_root: Option<std::ffi::OsString>,
@@ -516,100 +556,146 @@ pub fn render_root(ui: &mut Ui, state: &mut AppState, store: &dyn CredentialStor
 }
 
 fn render_top_bar(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
-    ui.horizontal(|ui| {
-        // Left: draggable brand header
-        let brand_resp = ui
-            .allocate_ui_with_layout(
-                Vec2::new(150.0, 42.0),
-                Layout::left_to_right(Align::Center),
-                |ui| {
-                    ui.label(RichText::new("⚡").size(20.0).color(C_ACCENT));
-                    ui.add_space(4.0);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(RichText::new(APP_NAME).size(15.0).strong().color(C_TEXT));
-                        ui.label(
-                            RichText::new("by pishun")
-                                .size(10.0)
-                                .italics()
-                                .color(C_TEXT_DIM),
-                        );
-                    });
-                },
-            )
-            .response
-            .interact(Sense::drag());
+    let mut controls_rect: Option<Rect> = None;
 
-        if brand_resp.drag_started() {
-            state.user_has_custom_dragged = true;
-            ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+    let bar_resp = ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 42.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            render_brand_logo(ui, 26.0);
+            ui.add_space(6.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.add(
+                    egui::Label::new(RichText::new(APP_NAME).size(15.0).strong().color(C_TEXT))
+                        .selectable(false),
+                );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("by pishun")
+                            .size(10.0)
+                            .italics()
+                            .color(C_TEXT_DIM),
+                    )
+                    .selectable(false),
+                );
+            });
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let close_style = PillStyle {
+                    bg: C_CARD,
+                    fg: C_TEXT_MUTED,
+                    border: C_BORDER,
+                    hover_bg: C_CLOSE_HOVER,
+                    hover_fg: Color32::WHITE,
+                    hover_border: C_CLOSE_HOVER,
+                    radius: 8,
+                    height: 28.0,
+                    font_size: 14.0,
+                    bold: true,
+                    pad_x: 0.0,
+                };
+                let close_resp = pill_button(ui, "✕", Some(30.0), close_style)
+                    .on_hover_text("Thu gọn xuống khay hệ thống");
+                let mut bounds = close_resp.rect;
+                if close_resp.clicked() {
+                    state.window_visible = false;
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                }
+
+                ui.add_space(4.0);
+
+                let refresh_style = PillStyle {
+                    fg: if state.is_scanning { C_ACCENT } else { C_TEXT },
+                    font_size: 14.0,
+                    pad_x: 0.0,
+                    ..PillStyle::secondary(28.0)
+                };
+                let refresh_resp = pill_button(ui, "↻", Some(30.0), refresh_style)
+                    .on_hover_text("Quét lại danh sách máy chủ");
+                bounds = bounds.union(refresh_resp.rect);
+                if refresh_resp.clicked() {
+                    if state.is_logged_in {
+                        state.start_scan();
+                    } else {
+                        state.show_login_view();
+                    }
+                }
+
+                ui.add_space(4.0);
+
+                let chip_text = state.account_chip_text();
+                let chip_fg = if state.is_logged_in {
+                    C_SUCCESS
+                } else {
+                    C_TEXT_DIM
+                };
+                let chip_style = PillStyle {
+                    fg: chip_fg,
+                    hover_fg: C_TEXT,
+                    font_size: 11.0,
+                    pad_x: 10.0,
+                    ..PillStyle::secondary(28.0)
+                };
+                let chip_resp = pill_button(ui, &chip_text, None, chip_style);
+                bounds = bounds.union(chip_resp.rect);
+                if chip_resp.clicked() {
+                    if state.is_logged_in {
+                        state.active_dialog = ActiveDialog::LogoutConfirm;
+                    } else {
+                        state.show_login_view();
+                    }
+                }
+
+                controls_rect = Some(bounds);
+            });
+        },
+    );
+
+    let screen = ctx.content_rect();
+    let bar_rect = bar_resp.response.rect;
+    let header_bounds = Rect::from_min_max(
+        screen.min,
+        Pos2::new(screen.max.x.max(bar_rect.max.x), bar_rect.max.y),
+    );
+
+    let drag_zones: Vec<Rect> = if let Some(ctrl) = controls_rect {
+        let ctrl = ctrl.intersect(header_bounds);
+        vec![
+            Rect::from_min_max(header_bounds.min, Pos2::new(ctrl.min.x, header_bounds.max.y)),
+            Rect::from_min_max(
+                Pos2::new(ctrl.min.x, header_bounds.min.y),
+                Pos2::new(ctrl.max.x, ctrl.min.y),
+            ),
+            Rect::from_min_max(
+                Pos2::new(ctrl.min.x, ctrl.max.y),
+                Pos2::new(ctrl.max.x, header_bounds.max.y),
+            ),
+            Rect::from_min_max(Pos2::new(ctrl.max.x, header_bounds.min.y), header_bounds.max),
+        ]
+    } else {
+        vec![header_bounds]
+    };
+
+    let mut drag_started = false;
+    for (idx, zone) in drag_zones.into_iter().enumerate() {
+        if zone.width() <= 0.0 || zone.height() <= 0.0 {
+            continue;
         }
+        let resp = ui.interact(
+            zone,
+            ui.scope_id().with(("top_bar_drag_zone", idx)),
+            Sense::drag(),
+        );
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            drag_started = true;
+        }
+    }
 
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let close_style = PillStyle {
-                bg: C_CARD,
-                fg: C_TEXT_MUTED,
-                border: C_BORDER,
-                hover_bg: C_CLOSE_HOVER,
-                hover_fg: Color32::WHITE,
-                hover_border: C_CLOSE_HOVER,
-                radius: 8,
-                height: 28.0,
-                font_size: 14.0,
-                bold: true,
-                pad_x: 0.0,
-            };
-            if pill_button(ui, "✕", Some(30.0), close_style)
-                .on_hover_text("Thu gọn xuống khay hệ thống")
-                .clicked()
-            {
-                state.window_visible = false;
-                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-            }
-
-            ui.add_space(4.0);
-
-            let refresh_style = PillStyle {
-                fg: if state.is_scanning { C_ACCENT } else { C_TEXT },
-                font_size: 14.0,
-                pad_x: 0.0,
-                ..PillStyle::secondary(28.0)
-            };
-            if pill_button(ui, "↻", Some(30.0), refresh_style)
-                .on_hover_text("Quét lại danh sách máy chủ")
-                .clicked()
-            {
-                if state.is_logged_in {
-                    state.start_scan();
-                } else {
-                    state.show_login_view();
-                }
-            }
-
-            ui.add_space(4.0);
-
-            let chip_text = state.account_chip_text();
-            let chip_fg = if state.is_logged_in {
-                C_SUCCESS
-            } else {
-                C_TEXT_DIM
-            };
-            let chip_style = PillStyle {
-                fg: chip_fg,
-                hover_fg: C_TEXT,
-                font_size: 11.0,
-                pad_x: 10.0,
-                ..PillStyle::secondary(28.0)
-            };
-            if pill_button(ui, &chip_text, None, chip_style).clicked() {
-                if state.is_logged_in {
-                    state.active_dialog = ActiveDialog::LogoutConfirm;
-                } else {
-                    state.show_login_view();
-                }
-            }
-        });
-    });
+    if drag_started {
+        state.user_has_custom_dragged = true;
+        ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+    }
 }
 
 fn render_loading_bar(
@@ -845,5 +931,202 @@ mod tests {
         assert_eq!(super::load_status_color(Some(79.9)), super::C_METRIC_YELLOW);
         assert_eq!(super::load_status_color(Some(80.0)), super::C_METRIC_RED);
         assert_eq!(super::load_status_color(Some(98.0)), super::C_METRIC_RED);
+    }
+
+    #[test]
+    fn test_brand_logo_renders_in_topbar_login_and_about_without_lightning_emoji() {
+        use crate::state::{AppState, AppView};
+        use freeton_core::storage::{ClientConfig, CredentialStore, StorageError};
+
+        struct NoopStore;
+        impl CredentialStore for NoopStore {
+            fn get_password(&self, _: &str, _: &str) -> Result<Option<String>, StorageError> {
+                Ok(None)
+            }
+            fn set_password(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+            fn delete_password(&self, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+        }
+
+        fn count_brand_images(
+            shapes: &[egui::epaint::ClippedShape],
+            brand_tex_id: egui::TextureId,
+        ) -> usize {
+            fn visit(shape: &egui::epaint::Shape, brand_tex_id: egui::TextureId) -> usize {
+                match shape {
+                    egui::epaint::Shape::Rect(r) if r.fill_texture_id() == brand_tex_id => 1,
+                    egui::epaint::Shape::Mesh(m) if m.texture_id == brand_tex_id => 1,
+                    egui::epaint::Shape::Vec(items) => {
+                        items.iter().map(|s| visit(s, brand_tex_id)).sum()
+                    }
+                    _ => 0,
+                }
+            }
+            shapes.iter().map(|c| visit(&c.shape, brand_tex_id)).sum()
+        }
+
+        fn collect_all_text(shapes: &[egui::epaint::ClippedShape]) -> String {
+            let mut out = String::new();
+            fn visit(shape: &egui::epaint::Shape, out: &mut String) {
+                match shape {
+                    egui::epaint::Shape::Text(t) => {
+                        out.push_str(t.galley.text());
+                        out.push('\n');
+                    }
+                    egui::epaint::Shape::Vec(items) => {
+                        for s in items {
+                            visit(s, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for c in shapes {
+                visit(&c.shape, &mut out);
+            }
+            out
+        }
+
+        let ctx = egui::Context::default();
+        let tex_handle = super::brand_logo_texture(&ctx);
+        assert_eq!(tex_handle.size(), [256, 256]);
+        let brand_tex_id = tex_handle.id();
+
+        let store = NoopStore;
+        let mut state = AppState::new(false, None, ClientConfig::default(), None, Vec::new());
+        state.current_view = AppView::Login;
+        state.window_visible = true;
+        state.open_about_dialog();
+
+        let mut out = egui::FullOutput::default();
+        for frame_idx in 0..2 {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(super::WINDOW_WIDTH, super::WINDOW_HEIGHT),
+                )),
+                time: Some(frame_idx as f64 * 0.1),
+                ..Default::default()
+            };
+            out = ctx.run_ui(raw_input, |ui| {
+                super::render_root(ui, &mut state, &store);
+            });
+            out.textures_delta.clear();
+        }
+
+        // Top bar + Login hero card + About dialog = 3 rendered brand logo images.
+        assert_eq!(count_brand_images(&out.shapes, brand_tex_id), 3);
+        let text = collect_all_text(&out.shapes);
+        assert!(
+            !text.contains('⚡'),
+            "Top bar, Login hero, and About dialog must not render ⚡ emoji: {text}"
+        );
+    }
+
+    #[test]
+    fn test_top_bar_drag_works_on_entire_empty_header_but_not_on_buttons() {
+        use crate::state::AppState;
+        use freeton_core::storage::{ClientConfig, CredentialStore, StorageError};
+
+        struct NoopStore;
+        impl CredentialStore for NoopStore {
+            fn get_password(&self, _: &str, _: &str) -> Result<Option<String>, StorageError> {
+                Ok(None)
+            }
+            fn set_password(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+            fn delete_password(&self, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+        }
+
+        fn simulate_drag_at(
+            start_pos: egui::Pos2,
+            drag_delta: egui::Vec2,
+        ) -> (bool, bool) {
+            let ctx = egui::Context::default();
+            let store = NoopStore;
+            let mut state = AppState::new(false, None, ClientConfig::default(), None, Vec::new());
+            state.window_visible = true;
+
+            let base_input = |events: Vec<egui::Event>, time: f64| egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(super::WINDOW_WIDTH, super::WINDOW_HEIGHT),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+
+            let mut out = ctx.run_ui(base_input(vec![], 0.0), |ui| {
+                super::render_root(ui, &mut state, &store);
+            });
+            out.textures_delta.clear();
+
+            let mut out2 = ctx.run_ui(
+                base_input(
+                    vec![
+                        egui::Event::PointerMoved(start_pos),
+                        egui::Event::PointerButton {
+                            pos: start_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    0.02,
+                ),
+                |ui| {
+                    super::render_root(ui, &mut state, &store);
+                },
+            );
+            out2.textures_delta.clear();
+
+            let mut out3 = ctx.run_ui(
+                base_input(
+                    vec![egui::Event::PointerMoved(start_pos + drag_delta)],
+                    0.04,
+                ),
+                |ui| {
+                    super::render_root(ui, &mut state, &store);
+                },
+            );
+            out3.textures_delta.clear();
+
+            let has_start_drag = |out: &egui::FullOutput| {
+                out.viewport_output
+                    .get(&egui::ViewportId::ROOT)
+                    .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::StartDrag))
+            };
+            let emitted_start_drag = has_start_drag(&out2) || has_start_drag(&out3);
+
+            (state.user_has_custom_dragged, emitted_start_drag)
+        }
+
+        // Empty middle space between brand header and account chip
+        assert_eq!(
+            simulate_drag_at(egui::Pos2::new(165.0, 32.0), egui::Vec2::new(8.0, 4.0)),
+            (true, true)
+        );
+        // Top margin strip above buttons (y = 4 inside 12px top margin)
+        assert_eq!(
+            simulate_drag_at(egui::Pos2::new(310.0, 4.0), egui::Vec2::new(6.0, 2.0)),
+            (true, true)
+        );
+        // Brand logo/text area on the left
+        assert_eq!(
+            simulate_drag_at(egui::Pos2::new(60.0, 32.0), egui::Vec2::new(6.0, 4.0)),
+            (true, true)
+        );
+        // Over the close button (right edge: 390 - 14 margin - 15 center = 361, y = 33) -> must NOT drag
+        assert_eq!(
+            simulate_drag_at(egui::Pos2::new(361.0, 33.0), egui::Vec2::new(6.0, 2.0)),
+            (false, false)
+        );
     }
 }
