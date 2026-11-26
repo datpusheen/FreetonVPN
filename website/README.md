@@ -1,41 +1,42 @@
 # Freeton VPN - Trang chủ tĩnh
 
-Trang web tĩnh chính thức cho **Freeton VPN by pishun**.
+Trang web tĩnh chính thức cho **Freeton VPN by pishun** (đồng bộ với **Desktop Client Rust v3.0.0**).
 
 ---
 
-## 📁 Cấu trúc thư mục
+## Cấu trúc thư mục
 
 ```text
 website/
-├── index.html              # Trang chủ HTML5 ngữ nghĩa
+├── index.html                  # Trang chủ HTML5 ngữ nghĩa
 ├── assets/
 │   ├── css/
-│   │   └── style.css       # Graphite UI đồng bộ với desktop client
+│   │   └── style.css           # Graphite + Mint UI đồng bộ với desktop client
 │   ├── js/
-│   │   └── main.js         # JavaScript tương tác Mockup & metadata
-│   ├── site.json           # Metadata UI/build dùng cho website
+│   │   └── main.js             # Tương tác Mockup, copy SHA-256 & đồng bộ release metadata
+│   ├── site.json               # Metadata fallback dùng khi chưa lấy được dữ liệu từ GitHub
 │   └── images/
-│       ├── logo.png        # Icon ứng dụng Freeton VPN (256x256)
-│       └── favicon.ico     # Favicon website
-└── README.md               # Hướng dẫn deploy
+│       ├── logo.png            # Icon ứng dụng Freeton VPN (256x256)
+│       ├── logo.svg            # Logo vector
+│       ├── favicon.ico         # Favicon website
+│       ├── bank-qr.svg         # QR hỗ trợ (tham khảo)
+│       ├── crypto-qr.svg       # QR hỗ trợ (tham khảo)
+│       └── momo-qr.svg         # QR hỗ trợ (tham khảo)
+└── README.md                   # Tài liệu thư mục web
 ```
 
 ---
 
-## 🚀 Hướng dẫn Deploy lên Web (Miễn Phí 100%)
+## Deploy lên Web
 
-### Cách 1: Deploy bằng GitHub Pages (Tạo Repo riêng cho web)
+### Cách 1: GitHub Pages tự động từ repo chính (Khuyên dùng)
 
-1. Tạo một repository mới trên GitHub (ví dụ: `freeton-vpn-web` hoặc `datpusheen.github.io`).
-2. Tải toàn bộ nội dung trong thư mục `website/` này lên repository đó.
-3. Vào **Settings** của repository trên GitHub -> chọn **Pages** -> ở mục **Branch** chọn `main` (hoặc `master`) và thư mục `/(root)` -> bấm **Save**.
-4. Trang web sẽ trực tiếp hoạt động tại: `https://<your-username>.github.io/<repo-name>/`.
+Repo đã cấu hình workflow [`.github/workflows/static.yml`](../.github/workflows/static.yml) để tự động xuất bản thư mục `website/` lên GitHub Pages mỗi khi push vào nhánh `main` hoặc `master`.
 
----
+1. Vào **Settings → Pages** trên GitHub repository.
+2. Ở mục **Build and deployment → Source**, chọn **GitHub Actions**.
+3. Push code hoặc chạy workflow **Deploy static content to Pages** trong tab **Actions**.
 
-### Cách 2: Deploy lên Vercel / Cloudflare Pages / Netlify (Khuyên dùng - Cực nhanh)
+### Cách 2: Vercel / Cloudflare Pages / Netlify
 
-1. **Vercel**: Kéo thả thư mục `website/` vào [vercel.com](https://vercel.com) hoặc kết nối qua GitHub repo.
-2. **Cloudflare Pages**: Chọn **Direct Upload** hoặc kết nối Git, chọn thư mục `website/`.
-3. **Netlify**: Kéo thả thẳng thư mục `website/` vào [app.netlify.com/drop](https://app.netlify.com/drop).
+- **Vercel / Cloudflare Pages / Netlify:** Trỏ Root Directory / Publish Directory vào `website/` (hoặc kéo thả thư mục `website/` khi upload trực tiếp).

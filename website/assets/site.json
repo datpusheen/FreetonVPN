@@ -1,20 +1,24 @@
 {
   "product": "Freeton VPN",
   "author": "pishun",
-  "ui_version": "2.4.3",
-  "ui_build_date": "2026-10-12",
-  "published_version": "2.4.3",
-  "published_date": "2026-10-12",
+  "ui_version": "3.0.0",
+  "ui_build_date": "2026-11-26",
+  "published_version": "3.0.0",
+  "published_date": "2026-11-26",
   "release_status": "published",
-  "download_url": "https://github.com/datpusheen/FreetonVPN/releases/latest/download/FreetonVPN.exe",
+  "installer_filename": "FreetonVPN-Setup-x64.exe",
+  "installer_size_bytes": 8444515,
+  "installer_sha256": "be8e0d6581cd72744a0e43e0e99ee24d00adff8844a03a6858970bdaa6400029",
+  "download_url": "https://github.com/datpusheen/FreetonVPN/releases/download/v3.0.0/FreetonVPN-Setup-x64.exe",
+  "version_manifest_url": "https://raw.githubusercontent.com/datpusheen/FreetonVPN/refs/heads/main/version-rust.json",
   "source_url": "https://github.com/datpusheen/FreetonVPN",
   "local_build_url": "https://github.com/datpusheen/FreetonVPN/releases",
   "platform": "Windows 10/11 · 64-bit",
   "features": [
-    "WireGuard native",
-    "Server cache",
-    "Auto ping & node selection",
-    "Edge login / SRP 2FA",
-    "WireGuard config export"
+    "Rust native x64 (egui/eframe)",
+    "FreetonVPNService + WireGuardNT",
+    "Proton SRP 2FA + WebView2 CAPTCHA",
+    "ICMP Auto Ping & node scoring",
+    "SHA-256 verified auto-updater"
   ]
 }
