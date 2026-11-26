@@ -1,0 +1,16 @@
+{
+    "version":  "3.0.0",
+    "release_date":  "2026-11-26",
+    "title":  "Freeton VPN Desktop Client v3.0.0",
+    "changelog":  [
+                      "⚡ Viết lại hoàn toàn bằng Rust gốc (x64) — khởi động tức thì, siêu nhẹ, không cần runtime ngoài",
+                      "🛡️ Tích hợp dịch vụ nền FreetonVPNService và WireGuardNT (tunnel.dll + wireguard.dll) — bật/tắt VPN không hỏi UAC",
+                      "🔐 Xác thực Proton SRP \u0026 OpenPGP thuần Rust, hỗ trợ 2FA và cửa sổ CAPTCHA WebView2 tích hợp",
+                      "🔄 Cập nhật tự động kiểm tra SHA-256 nghiêm ngặt trước khi chạy trình cài đặt"
+                  ],
+    "download_url":  "https://github.com/datpusheen/FreetonVPN/releases/download/v3.0.0/FreetonVPN-Setup-x64.exe",
+    "file_size_bytes":  8399342,
+    "sha256":  "0ef1124e3e59130b5c0366ba53cb9bc0000dbf53fb73ac62f0616f1558a707fc",
+    "mandatory":  false,
+    "min_supported_version":  "3.0.0"
+}

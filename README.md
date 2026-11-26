@@ -1,36 +1,51 @@
 # Freeton VPN
 
-Windows desktop client that connects to Proton VPN servers through WireGuard.
+Windows x64 desktop client and browser extension that connect to Proton VPN Free servers.
 
-## Run the app
+## Desktop Client (Rust v3.0.0)
 
-- **Packaged app:** open [`dist/FreetonVPN.exe`](dist/FreetonVPN.exe).
-- **Run from source:** open `run_freeton.bat`. It prefers `.venv-windows`, then `.venv`, then Python on `PATH`.
-- **WireGuard:** WireGuard for Windows must be installed. The app can open its dependency setup flow if it is missing.
+The v3.0.0 desktop client is a native Rust Windows x64 application (`FreetonVPN.exe`) paired with a privileged Windows service broker (`FreetonVPNService.exe`) and bundled WireGuard libraries (`tunnel.dll` + `wireguard.dll`). Users do not need to install WireGuard for Windows, GPG, Python, or Playwright separately, and routine VPN connect/disconnect toggles run without UAC prompts.
 
-`run_warp_gui.bat` is a compatibility launcher with the same behavior as `run_freeton.bat`.
+### Install & Run
 
-## Run from source for the first time
+- **Installer:** run [`dist/FreetonVPN-Setup-x64.exe`](dist/FreetonVPN-Setup-x64.exe).
+  - Installs into `C:\Program Files\FreetonVPN\`.
+  - Registers and starts `FreetonVPNService` with non-admin Interactive User IPC permissions.
+  - Creates Start Menu shortcuts (`Freeton VPN` and `Uninstall Freeton VPN`).
+- **Auto-updates:** v3.0.0+ checks [`version-rust.json`](version-rust.json) (isolated from the legacy v2.4.3 [`version.json`](version.json) feed) and verifies the installer's SHA-256 before launching a silent `/S` upgrade.
 
-Use Python 3.10 or newer:
+### Build & Package Windows Installer
+
+Prerequisites on Windows 10/11 x64:
+
+- Rust toolchain (`rustup`, `stable-x86_64-pc-windows-msvc`) + Visual Studio Build Tools (C++ & Windows 10/11 SDK)
+- Go (`C:\Program Files\Go\bin`) and `git`
+- NSIS 3 (`C:\Program Files (x86)\NSIS\makensis.exe`)
+
+Run the full build and packaging pipeline:
 
 ```powershell
-python -m venv .venv-windows
-.\.venv-windows\Scripts\python.exe -m pip install -r requirements.txt
-.\run_freeton.bat
+powershell -NoProfile -ExecutionPolicy Bypass -File .\rust\scripts\build_windows.ps1
 ```
 
-## Build Windows packages
+What `build_windows.ps1` does:
+
+1. Clones and verifies the pinned `wireguard-windows` release (`v1.1.1`) into `rust/build/wireguard-windows/`, runs `embeddable-dll-service\build.bat`, and stages `tunnel.dll` into `rust/assets/bin/tunnel.dll`.
+2. Downloads and SHA-256-verifies `wireguard-nt-1.1.zip`, then extracts `amd64/wireguard.dll` into `rust/assets/bin/wireguard.dll`.
+3. Runs `cargo test --manifest-path rust/Cargo.toml --workspace` and `cargo build --manifest-path rust/Cargo.toml --release`.
+4. Compiles [`rust/installer/freeton.nsi`](rust/installer/freeton.nsi) with `makensis.exe` to produce:
+   - `dist/FreetonVPN-Setup-x64.exe`
+   - `dist/FreetonVPN-Setup-x64.exe.sha256`
+   - Updated [`version-rust.json`](version-rust.json) with exact `file_size_bytes` and `sha256`.
+
+### Legacy Python v2.4.3 Desktop (Cutover Pending)
+
+The legacy Python desktop files (`proton_warp_material_gui.py`, `windows_vpn.py`, `build_exe.ps1`, `version.json`, etc.) remain temporarily during v3.0.0 desktop verification:
 
 ```powershell
+.\run_freeton.bat
 .\build_exe.ps1
 ```
-
-The build script uses `.venv-windows` (or `.venv` as a fallback). It writes distributable packages to `dist/` and recreatable PyInstaller intermediates to `build/`:
-
-- `dist/FreetonVPN.exe` — single-file build
-- `dist/FreetonVPN/FreetonVPN.exe` — folder build
-- `dist/FreetonVPN-v2.4.3-windows-x64-portable.zip` — portable folder build
 
 ## Browser VPN extension
 
@@ -48,23 +63,16 @@ The package folders and ZIP archives are written to `dist/browser-extension/`. S
 
 | File or folder | Purpose |
 | --- | --- |
-| `proton_warp_material_gui.py` | Main GUI, Proton API client, and WireGuard lifecycle |
-| `windows_vpn.py` | Windows service, handshake, and DNS health checks |
-| `updater.py` | App update handling |
-| `main.py` | Small entry point for the GUI module |
-| `requirements.txt` | Python dependencies |
-| `run_freeton.bat` | Preferred source launcher |
-| `build_exe.ps1` | Windows packaging script |
-| `FreetonVPN.spec` | PyInstaller build recipe used by the packaging script |
-| `pyinstaller_hooks/` | PyInstaller runtime hooks |
-| `.venv-windows/`, `.venv/` | Local Python environments; do not copy into a release |
-| `build/` | Generated build cache; safe to recreate |
-| `dist/` | Packaged app output |
-| `archive/legacy-builds/` | Older local binaries kept for reference |
-| `website/` | Static project website |
+| `rust/freeton-core/` | Proton SRP/OpenPGP auth, API client, ICMP pinger, Windows Credential Manager, fail-closed updater, WireGuard helpers |
+| `rust/freeton-service/` | `FreetonVPNService.exe` broker and `WireGuardTunnel$FreetonVPN` runner (`tunnel.dll` + `wireguard.dll`) |
+| `rust/freeton-app/` | Native `eframe`/`egui` tray flyout UI and WebView2 CAPTCHA modal (`FreetonVPN.exe`) |
+| `rust/scripts/build_windows.ps1` | End-to-end Windows x64 build, DLL staging, NSIS packaging, and manifest update script |
+| `rust/installer/freeton.nsi` | NSIS installer and uninstaller script |
+| `version-rust.json` | Release manifest for Rust v3.0.0+ desktop channel |
+| `version.json` | Legacy v2.4.3 release manifest (preserved for existing v2.x users) |
 | `browser-extension/` | Shared source and build script for Chromium and Firefox node checker add-ons |
-
-`qa_gui.py`, `smoke_windows_gui.py`, `test_connection.py`, and `test_updater.py` are development and verification utilities.
+| `website/` | Static project website |
+| `dist/` | Packaged installer and checksum outputs (git-ignored) |
 
 ## Project status
 
