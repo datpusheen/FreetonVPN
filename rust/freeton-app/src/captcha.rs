@@ -76,6 +76,11 @@ const CAPTCHA_CAPTURE_SCRIPT: &str = r#"(() => {
   if (window !== window.top) return;
   if (window.__freetonCaptchaCaptureInstalled) return;
   window.__freetonCaptchaCaptureInstalled = true;
+  const ALLOWED_ORIGIN_RE = /^https:\/\/([a-z0-9-]+\.)*(proton\.me|protonvpn\.com)$/i;
+  const isAllowedOrigin = (origin) =>
+    typeof origin === "string" &&
+    ((origin === window.location.origin && /^https:\/\//i.test(origin)) ||
+      ALLOWED_ORIGIN_RE.test(origin));
   const TOKEN_KEYS = [
     "Token",
     "token",
@@ -102,6 +107,7 @@ const CAPTCHA_CAPTURE_SCRIPT: &str = r#"(() => {
     } catch (_) {}
   };
   window.addEventListener("message", (event) => {
+    if (!isAllowedOrigin(event.origin)) return;
     const data = event.data;
     if (typeof data === "string") {
       const trimmed = data.trim();
@@ -1296,6 +1302,15 @@ mod tests {
                 "missing token key {key} in CAPTCHA_CAPTURE_SCRIPT"
             );
         }
+    }
+
+    #[test]
+    fn test_capture_script_enforces_proton_event_origin_filter() {
+        assert!(CAPTCHA_CAPTURE_SCRIPT.contains("event.origin"));
+        assert!(CAPTCHA_CAPTURE_SCRIPT.contains("isAllowedOrigin"));
+        assert!(CAPTCHA_CAPTURE_SCRIPT.contains(r"proton\.me"));
+        assert!(CAPTCHA_CAPTURE_SCRIPT.contains(r"protonvpn\.com"));
+        assert!(CAPTCHA_CAPTURE_SCRIPT.contains("if (!isAllowedOrigin(event.origin)) return;"));
     }
 
     #[test]
