@@ -1735,6 +1735,70 @@ mod tests {
         state.start_service_repair();
         assert!(state.drain_commands().is_empty());
 
+        // Closing via Escape/close_dialog or reopening while LaunchingAndWaiting cannot cancel/reset state.
+        state.close_dialog();
+        assert_eq!(state.active_dialog, ActiveDialog::ServiceRepair);
+        assert_eq!(
+            state.service_repair_phase,
+            ServiceRepairPhase::LaunchingAndWaiting
+        );
+        state.open_service_repair_dialog();
+        assert_eq!(state.active_dialog, ActiveDialog::ServiceRepair);
+        assert_eq!(
+            state.service_repair_phase,
+            ServiceRepairPhase::LaunchingAndWaiting
+        );
+
+        let escape_ctx = egui::Context::default();
+        let escape_input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(crate::ui::WINDOW_WIDTH, crate::ui::WINDOW_HEIGHT),
+            )),
+            events: vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: Some(Key::Escape),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        struct DummyStore;
+        impl CredentialStore for DummyStore {
+            fn get_password(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<Option<String>, freeton_core::storage::StorageError> {
+                Ok(None)
+            }
+            fn set_password(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), freeton_core::storage::StorageError> {
+                Ok(())
+            }
+            fn delete_password(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), freeton_core::storage::StorageError> {
+                Ok(())
+            }
+        }
+        let mut out = escape_ctx.run_ui(escape_input, |ui| {
+            crate::ui::render_root(ui, &mut state, &DummyStore);
+        });
+        out.textures_delta.clear();
+        assert_eq!(state.active_dialog, ActiveDialog::ServiceRepair);
+        assert_eq!(
+            state.service_repair_phase,
+            ServiceRepairPhase::LaunchingAndWaiting
+        );
+
         state.apply_event(WorkerEvent::ServiceRepairFailed {
             message: "UAC denied".to_owned(),
             detail: "code 5".to_owned(),

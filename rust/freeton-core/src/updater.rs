@@ -311,32 +311,33 @@ pub fn parse_github_release_info(
         (String::new(), String::new(), 0)
     };
 
-    let expected_sha_name =
-        (!installer_name.is_empty()).then(|| format!("{installer_name}.sha256"));
-    let chosen_sha_asset = expected_sha_name
-        .as_deref()
-        .and_then(|target_name| {
-            assets.iter().find(|asset| {
+    let sha_asset_url = if !installer_name.is_empty() && !download_url.is_empty() {
+        let expected_sha_name = format!("{installer_name}.sha256");
+        let chosen_sha_asset = assets
+            .iter()
+            .find(|asset| {
                 asset
                     .get("name")
                     .and_then(Value::as_str)
-                    .is_some_and(|n| n.trim().eq_ignore_ascii_case(target_name))
+                    .is_some_and(|n| n.trim().eq_ignore_ascii_case(&expected_sha_name))
             })
-        })
-        .or_else(|| {
-            assets.iter().find(|asset| {
-                asset
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|n| n.trim().to_ascii_lowercase().ends_with(".sha256"))
-            })
-        });
+            .or_else(|| {
+                assets.iter().find(|asset| {
+                    asset
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| n.trim().to_ascii_lowercase().ends_with(".sha256"))
+                })
+            });
 
-    let sha_asset_url = chosen_sha_asset
-        .and_then(|asset| asset.get("browser_download_url").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
+        chosen_sha_asset
+            .and_then(|asset| asset.get("browser_download_url").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    } else {
+        None
+    };
 
     Ok((
         UpdateInfo {
@@ -361,11 +362,35 @@ fn extract_hex64_from_line(line: &str) -> Option<String> {
         .map(|token| token.to_ascii_lowercase())
 }
 
+fn token_matches_filename(raw_token: &str, filename_lower: &str) -> bool {
+    let tok = raw_token.trim();
+    let tok = tok.strip_prefix('*').unwrap_or(tok);
+    let unwrapped = if tok.starts_with('(') && tok.ends_with(')') && tok.len() >= 2 {
+        &tok[1..tok.len() - 1]
+    } else if let Some(inner) = tok
+        .strip_prefix("SHA256(")
+        .or_else(|| tok.strip_prefix("sha256("))
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        inner
+    } else {
+        tok
+    };
+    unwrapped.trim().to_ascii_lowercase() == filename_lower
+}
+
+fn line_matches_filename(line: &str, filename_lower: &str) -> bool {
+    line.split_whitespace()
+        .flat_map(|ws_tok| ws_tok.split('='))
+        .any(|tok| token_matches_filename(tok, filename_lower))
+}
+
 /// Safely extracts a 64-character lowercase SHA-256 hex digest from a `.sha256` file payload.
 pub fn parse_sha256_text(text: &str, expected_filename: Option<&str>) -> Option<String> {
-    let lines: Vec<&str> = text
+    let cleaned = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let lines: Vec<&str> = cleaned
         .lines()
-        .map(str::trim)
+        .map(|l| l.trim().trim_start_matches('\u{FEFF}').trim())
         .filter(|l| !l.is_empty())
         .collect();
     if lines.is_empty() {
@@ -376,7 +401,7 @@ pub fn parse_sha256_text(text: &str, expected_filename: Option<&str>) -> Option<
         let filename_lower = filename.to_ascii_lowercase();
         let matching_hashes: Vec<String> = lines
             .iter()
-            .filter(|line| line.to_ascii_lowercase().contains(&filename_lower))
+            .filter(|line| line_matches_filename(line, &filename_lower))
             .filter_map(|line| extract_hex64_from_line(line))
             .collect();
         if matching_hashes.len() == 1 {
@@ -385,6 +410,14 @@ pub fn parse_sha256_text(text: &str, expected_filename: Option<&str>) -> Option<
         if matching_hashes.len() > 1 {
             return None;
         }
+        // Only fall back when the entire payload is a bare 64-hex hash without any filename token.
+        if lines.len() == 1
+            && lines[0].split_whitespace().count() == 1
+            && is_valid_sha256_hex(lines[0])
+        {
+            return Some(lines[0].to_ascii_lowercase());
+        }
+        return None;
     }
 
     let all_hashes: Vec<String> = lines
@@ -501,14 +534,23 @@ fn sanitize_installer_filename(url: &Url) -> String {
         .path_segments()
         .and_then(|mut segments| segments.rfind(|s| !s.is_empty()))
         .unwrap_or(INSTALLER_ASSET_NAME);
-    if candidate.is_empty()
-        || candidate == "."
-        || candidate == ".."
-        || candidate.contains('/')
-        || candidate.contains('\\')
-        || candidate.contains(':')
-        || candidate.chars().any(char::is_control)
-    {
+    let is_exe = candidate.len() > 4 && candidate.to_ascii_lowercase().ends_with(".exe");
+    let stem = if is_exe {
+        &candidate[..candidate.len() - 4]
+    } else {
+        ""
+    };
+    let safe = is_exe
+        && !stem.trim_matches('.').is_empty()
+        && candidate != "."
+        && candidate != ".."
+        && !candidate.contains("..")
+        && !candidate.contains('/')
+        && !candidate.contains('\\')
+        && !candidate.contains(':')
+        && !candidate.contains('%')
+        && !candidate.chars().any(char::is_control);
+    if !safe {
         INSTALLER_ASSET_NAME.to_owned()
     } else {
         candidate.to_owned()
@@ -599,22 +641,28 @@ pub async fn fetch_update_info_with_base(
     let gh_json: Value = gh_resp.json().await?;
     let (mut info, sha_asset_url) = parse_github_release_info(&gh_json)?;
 
-    if let Some(asset_url) = sha_asset_url {
-        let expected_name = Url::parse(&info.download_url)
-            .ok()
-            .map(|u| sanitize_installer_filename(&u));
-        if let Ok(sha_resp) = client
-            .get(&asset_url)
-            .timeout(Duration::from_secs(8))
-            .send()
-            .await
-        {
-            if sha_resp.status().is_success() {
-                if let Ok(bytes) = sha_resp.bytes().await {
-                    if bytes.len() <= MAX_SHA256_ASSET_BYTES {
-                        let text = String::from_utf8_lossy(&bytes);
-                        if let Some(digest) = parse_sha256_text(&text, expected_name.as_deref()) {
-                            info.sha256 = digest;
+    if !info.download_url.is_empty() {
+        if let Some(asset_url) = sha_asset_url {
+            if let Ok(validated_sha_url) = validate_download_url(&asset_url) {
+                let expected_name = Url::parse(&info.download_url)
+                    .ok()
+                    .map(|u| sanitize_installer_filename(&u));
+                if let Ok(sha_resp) = client
+                    .get(validated_sha_url)
+                    .timeout(Duration::from_secs(8))
+                    .send()
+                    .await
+                {
+                    if sha_resp.status().is_success() {
+                        if let Ok(bytes) = sha_resp.bytes().await {
+                            if bytes.len() <= MAX_SHA256_ASSET_BYTES {
+                                let text = String::from_utf8_lossy(&bytes);
+                                if let Some(digest) =
+                                    parse_sha256_text(&text, expected_name.as_deref())
+                                {
+                                    info.sha256 = digest;
+                                }
+                            }
                         }
                     }
                 }
@@ -646,6 +694,28 @@ pub async fn download_and_verify_update(
     download_and_verify_update_with_client(&client, info, dest_dir, on_progress).await
 }
 
+struct PartFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl PartFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for PartFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 async fn download_and_verify_update_with_client(
     client: &Client,
     info: &UpdateInfo,
@@ -668,6 +738,10 @@ async fn download_and_verify_update_with_client(
     if part_path.exists() {
         let _ = fs::remove_file(&part_path);
     }
+
+    // Declared before `response` and the file handle so dropping/cancelling the future closes
+    // the file handle first and removes `.part` on any non-success exit path.
+    let mut part_guard = PartFileGuard::new(part_path.clone());
 
     let mut response = client.get(download_url).send().await?.error_for_status()?;
     let total_size = response.content_length().unwrap_or(info.file_size_bytes);
@@ -702,16 +776,9 @@ async fn download_and_verify_update_with_client(
     }
     .await;
 
-    let (_, actual_sha) = match result {
-        Ok(ok) => ok,
-        Err(err) => {
-            let _ = fs::remove_file(&part_path);
-            return Err(err);
-        }
-    };
+    let (_, actual_sha) = result?;
 
     if actual_sha != expected_sha {
-        let _ = fs::remove_file(&part_path);
         return Err(UpdateError::ChecksumMismatch {
             expected: expected_sha,
             actual: actual_sha,
@@ -721,10 +788,8 @@ async fn download_and_verify_update_with_client(
     if dest_path.exists() {
         let _ = fs::remove_file(&dest_path);
     }
-    if let Err(err) = fs::rename(&part_path, &dest_path) {
-        let _ = fs::remove_file(&part_path);
-        return Err(UpdateError::Io(err));
-    }
+    fs::rename(&part_path, &dest_path)?;
+    part_guard.disarm();
 
     Ok(UpdateAction::LaunchVerifiedInstaller(dest_path))
 }
@@ -1263,5 +1328,160 @@ mod tests {
         let _ = fs::remove_dir_all(&stalled_dir);
 
         server_task.abort();
+    }
+
+    #[test]
+    fn test_orphan_sha256_without_exe_and_bom_exact_token_matching() {
+        // 1. Orphan .sha256 without .exe asset must not attach sha_asset_url.
+        let orphan_gh = serde_json::json!({
+            "tag_name": "v3.5.0",
+            "name": "Freeton VPN v3.5.0",
+            "assets": [
+                {
+                    "name": "FreetonVPN-Setup-x64.exe.sha256",
+                    "browser_download_url": "https://github.com/datpusheen/FreetonVPN/releases/download/v3.5.0/FreetonVPN-Setup-x64.exe.sha256",
+                    "size": 96
+                }
+            ]
+        });
+        let (orphan_info, orphan_sha_url) =
+            parse_github_release_info(&orphan_gh).expect("valid release json");
+        assert!(orphan_info.download_url.is_empty());
+        assert!(orphan_sha_url.is_none());
+
+        // 2. UTF-8 BOM + exact filename token vs substring non-match in parse_sha256_text.
+        let digest = "c".repeat(64);
+        assert_eq!(
+            parse_sha256_text(
+                &format!("\u{FEFF}{digest}  FreetonVPN-Setup-x64.exe"),
+                Some("FreetonVPN-Setup-x64.exe")
+            ),
+            Some(digest.clone())
+        );
+        assert_eq!(
+            parse_sha256_text(
+                &format!("\u{FEFF}{digest} *FreetonVPN-Setup-x64.exe"),
+                Some("FreetonVPN-Setup-x64.exe")
+            ),
+            Some(digest.clone())
+        );
+        assert_eq!(
+            parse_sha256_text(
+                &format!("\u{FEFF}{digest}\n"),
+                Some("FreetonVPN-Setup-x64.exe")
+            ),
+            Some(digest.clone())
+        );
+        // Substring matches (`.bak`, prefix, `.sha256`) must NOT match.
+        assert_eq!(
+            parse_sha256_text(
+                &format!("\u{FEFF}{digest}  FreetonVPN-Setup-x64.exe.bak"),
+                Some("FreetonVPN-Setup-x64.exe")
+            ),
+            None
+        );
+        assert_eq!(
+            parse_sha256_text(
+                &format!("\u{FEFF}{digest}  evil-FreetonVPN-Setup-x64.exe"),
+                Some("FreetonVPN-Setup-x64.exe")
+            ),
+            None
+        );
+
+        // 3. sanitize_installer_filename strictly enforces a safe non-empty `.exe` filename.
+        assert_eq!(
+            sanitize_installer_filename(&Url::parse("https://example.com/latest").unwrap()),
+            INSTALLER_ASSET_NAME
+        );
+        assert_eq!(
+            sanitize_installer_filename(&Url::parse("https://example.com/evil.bat").unwrap()),
+            INSTALLER_ASSET_NAME
+        );
+        assert_eq!(
+            sanitize_installer_filename(&Url::parse("https://example.com/.exe").unwrap()),
+            INSTALLER_ASSET_NAME
+        );
+        assert_eq!(
+            sanitize_installer_filename(
+                &Url::parse("https://example.com/CustomSetup-x64.exe").unwrap()
+            ),
+            "CustomSetup-x64.exe"
+        );
+        assert!(
+            validate_download_url("http://evil.example/FreetonVPN-Setup-x64.exe.sha256").is_err()
+        );
+        assert!(validate_download_url("https://github.com/datpusheen/FreetonVPN/releases/download/v3.5.0/FreetonVPN-Setup-x64.exe.sha256").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dropping_download_future_removes_part_file() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let hold_srv = Arc::clone(&hold);
+
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut socket).await;
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(header.as_bytes()).await;
+            let _ = socket.write_all(b"PARTIAL-INSTALLER-CHUNK").await;
+            let _ = socket.flush().await;
+            hold_srv.notified().await;
+        });
+
+        let dest_dir = temp_dir("future_drop_guard");
+        let info = UpdateInfo {
+            version: "3.5.0".to_owned(),
+            release_date: "2026-12-25".to_owned(),
+            title: "Drop Guard Test".to_owned(),
+            changelog: Vec::new(),
+            download_url: format!("http://{addr}/FreetonVPN-Setup-x64.exe"),
+            file_size_bytes: 4096,
+            sha256: "d".repeat(64),
+            mandatory: false,
+            min_supported_version: "3.0.0".to_owned(),
+        };
+
+        let client = build_updater_client_with(
+            Duration::from_secs(2),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )
+        .expect("client");
+
+        let chunk_written = Arc::new(tokio::sync::Notify::new());
+        let chunk_notify = Arc::clone(&chunk_written);
+        let part_path = dest_dir.join("FreetonVPN-Setup-x64.exe.part");
+
+        {
+            let mut download_fut = std::pin::pin!(download_and_verify_update_with_client(
+                &client,
+                &info,
+                &dest_dir,
+                move |_, _, _| {
+                    chunk_notify.notify_one();
+                },
+            ));
+            tokio::select! {
+                _ = &mut download_fut => panic!("download should still be streaming"),
+                _ = chunk_written.notified() => {}
+            }
+            assert!(
+                part_path.exists(),
+                ".part must exist while streaming before drop"
+            );
+            // Exiting scope drops `download_fut` directly without finishing or erroring.
+        }
+
+        assert!(
+            !part_path.exists(),
+            ".part must be removed immediately when download future is dropped"
+        );
+        assert_eq!(fs::read_dir(&dest_dir).expect("read dir").count(), 0);
+
+        hold.notify_one();
+        server_task.abort();
+        let _ = fs::remove_dir_all(&dest_dir);
     }
 }

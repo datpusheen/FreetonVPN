@@ -102,14 +102,14 @@ fn grant_interactive_user_service_rights(service_handle: &ScHandleGuard) -> Resu
         }
     }
 
-    let mut sd_buf = vec![0u8; bytes_needed.max(64) as usize];
+    let mut sd_buf = vec![0u64; (bytes_needed as usize).max(64).div_ceil(8)];
     let existing_sd = PSECURITY_DESCRIPTOR(sd_buf.as_mut_ptr().cast());
     unsafe {
         QueryServiceObjectSecurity(
             service_handle.0,
             DACL_SECURITY_INFORMATION.0,
             Some(existing_sd),
-            u32::try_from(sd_buf.len()).unwrap_or(u32::MAX),
+            u32::try_from(sd_buf.len() * core::mem::size_of::<u64>()).unwrap_or(u32::MAX),
             &mut bytes_needed,
         )
         .map_err(|e| format!("QueryServiceObjectSecurity failed: {e}"))?;

@@ -2,25 +2,29 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::ClientOptions;
-use windows::core::{s, PCWSTR, PWSTR};
+use windows::core::{s, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, FreeLibrary, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
+    CloseHandle, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
     ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOT_ACTIVE,
-    HLOCAL, HMODULE, WIN32_ERROR,
+    HANDLE, HLOCAL, LUID, WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SDDL_REVISION_1,
     SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR,
+    AdjustTokenPrivileges, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+    LookupPrivilegeValueW, ACL, DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SE_PRIVILEGE_ENABLED, SE_TAKE_OWNERSHIP_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    TOKEN_QUERY,
 };
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryW, SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_APPLICATION_DIR,
@@ -34,14 +38,16 @@ use windows::Win32::System::Services::{
     SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS, SERVICE_SID_INFO, SERVICE_SID_TYPE_UNRESTRICTED,
     SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_WIN32_OWN_PROCESS,
 };
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 pub const TUNNEL_SERVICE_PREFIX: &str = "WireGuardTunnel$";
 pub const TUNNEL_SERVICE_DISPLAY_PREFIX: &str = "WireGuard Tunnel: ";
 pub const WIREGUARD_UAPI_PIPE_PREFIX: &str = r"\\.\pipe\ProtectedPrefix\Administrators\WireGuard\";
-pub const RESTRICTED_TUNNEL_DIR_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
+pub const RESTRICTED_TUNNEL_DIR_SDDL: &str = "O:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
 
 const UAPI_PIPE_TIMEOUT: Duration = Duration::from_secs(2);
 const DELETE_ACCESS: u32 = 0x0001_0000;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
 type WireGuardTunnelServiceFn = unsafe extern "system" fn(*const u16) -> i32;
 
@@ -86,32 +92,6 @@ impl Drop for LocalFreeGuard {
         if !self.0.is_null() {
             unsafe {
                 let _ = LocalFree(Some(HLOCAL(self.0)));
-            }
-        }
-    }
-}
-
-struct LibraryGuard(HMODULE);
-
-impl Drop for LibraryGuard {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            unsafe {
-                let _ = FreeLibrary(self.0);
-            }
-        }
-    }
-}
-
-/// Ensures Windows `CloseHandle` usage stays clean if needed across modules.
-#[allow(dead_code)]
-pub(crate) struct WinHandleGuard(pub(crate) windows::Win32::Foundation::HANDLE);
-
-impl Drop for WinHandleGuard {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            unsafe {
-                let _ = CloseHandle(self.0);
             }
         }
     }
@@ -186,8 +166,26 @@ pub fn to_win32_path_arg(canonical_path: &Path) -> PathBuf {
     canonical_path.to_path_buf()
 }
 
-/// Verifies that `conf_path` is an existing regular `.conf` file (never a symlink) whose canonical
-/// path resolves directly inside `allowed_dir`.
+fn is_reparse_or_symlink(meta: &fs::Metadata) -> bool {
+    meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+}
+
+fn validate_non_reparse_dir(dir: &Path, label: &str) -> Result<(), TunnelError> {
+    let meta = fs::symlink_metadata(dir).map_err(|err| {
+        TunnelError::InvalidConfPath(format!("{label} {} is unavailable: {err}", dir.display()))
+    })?;
+    if is_reparse_or_symlink(&meta) || !meta.is_dir() {
+        return Err(TunnelError::InvalidConfPath(format!(
+            "{label} {} must be a real non-reparse directory",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Verifies that `conf_path` is an existing regular `.conf` file (never a symlink/reparse point),
+/// that `allowed_dir` and its parent directory are real non-reparse directories, and that the
+/// canonical path resolves directly inside `allowed_dir`.
 pub fn validate_tunnel_conf_path(
     conf_path: &Path,
     allowed_dir: &Path,
@@ -210,13 +208,18 @@ pub fn validate_tunnel_conf_path(
         )));
     }
 
+    if let Some(parent_dir) = allowed_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        validate_non_reparse_dir(parent_dir, "allowed tunnels parent directory")?;
+    }
+    validate_non_reparse_dir(allowed_dir, "allowed tunnels directory")?;
+
     let meta = fs::symlink_metadata(conf_path).map_err(|err| {
         TunnelError::InvalidConfPath(format!(
             "cannot access configuration file {}: {err}",
             conf_path.display()
         ))
     })?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
+    if is_reparse_or_symlink(&meta) || !meta.is_file() {
         return Err(TunnelError::InvalidConfPath(format!(
             "configuration path must be a regular non-symlink file: {}",
             conf_path.display()
@@ -250,6 +253,47 @@ pub fn validate_tunnel_conf_path(
     Ok(canonical_conf)
 }
 
+fn try_enable_take_ownership_privilege() {
+    struct TokenGuard(HANDLE);
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let _token_guard = TokenGuard(token);
+
+        let mut luid = LUID::default();
+        if LookupPrivilegeValueW(PCWSTR::null(), SE_TAKE_OWNERSHIP_NAME, &mut luid).is_err() {
+            return;
+        }
+
+        let tp = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        let _ = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None);
+    }
+}
+
 pub fn apply_restricted_dacl(path: &Path, sddl: &str) -> Result<(), TunnelError> {
     let wide_sddl = to_wide_null(sddl)?;
     let mut sd = PSECURITY_DESCRIPTOR::default();
@@ -277,13 +321,31 @@ pub fn apply_restricted_dacl(path: &Path, sddl: &str) -> Result<(), TunnelError>
         ));
     }
 
+    let mut p_owner = PSID::default();
+    let mut owner_defaulted = windows::core::BOOL(0);
+    unsafe {
+        GetSecurityDescriptorOwner(sd, &mut p_owner, &mut owner_defaulted).map_err(|e| {
+            TunnelError::Security(format!("GetSecurityDescriptorOwner failed: {e}"))
+        })?;
+    }
+    let owner_opt = if p_owner.0.is_null() {
+        None
+    } else {
+        try_enable_take_ownership_privilege();
+        Some(p_owner)
+    };
+    let mut security_info = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+    if owner_opt.is_some() {
+        security_info |= OWNER_SECURITY_INFORMATION;
+    }
+
     let wide_path = to_wide_null(path.as_os_str())?;
     let status = unsafe {
         SetNamedSecurityInfoW(
             PCWSTR(wide_path.as_ptr()),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            None,
+            security_info,
+            owner_opt,
             None,
             Some(p_dacl.cast_const()),
             None,
@@ -300,21 +362,55 @@ pub fn apply_restricted_dacl(path: &Path, sddl: &str) -> Result<(), TunnelError>
     Ok(())
 }
 
+fn ensure_single_restricted_dir(dir: &Path, enforce_acl: bool) -> Result<(), TunnelError> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if is_reparse_or_symlink(&meta) || !meta.is_dir() {
+                return Err(TunnelError::InvalidConfPath(format!(
+                    "directory {} must be a real non-reparse directory",
+                    dir.display()
+                )));
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            match fs::create_dir(dir) {
+                Ok(()) => {}
+                Err(create_err) if create_err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(create_err) => return Err(TunnelError::Io(create_err)),
+            }
+            let meta = fs::symlink_metadata(dir)?;
+            if is_reparse_or_symlink(&meta) || !meta.is_dir() {
+                return Err(TunnelError::InvalidConfPath(format!(
+                    "directory {} must be a real non-reparse directory",
+                    dir.display()
+                )));
+            }
+        }
+        Err(err) => return Err(TunnelError::Io(err)),
+    }
+
+    if enforce_acl {
+        apply_restricted_dacl(dir, RESTRICTED_TUNNEL_DIR_SDDL)?;
+    }
+    Ok(())
+}
+
 pub fn ensure_restricted_tunnels_dir(
     tunnels_dir: &Path,
     enforce_acl: bool,
 ) -> Result<(), TunnelError> {
-    fs::create_dir_all(tunnels_dir)?;
-    let meta = fs::symlink_metadata(tunnels_dir)?;
-    if meta.file_type().is_symlink() || !meta.is_dir() {
-        return Err(TunnelError::InvalidConfPath(format!(
-            "tunnels directory {} must be a real directory",
-            tunnels_dir.display()
-        )));
+    if let Some(parent) = tunnels_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty() && p.parent().is_some())
+    {
+        if let Some(grandparent) = parent.parent().filter(|gp| !gp.as_os_str().is_empty()) {
+            if !grandparent.exists() {
+                fs::create_dir_all(grandparent)?;
+            }
+        }
+        ensure_single_restricted_dir(parent, enforce_acl)?;
     }
-    if enforce_acl {
-        apply_restricted_dacl(tunnels_dir, RESTRICTED_TUNNEL_DIR_SDDL)?;
-    }
+    ensure_single_restricted_dir(tunnels_dir, enforce_acl)?;
     Ok(())
 }
 
@@ -329,9 +425,9 @@ pub fn write_restricted_tunnel_conf(
 
     let conf_path = tunnels_dir.join(format!("{tunnel_name}.conf"));
     if let Ok(meta) = fs::symlink_metadata(&conf_path) {
-        if meta.file_type().is_symlink() {
+        if is_reparse_or_symlink(&meta) {
             return Err(TunnelError::InvalidConfPath(format!(
-                "refusing to overwrite symlink {}",
+                "refusing to overwrite symlink/reparse point {}",
                 conf_path.display()
             )));
         }
@@ -392,7 +488,8 @@ pub fn run_tunnel_service_from_cli(conf_path: &Path) -> Result<(), TunnelError> 
     let module = unsafe { LoadLibraryW(PCWSTR(wide_tunnel_dll.as_ptr())) }.map_err(|err| {
         TunnelError::DllLoad(format!("failed loading {}: {err}", tunnel_dll.display()))
     })?;
-    let _module_guard = LibraryGuard(module);
+    // Intentionally never call FreeLibrary on tunnel.dll (Go c-shared DLL): the --tunnel process
+    // exits immediately on return, avoiding 0xC0000005 teardown crashes in Go runtime threads.
 
     let proc_ptr =
         unsafe { GetProcAddress(module, s!("WireGuardTunnelService")) }.ok_or_else(|| {
@@ -612,10 +709,6 @@ pub async fn query_uapi_state(tunnel_name: &str) -> Result<String, TunnelError> 
     .map_err(|_| TunnelError::Pipe("timed out reading WireGuard UAPI state".to_owned()))?
 }
 
-/// Utility helper for converting a UTF-16 `PWSTR` if needed in diagnostics.
-#[allow(dead_code)]
-pub(crate) fn _check_pwstr_unused(_: PWSTR) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,5 +828,137 @@ mod tests {
             }
             let _guard = LocalFreeGuard(sd.0);
         }
+
+        // Verify RESTRICTED_TUNNEL_DIR_SDDL explicitly specifies an Owner SID (BA) and a DACL.
+        let wide_dir_sddl = to_wide_null(RESTRICTED_TUNNEL_DIR_SDDL).expect("wide dir sddl");
+        let mut dir_sd = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(wide_dir_sddl.as_ptr()),
+                SDDL_REVISION_1,
+                &mut dir_sd,
+                None,
+            )
+            .expect("parse RESTRICTED_TUNNEL_DIR_SDDL");
+        }
+        let _dir_sd_guard = LocalFreeGuard(dir_sd.0);
+        let mut p_owner = PSID::default();
+        let mut owner_defaulted = windows::core::BOOL(0);
+        unsafe {
+            GetSecurityDescriptorOwner(dir_sd, &mut p_owner, &mut owner_defaulted)
+                .expect("GetSecurityDescriptorOwner");
+        }
+        assert!(
+            !p_owner.0.is_null(),
+            "RESTRICTED_TUNNEL_DIR_SDDL must include explicit Owner SID"
+        );
+    }
+
+    fn create_directory_junction(link: &Path, target: &Path) -> io::Result<()> {
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!("mklink /J exited with {status}")))
+        }
+    }
+
+    #[test]
+    fn test_rejects_junction_and_symlink_on_parent_and_tunnels_dir() {
+        let root = unique_temp_dir("reparse_dirs");
+        let evil_target = root.join("evil_target");
+        let evil_tunnels_inside = evil_target.join("tunnels");
+        fs::create_dir_all(&evil_tunnels_inside).expect("create evil target");
+        let evil_conf = evil_tunnels_inside.join("FreetonVPN.conf");
+        fs::write(&evil_conf, "[Interface]\n").expect("write evil conf");
+
+        // Case 1: Parent directory (`FreetonVPN`) is an NTFS directory junction (unprivileged reparse point).
+        let base_a = root.join("case_parent_junction");
+        fs::create_dir_all(&base_a).expect("create base_a");
+        let parent_junction = base_a.join("FreetonVPN");
+        create_directory_junction(&parent_junction, &evil_target)
+            .expect("create unprivileged directory junction on parent");
+        let tunnels_under_parent_junction = parent_junction.join("tunnels");
+
+        assert!(
+            matches!(
+                ensure_restricted_tunnels_dir(&tunnels_under_parent_junction, false),
+                Err(TunnelError::InvalidConfPath(_))
+            ),
+            "ensure_restricted_tunnels_dir must reject reparse point parent"
+        );
+        assert!(
+            matches!(
+                validate_tunnel_conf_path(
+                    &tunnels_under_parent_junction.join("FreetonVPN.conf"),
+                    &tunnels_under_parent_junction
+                ),
+                Err(TunnelError::InvalidConfPath(_))
+            ),
+            "validate_tunnel_conf_path must reject reparse point parent"
+        );
+
+        // Case 2: Leaf directory (`tunnels`) is an NTFS directory junction under a real parent.
+        let base_b = root.join("case_leaf_junction");
+        let real_parent = base_b.join("FreetonVPN");
+        fs::create_dir_all(&real_parent).expect("create real parent");
+        let leaf_junction = real_parent.join("tunnels");
+        create_directory_junction(&leaf_junction, &evil_tunnels_inside)
+            .expect("create unprivileged directory junction on leaf");
+
+        assert!(
+            matches!(
+                ensure_restricted_tunnels_dir(&leaf_junction, false),
+                Err(TunnelError::InvalidConfPath(_))
+            ),
+            "ensure_restricted_tunnels_dir must reject reparse point leaf"
+        );
+        assert!(
+            matches!(
+                validate_tunnel_conf_path(&leaf_junction.join("FreetonVPN.conf"), &leaf_junction),
+                Err(TunnelError::InvalidConfPath(_))
+            ),
+            "validate_tunnel_conf_path must reject reparse point leaf"
+        );
+
+        // Case 3: True directory symlinks if unprivileged symlink creation is enabled on this host.
+        let base_c = root.join("case_symlink_dir");
+        let sym_parent_parent = base_c.join("FreetonVPN");
+        fs::create_dir_all(&sym_parent_parent).expect("create sym base");
+        let sym_leaf = sym_parent_parent.join("tunnels");
+        if std::os::windows::fs::symlink_dir(&evil_tunnels_inside, &sym_leaf).is_ok() {
+            assert!(matches!(
+                ensure_restricted_tunnels_dir(&sym_leaf, false),
+                Err(TunnelError::InvalidConfPath(_))
+            ));
+            assert!(matches!(
+                validate_tunnel_conf_path(&sym_leaf.join("FreetonVPN.conf"), &sym_leaf),
+                Err(TunnelError::InvalidConfPath(_))
+            ));
+        }
+
+        // Case 4: Step-by-step creation succeeds cleanly on a normal non-reparse path.
+        let clean_tunnels = root.join("clean").join("FreetonVPN").join("tunnels");
+        ensure_restricted_tunnels_dir(&clean_tunnels, false).expect("clean dir creation succeeds");
+        let clean_conf =
+            write_restricted_tunnel_conf(&clean_tunnels, "FreetonVPN", "[Interface]\n", false)
+                .expect("write_restricted_tunnel_conf succeeds");
+        assert!(clean_conf.is_file());
+
+        // Cleanup junctions cleanly before remove_dir_all so targets aren't confused.
+        let _ = fs::remove_dir(&parent_junction);
+        let _ = fs::remove_dir(&leaf_junction);
+        let _ = fs::remove_dir(&sym_leaf);
+        let _ = fs::remove_dir_all(&root);
     }
 }

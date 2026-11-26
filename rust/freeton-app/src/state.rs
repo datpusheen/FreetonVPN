@@ -1135,8 +1135,10 @@ impl AppState {
     }
 
     pub fn open_service_repair_dialog(&mut self) {
-        self.service_repair_phase = ServiceRepairPhase::Idle;
-        self.service_repair_detail = None;
+        if self.service_repair_phase != ServiceRepairPhase::LaunchingAndWaiting {
+            self.service_repair_phase = ServiceRepairPhase::Idle;
+            self.service_repair_detail = None;
+        }
         self.return_dialog = None;
         self.active_dialog = ActiveDialog::ServiceRepair;
         self.window_visible = true;
@@ -1156,6 +1158,9 @@ impl AppState {
             }
         }
         if self.active_dialog == ActiveDialog::ServiceRepair {
+            if self.service_repair_phase == ServiceRepairPhase::LaunchingAndWaiting {
+                return;
+            }
             self.service_repair_phase = ServiceRepairPhase::Idle;
             self.service_repair_detail = None;
         }

@@ -41,13 +41,28 @@ pub const C_TOGGLE_ON: Color32 = Color32::from_rgb(0x79, 0xcb, 0xbb);
 pub const WINDOW_WIDTH: f32 = 390.0;
 pub const WINDOW_HEIGHT: f32 = 610.0;
 
+fn resolve_windows_fonts_dir(
+    windir: Option<std::ffi::OsString>,
+    system_root: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    windir
+        .filter(|v| !v.is_empty())
+        .or_else(|| system_root.filter(|v| !v.is_empty()))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+        .join("Fonts")
+}
+
 pub fn configure_fonts_and_style(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
 
     let mut prop_prefix = Vec::new();
     let mut mono_suffix = Vec::new();
 
-    if let Ok(segoe_bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
+    let fonts_dir =
+        resolve_windows_fonts_dir(std::env::var_os("WINDIR"), std::env::var_os("SystemRoot"));
+
+    if let Ok(segoe_bytes) = std::fs::read(fonts_dir.join("segoeui.ttf")) {
         fonts.font_data.insert(
             "segoe_ui".to_owned(),
             Arc::new(FontData::from_owned(segoe_bytes)),
@@ -55,7 +70,7 @@ pub fn configure_fonts_and_style(ctx: &egui::Context) {
         prop_prefix.push("segoe_ui".to_owned());
     }
 
-    if let Ok(emoji_bytes) = std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf") {
+    if let Ok(emoji_bytes) = std::fs::read(fonts_dir.join("seguiemj.ttf")) {
         fonts.font_data.insert(
             "segoe_ui_emoji".to_owned(),
             Arc::new(FontData::from_owned(emoji_bytes)),
@@ -64,7 +79,7 @@ pub fn configure_fonts_and_style(ctx: &egui::Context) {
         mono_suffix.push("segoe_ui_emoji".to_owned());
     }
 
-    if let Ok(sym_bytes) = std::fs::read(r"C:\Windows\Fonts\seguisym.ttf") {
+    if let Ok(sym_bytes) = std::fs::read(fonts_dir.join("seguisym.ttf")) {
         fonts.font_data.insert(
             "segoe_ui_symbol".to_owned(),
             Arc::new(FontData::from_owned(sym_bytes)),
@@ -480,4 +495,30 @@ fn render_loading_bar(ui: &mut Ui, state: &AppState) {
             p.rect_filled(fill_rect, cr, C_ACCENT);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_windows_fonts_dir;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_resolve_windows_fonts_dir_precedence() {
+        assert_eq!(
+            resolve_windows_fonts_dir(
+                Some(OsString::from(r"D:\WinOS")),
+                Some(OsString::from(r"E:\Fallback"))
+            ),
+            PathBuf::from(r"D:\WinOS\Fonts")
+        );
+        assert_eq!(
+            resolve_windows_fonts_dir(Some(OsString::new()), Some(OsString::from(r"E:\SysRoot"))),
+            PathBuf::from(r"E:\SysRoot\Fonts")
+        );
+        assert_eq!(
+            resolve_windows_fonts_dir(None, None),
+            PathBuf::from(r"C:\Windows\Fonts")
+        );
+    }
 }

@@ -611,19 +611,25 @@ where
         return false;
     }
 
+    let candidates: Vec<(IpAddr, IpAddr)> = targets
+        .into_iter()
+        .filter_map(|target| {
+            sources
+                .iter()
+                .find(|ip| ip.is_ipv4() == target.is_ipv4())
+                .copied()
+                .map(|source| (source, target))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return false;
+    }
+
     let deadline = Instant::now() + timeout;
-    let total_targets = targets.len();
+    let total_targets = candidates.len();
     let mut recv_buf = [0u8; 4096];
 
-    for (index, target) in targets.into_iter().enumerate() {
-        let Some(source) = sources
-            .iter()
-            .find(|ip| ip.is_ipv4() == target.is_ipv4())
-            .copied()
-        else {
-            continue;
-        };
-
+    for (index, (source, target)) in candidates.into_iter().enumerate() {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             break;
         };
@@ -996,6 +1002,7 @@ mod tests {
         binds: RefCell<Vec<SocketAddr>>,
         connects: RefCell<Vec<SocketAddr>>,
         sends: RefCell<Vec<Vec<u8>>>,
+        timeouts: RefCell<Vec<Duration>>,
     }
 
     impl MockSocketScript {
@@ -1006,6 +1013,7 @@ mod tests {
                 binds: RefCell::new(Vec::new()),
                 connects: RefCell::new(Vec::new()),
                 sends: RefCell::new(Vec::new()),
+                timeouts: RefCell::new(Vec::new()),
             }
         }
     }
@@ -1032,7 +1040,8 @@ mod tests {
     }
 
     impl ProbeSocket for MockBoundSocket<'_> {
-        fn set_timeout(&self, _timeout: Duration) -> io::Result<()> {
+        fn set_timeout(&self, timeout: Duration) -> io::Result<()> {
+            self.script.timeouts.borrow_mut().push(timeout);
             Ok(())
         }
 
@@ -1185,6 +1194,39 @@ mod tests {
             server_port,
             Duration::from_millis(200),
         ));
+    }
+
+    #[test]
+    fn test_ipv6_dns_target_does_not_halve_ipv4_timeout_budget() {
+        let mut resp = Vec::with_capacity(12);
+        resp.extend_from_slice(&42u16.to_be_bytes());
+        resp.extend_from_slice(&0x8180u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+
+        for dns_list in [
+            "10.2.0.1, 2606:4700:4700::1111",
+            "2606:4700:4700::1111, 10.2.0.1",
+        ] {
+            let mock = MockSocketScript::new(false, vec![Ok(resp.clone())]);
+            assert!(probe_dns_with(
+                "10.2.0.2/32",
+                dns_list,
+                53,
+                Duration::from_secs(2),
+                &MockFactory(&mock),
+                || 42,
+            ));
+            let timeouts = mock.timeouts.borrow();
+            assert_eq!(timeouts.len(), 1);
+            assert!(
+                timeouts[0] > Duration::from_millis(1500),
+                "IPv6 target must be filtered before timeout slicing ({dns_list}): got {:?}",
+                timeouts[0]
+            );
+        }
     }
 
     #[test]

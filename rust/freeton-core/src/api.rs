@@ -240,14 +240,11 @@ pub fn normalize_2fa_code(code: &str) -> Result<String, ApiError> {
     Ok(trimmed.to_owned())
 }
 
-/// Returns `true` when a Proton physical server entry is online and has no services down.
+/// Returns `true` when a Proton physical server entry is online and has `ServicesDown == 0`.
 pub fn is_usable_physical_server(server: &Value) -> bool {
     let status = server.get("Status").and_then(Value::as_i64);
-    let services_down = server
-        .get("ServicesDown")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    status == Some(1) && services_down == 0
+    let services_down = server.get("ServicesDown").and_then(Value::as_i64);
+    status == Some(1) && services_down == Some(0)
 }
 
 fn first_non_empty(candidates: &[Option<&str>]) -> String {
@@ -1243,6 +1240,47 @@ mod tests {
         assert_eq!(with_down.len(), 3);
         assert_eq!(with_down[0].name, "SG-DOWN#1");
         assert_eq!(with_down[0].active_physical_servers, 0);
+    }
+
+    #[test]
+    fn test_is_usable_physical_server_rejects_missing_or_null_services_down() {
+        assert!(is_usable_physical_server(&serde_json::json!({
+            "Status": 1,
+            "ServicesDown": 0
+        })));
+        assert!(!is_usable_physical_server(&serde_json::json!({
+            "Status": 1
+        })));
+        assert!(!is_usable_physical_server(&serde_json::json!({
+            "Status": 1,
+            "ServicesDown": null
+        })));
+        assert!(!is_usable_physical_server(&serde_json::json!({
+            "Status": 1,
+            "ServicesDown": "0"
+        })));
+
+        let payload = serde_json::json!({
+            "Code": 1000,
+            "LogicalServers": [
+                {
+                    "Name": "MISSING-SD#1",
+                    "Tier": 0,
+                    "Status": 1,
+                    "EntryCountry": "US",
+                    "ExitCountry": "US",
+                    "City": "Dallas",
+                    "Load": 10,
+                    "Domain": "missing-sd.protonvpn.net",
+                    "Servers": [
+                        {"EntryIP": "198.51.100.10", "Status": 1, "X25519PublicKey": "k1"},
+                        {"EntryIP": "198.51.100.11", "Status": 1, "ServicesDown": null, "X25519PublicKey": "k2"}
+                    ]
+                }
+            ]
+        });
+        let usable = select_free_servers_with_wg(&payload, None, false).expect("valid payload");
+        assert!(usable.is_empty());
     }
 
     #[tokio::test]

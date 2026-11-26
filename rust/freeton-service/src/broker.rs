@@ -234,6 +234,7 @@ enum BrokerPhase {
 struct BrokerState {
     phase: BrokerPhase,
     last_dns_verified_unix: Option<i64>,
+    generation: u64,
 }
 
 impl Default for BrokerState {
@@ -241,6 +242,71 @@ impl Default for BrokerState {
         Self {
             phase: BrokerPhase::Idle,
             last_dns_verified_unix: None,
+            generation: 0,
+        }
+    }
+}
+
+impl BrokerState {
+    fn set_phase(&mut self, phase: BrokerPhase, last_dns_verified_unix: Option<i64>) {
+        self.phase = phase;
+        self.last_dns_verified_unix = last_dns_verified_unix;
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
+
+enum ServiceWaitError {
+    Cancelled,
+    Other(String),
+}
+
+struct ConnectCancelToken {
+    cancel_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
+    external_shutdown_rx: Option<watch::Receiver<bool>>,
+}
+
+impl ConnectCancelToken {
+    fn is_cancelled(&self) -> bool {
+        *self.cancel_rx.borrow()
+            || *self.shutdown_rx.borrow()
+            || self
+                .external_shutdown_rx
+                .as_ref()
+                .is_some_and(|rx| *rx.borrow())
+    }
+
+    async fn cancelled(&mut self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let cancel_rx = &mut self.cancel_rx;
+        let shutdown_rx = &mut self.shutdown_rx;
+        let external_rx = &mut self.external_shutdown_rx;
+
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(cancel_rx) => {}
+            _ = wait_for_shutdown(shutdown_rx) => {}
+            _ = async {
+                if let Some(rx) = external_rx.as_mut() {
+                    wait_for_shutdown(rx).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
+        }
+    }
+}
+
+struct ActiveConnectGuard<'a> {
+    slot: &'a Mutex<Option<watch::Sender<bool>>>,
+}
+
+impl Drop for ActiveConnectGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.slot.lock() {
+            *guard = None;
         }
     }
 }
@@ -250,6 +316,9 @@ pub struct TunnelBroker<R: TunnelRuntime> {
     config: BrokerConfig,
     mutation_lock: AsyncMutex<()>,
     state: Mutex<BrokerState>,
+    active_connect_cancel: Mutex<Option<watch::Sender<bool>>>,
+    shutdown_tx: watch::Sender<bool>,
+    external_shutdown: Option<watch::Receiver<bool>>,
 }
 
 fn is_fresh_handshake(stamp: i64, now_unix: i64) -> bool {
@@ -287,18 +356,71 @@ fn build_active_info(spec: &ValidatedTunnelSpec, connected_at_unix: i64) -> Acti
 
 impl<R: TunnelRuntime> TunnelBroker<R> {
     pub fn new(runtime: Arc<R>, config: BrokerConfig) -> Self {
+        let (shutdown_tx, _) = watch::channel(false);
         Self {
             runtime,
             config,
             mutation_lock: AsyncMutex::new(()),
             state: Mutex::new(BrokerState::default()),
+            active_connect_cancel: Mutex::new(None),
+            shutdown_tx,
+            external_shutdown: None,
         }
+    }
+
+    pub fn with_shutdown(mut self, external_shutdown: watch::Receiver<bool>) -> Self {
+        self.external_shutdown = Some(external_shutdown);
+        self
+    }
+
+    fn cancel_in_flight_connect(&self) {
+        if let Ok(guard) = self.active_connect_cancel.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(true);
+            }
+        }
+    }
+
+    pub fn cancel_for_service_stop(&self) {
+        let _ = self.shutdown_tx.send(true);
+        self.cancel_in_flight_connect();
+    }
+
+    fn is_stopping(&self) -> bool {
+        *self.shutdown_tx.borrow()
+            || self
+                .external_shutdown
+                .as_ref()
+                .is_some_and(|rx| *rx.borrow())
+    }
+
+    fn register_connect_cancel(&self) -> (ConnectCancelToken, ActiveConnectGuard<'_>) {
+        let (tx, rx) = watch::channel(false);
+        {
+            let mut slot = self
+                .active_connect_cancel
+                .lock()
+                .expect("active connect cancel lock poisoned");
+            *slot = Some(tx);
+        }
+        let token = ConnectCancelToken {
+            cancel_rx: rx,
+            shutdown_rx: self.shutdown_tx.subscribe(),
+            external_shutdown_rx: self.external_shutdown.clone(),
+        };
+        (
+            token,
+            ActiveConnectGuard {
+                slot: &self.active_connect_cancel,
+            },
+        )
     }
 
     pub async fn handle_request(&self, req: ServiceRequest) -> ServiceResponse {
         match req {
             ServiceRequest::Connect(spec) => self.handle_connect(spec).await,
             ServiceRequest::Disconnect | ServiceRequest::ShutdownTunnelOnExit => {
+                self.cancel_in_flight_connect();
                 match self.teardown_locked().await {
                     Ok(()) => ServiceResponse::Ok,
                     Err(message) => ServiceResponse::Error {
@@ -314,31 +436,73 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
     pub async fn handle_session_change(&self, reason: SessionChangeReason) -> Result<(), String> {
         if should_teardown_on_session_change(reason) {
             info!("Windows session change ({reason:?}) detected; tearing down active tunnel");
+            self.cancel_in_flight_connect();
             self.teardown_locked().await?;
         }
         Ok(())
     }
 
     pub async fn shutdown_for_service_stop(&self) {
+        self.cancel_for_service_stop();
         if let Err(err) = self.teardown_locked().await {
             warn!("failed tearing down tunnel during service stop: {err}");
         }
     }
 
-    async fn wait_for_service_state(&self, expected_state: u32) -> Result<(), String> {
+    async fn wait_for_service_state(
+        &self,
+        expected_state: u32,
+        mut cancel: Option<&mut ConnectCancelToken>,
+    ) -> Result<(), ServiceWaitError> {
         let deadline = Instant::now() + self.config.service_wait_timeout;
         loop {
-            let state = self.runtime.service_state(&self.config.tunnel_name).await?;
+            if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+                return Err(ServiceWaitError::Cancelled);
+            }
+
+            let state = match cancel.as_deref_mut() {
+                Some(token) => {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return Err(ServiceWaitError::Cancelled),
+                        res = self.runtime.service_state(&self.config.tunnel_name) => {
+                            res.map_err(ServiceWaitError::Other)?
+                        }
+                    }
+                }
+                None => self
+                    .runtime
+                    .service_state(&self.config.tunnel_name)
+                    .await
+                    .map_err(ServiceWaitError::Other)?,
+            };
+
             if state == expected_state {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                return Err(
+                return Err(ServiceWaitError::Other(
                     "WireGuard Service chưa hoàn tất thay đổi trạng thái. Vui lòng thử lại."
                         .to_owned(),
-                );
+                ));
             }
-            tokio::time::sleep(self.config.service_poll_interval).await;
+
+            let sleep_dur = self
+                .config
+                .service_poll_interval
+                .min(deadline.saturating_duration_since(Instant::now()));
+            match cancel.as_deref_mut() {
+                Some(token) => {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return Err(ServiceWaitError::Cancelled),
+                        _ = tokio::time::sleep(sleep_dur) => {}
+                    }
+                }
+                None => {
+                    tokio::time::sleep(sleep_dur).await;
+                }
+            }
         }
     }
 
@@ -350,10 +514,43 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
             self.runtime
                 .uninstall_tunnel(&self.config.tunnel_name)
                 .await?;
-            self.wait_for_service_state(0).await?;
+            self.wait_for_service_state(0, None)
+                .await
+                .map_err(|err| match err {
+                    ServiceWaitError::Cancelled => "cancelled".to_owned(),
+                    ServiceWaitError::Other(msg) => msg,
+                })?;
         }
         // Keep the .conf file if service uninstall failed above; only remove after absent.
         self.runtime.remove_conf(&self.config.tunnel_name).await?;
+        Ok(())
+    }
+
+    async fn disconnect_while_locked_cancellable(
+        &self,
+        cancel: &mut ConnectCancelToken,
+    ) -> Result<(), ServiceWaitError> {
+        if cancel.is_cancelled() {
+            return Err(ServiceWaitError::Cancelled);
+        }
+        let state = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ServiceWaitError::Cancelled),
+            res = self.runtime.service_state(&self.config.tunnel_name) => {
+                res.map_err(ServiceWaitError::Other)?
+            }
+        };
+        if state != 0 {
+            self.runtime
+                .uninstall_tunnel(&self.config.tunnel_name)
+                .await
+                .map_err(ServiceWaitError::Other)?;
+            self.wait_for_service_state(0, Some(cancel)).await?;
+        }
+        self.runtime
+            .remove_conf(&self.config.tunnel_name)
+            .await
+            .map_err(ServiceWaitError::Other)?;
         Ok(())
     }
 
@@ -361,8 +558,7 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
         let _guard = self.mutation_lock.lock().await;
         self.disconnect_while_locked().await?;
         let mut st = self.state.lock().expect("broker state lock poisoned");
-        st.phase = BrokerPhase::Idle;
-        st.last_dns_verified_unix = None;
+        st.set_phase(BrokerPhase::Idle, None);
         Ok(())
     }
 
@@ -379,6 +575,15 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
         };
 
         let _guard = self.mutation_lock.lock().await;
+        if self.is_stopping() {
+            return ServiceResponse::Error {
+                code: "CONNECT_CANCELLED".to_owned(),
+                message: "Dịch vụ đang dừng; đã hủy yêu cầu kết nối.".to_owned(),
+            };
+        }
+
+        let (mut cancel_token, _cancel_guard) = self.register_connect_cancel();
+
         let prev_state = self
             .state
             .lock()
@@ -386,36 +591,61 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
             .clone();
         {
             let mut st = self.state.lock().expect("broker state lock poisoned");
-            st.phase = BrokerPhase::Connecting;
-            st.last_dns_verified_unix = None;
+            st.set_phase(BrokerPhase::Connecting, None);
         }
 
-        if let Err(err) = self.disconnect_while_locked().await {
-            *self.state.lock().expect("broker state lock poisoned") = prev_state;
-            return ServiceResponse::Error {
-                code: "DISCONNECT_FAILED".to_owned(),
-                message: err,
+        if let Err(err) = self
+            .disconnect_while_locked_cancellable(&mut cancel_token)
+            .await
+        {
+            return match err {
+                ServiceWaitError::Cancelled => {
+                    let cleanup_res = self.disconnect_while_locked().await;
+                    let mut st = self.state.lock().expect("broker state lock poisoned");
+                    st.set_phase(BrokerPhase::Idle, None);
+                    let msg = match cleanup_res {
+                        Ok(()) => "Kết nối WireGuard đã bị hủy.".to_owned(),
+                        Err(cleanup_err) => {
+                            format!(
+                                "Kết nối WireGuard đã bị hủy.\nKhông thể dọn tunnel: {cleanup_err}"
+                            )
+                        }
+                    };
+                    ServiceResponse::Error {
+                        code: "CONNECT_CANCELLED".to_owned(),
+                        message: msg,
+                    }
+                }
+                ServiceWaitError::Other(msg) => {
+                    let mut st = self.state.lock().expect("broker state lock poisoned");
+                    st.set_phase(prev_state.phase, prev_state.last_dns_verified_unix);
+                    ServiceResponse::Error {
+                        code: "DISCONNECT_FAILED".to_owned(),
+                        message: msg,
+                    }
+                }
             };
         }
 
         let info = build_active_info(&spec, self.runtime.now_unix());
         {
             let mut st = self.state.lock().expect("broker state lock poisoned");
-            st.phase = BrokerPhase::Verifying(info.clone());
+            st.set_phase(BrokerPhase::Verifying(info.clone()), None);
         }
 
-        match self.install_and_verify(&conf_content, &info).await {
+        match self
+            .install_and_verify(&conf_content, &info, &mut cancel_token)
+            .await
+        {
             Ok(()) => {
                 let mut st = self.state.lock().expect("broker state lock poisoned");
-                st.phase = BrokerPhase::Active(info);
-                st.last_dns_verified_unix = Some(self.runtime.now_unix());
+                st.set_phase(BrokerPhase::Active(info), Some(self.runtime.now_unix()));
                 ServiceResponse::Ok
             }
             Err((code, message)) => {
                 let cleanup_res = self.disconnect_while_locked().await;
                 let mut st = self.state.lock().expect("broker state lock poisoned");
-                st.phase = BrokerPhase::Idle;
-                st.last_dns_verified_unix = None;
+                st.set_phase(BrokerPhase::Idle, None);
 
                 let full_message = match cleanup_res {
                     Ok(()) => message,
@@ -435,38 +665,74 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
         &self,
         conf_content: &str,
         info: &ActiveTunnelInfo,
+        cancel: &mut ConnectCancelToken,
     ) -> Result<(), (&'static str, String)> {
+        if cancel.is_cancelled() {
+            return Err((
+                "CONNECT_CANCELLED",
+                "Kết nối WireGuard đã bị hủy.".to_owned(),
+            ));
+        }
+
         let conf_path = self
             .runtime
             .write_conf(&self.config.tunnel_name, conf_content)
             .await
             .map_err(|e| ("CONF_WRITE_FAILED", e))?;
 
+        if cancel.is_cancelled() {
+            return Err((
+                "CONNECT_CANCELLED",
+                "Kết nối WireGuard đã bị hủy.".to_owned(),
+            ));
+        }
+
         self.runtime
             .install_and_start_tunnel(&self.config.tunnel_name, &conf_path)
             .await
             .map_err(|e| ("INSTALL_FAILED", e))?;
 
-        self.wait_for_service_state(SERVICE_RUNNING_STATE)
+        self.wait_for_service_state(SERVICE_RUNNING_STATE, Some(cancel))
             .await
-            .map_err(|e| ("SERVICE_START_TIMEOUT", e))?;
+            .map_err(|err| match err {
+                ServiceWaitError::Cancelled => (
+                    "CONNECT_CANCELLED",
+                    "Kết nối WireGuard đã bị hủy.".to_owned(),
+                ),
+                ServiceWaitError::Other(e) => ("SERVICE_START_TIMEOUT", e),
+            })?;
 
-        self.wait_for_connection(info).await
+        self.wait_for_connection(info, cancel).await
     }
 
     async fn wait_for_connection(
         &self,
         info: &ActiveTunnelInfo,
+        cancel: &mut ConnectCancelToken,
     ) -> Result<(), (&'static str, String)> {
         let deadline = Instant::now() + self.config.connect_timeout;
         let mut handshaken = false;
 
         while Instant::now() < deadline {
-            let state = self
-                .runtime
-                .service_state(&self.config.tunnel_name)
-                .await
-                .map_err(|e| ("SCM_ERROR", e))?;
+            if cancel.is_cancelled() {
+                return Err((
+                    "CONNECT_CANCELLED",
+                    "Kết nối WireGuard đã bị hủy.".to_owned(),
+                ));
+            }
+
+            let state = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err((
+                        "CONNECT_CANCELLED",
+                        "Kết nối WireGuard đã bị hủy.".to_owned(),
+                    ));
+                }
+                res = self.runtime.service_state(&self.config.tunnel_name) => {
+                    res.map_err(|e| ("SCM_ERROR", e))?
+                }
+            };
             if state != SERVICE_RUNNING_STATE {
                 return Err((
                     "SERVICE_STOPPED",
@@ -474,12 +740,23 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
                 ));
             }
 
-            handshaken = match self.runtime.read_uapi_state(&self.config.tunnel_name).await {
-                Ok(uapi) => {
-                    let stamp = parse_uapi_latest_handshake(&uapi, &info.x25519_pubkey);
-                    is_fresh_handshake(stamp, self.runtime.now_unix())
+            handshaken = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err((
+                        "CONNECT_CANCELLED",
+                        "Kết nối WireGuard đã bị hủy.".to_owned(),
+                    ));
                 }
-                Err(_) => false,
+                uapi_res = self.runtime.read_uapi_state(&self.config.tunnel_name) => {
+                    match uapi_res {
+                        Ok(uapi) => {
+                            let stamp = parse_uapi_latest_handshake(&uapi, &info.x25519_pubkey);
+                            is_fresh_handshake(stamp, self.runtime.now_unix())
+                        }
+                        Err(_) => false,
+                    }
+                }
             };
 
             if handshaken {
@@ -488,11 +765,17 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
                     .config
                     .dns_probe_timeout
                     .min(remaining.max(Duration::from_millis(1)));
-                if self
-                    .runtime
-                    .check_dns_through_tunnel(&info.address, &info.dns, dns_budget)
-                    .await
-                {
+                let dns_ok = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        return Err((
+                            "CONNECT_CANCELLED",
+                            "Kết nối WireGuard đã bị hủy.".to_owned(),
+                        ));
+                    }
+                    ok = self.runtime.check_dns_through_tunnel(&info.address, &info.dns, dns_budget) => ok,
+                };
+                if dns_ok {
                     return Ok(());
                 }
             }
@@ -501,7 +784,16 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
             if remaining.is_zero() {
                 break;
             }
-            tokio::time::sleep(self.config.handshake_poll_interval.min(remaining)).await;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err((
+                        "CONNECT_CANCELLED",
+                        "Kết nối WireGuard đã bị hủy.".to_owned(),
+                    ));
+                }
+                _ = tokio::time::sleep(self.config.handshake_poll_interval.min(remaining)) => {}
+            }
         }
 
         if handshaken {
@@ -523,6 +815,7 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
             .lock()
             .expect("broker state lock poisoned")
             .clone();
+        let snapshot_generation = snapshot.generation;
         let (info, last_dns_verified_unix) = match snapshot.phase {
             BrokerPhase::Idle => return TunnelHealthState::Disconnected,
             BrokerPhase::Connecting => return TunnelHealthState::Connecting,
@@ -533,7 +826,7 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
         match self.runtime.service_state(&self.config.tunnel_name).await {
             Ok(state) if state == SERVICE_RUNNING_STATE => {}
             Ok(_) => {
-                self.clear_stale_active(info.connected_at_unix);
+                self.clear_stale_active(snapshot_generation);
                 return TunnelHealthState::Disconnected;
             }
             Err(err) => {
@@ -547,7 +840,7 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
         let uapi = match self.runtime.read_uapi_state(&self.config.tunnel_name).await {
             Ok(data) => data,
             Err(err) => {
-                self.invalidate_dns_cache(info.connected_at_unix);
+                self.invalidate_dns_cache(snapshot_generation);
                 return TunnelHealthState::Unverified {
                     info,
                     reason: format!("Không đọc được handshake WireGuard: {err}"),
@@ -558,7 +851,7 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
         let now = self.runtime.now_unix();
         let stamp = parse_uapi_latest_handshake(&uapi, &info.x25519_pubkey);
         if !is_fresh_handshake(stamp, now) {
-            self.invalidate_dns_cache(info.connected_at_unix);
+            self.invalidate_dns_cache(snapshot_generation);
             return TunnelHealthState::Unverified {
                 info,
                 reason: "Chưa có handshake WireGuard hợp lệ (hết hạn hoặc chưa bắt tay)."
@@ -575,39 +868,35 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
                 .check_dns_through_tunnel(&info.address, &info.dns, self.config.dns_probe_timeout)
                 .await
             {
-                self.invalidate_dns_cache(info.connected_at_unix);
+                self.invalidate_dns_cache(snapshot_generation);
                 return TunnelHealthState::Unverified {
                     info,
                     reason: "DNS qua VPN chưa phản hồi.".to_owned(),
                 };
             }
-            self.mark_dns_verified(info.connected_at_unix, self.runtime.now_unix());
+            self.mark_dns_verified(snapshot_generation, self.runtime.now_unix());
         }
 
         TunnelHealthState::Connected(info)
     }
 
-    fn clear_stale_active(&self, expected_connected_at: i64) {
+    fn clear_stale_active(&self, expected_generation: u64) {
         let mut st = self.state.lock().expect("broker state lock poisoned");
-        if matches!(&st.phase, BrokerPhase::Active(cur) if cur.connected_at_unix == expected_connected_at)
-        {
-            st.phase = BrokerPhase::Idle;
+        if st.generation == expected_generation && matches!(st.phase, BrokerPhase::Active(_)) {
+            st.set_phase(BrokerPhase::Idle, None);
+        }
+    }
+
+    fn invalidate_dns_cache(&self, expected_generation: u64) {
+        let mut st = self.state.lock().expect("broker state lock poisoned");
+        if st.generation == expected_generation && matches!(st.phase, BrokerPhase::Active(_)) {
             st.last_dns_verified_unix = None;
         }
     }
 
-    fn invalidate_dns_cache(&self, expected_connected_at: i64) {
+    fn mark_dns_verified(&self, expected_generation: u64, verified_at: i64) {
         let mut st = self.state.lock().expect("broker state lock poisoned");
-        if matches!(&st.phase, BrokerPhase::Active(cur) if cur.connected_at_unix == expected_connected_at)
-        {
-            st.last_dns_verified_unix = None;
-        }
-    }
-
-    fn mark_dns_verified(&self, expected_connected_at: i64, verified_at: i64) {
-        let mut st = self.state.lock().expect("broker state lock poisoned");
-        if matches!(&st.phase, BrokerPhase::Active(cur) if cur.connected_at_unix == expected_connected_at)
-        {
+        if st.generation == expected_generation && matches!(st.phase, BrokerPhase::Active(_)) {
             st.last_dns_verified_unix = Some(verified_at);
         }
     }
@@ -1101,6 +1390,7 @@ where
     }
 
     let _ = internal_stop_tx.send(true);
+    broker.cancel_for_service_stop();
     let _ = status_reporter.set_status(
         ServiceState::StopPending,
         ServiceControlAccept::empty(),
@@ -1169,7 +1459,9 @@ fn run_broker_service_inner() -> Result<(), String> {
         default_tunnels_dir(),
         service_exe,
     ));
-    let broker = Arc::new(TunnelBroker::new(runtime, BrokerConfig::default()));
+    let broker = Arc::new(
+        TunnelBroker::new(runtime, BrokerConfig::default()).with_shutdown(shutdown_rx.clone()),
+    );
     let pipe_factory = Arc::new(WindowsPipeFactory {
         pipe_name: SERVICE_PIPE_NAME.to_owned(),
         sddl: PIPE_SDDL_DACL.to_owned(),
@@ -2277,6 +2569,407 @@ mod tests {
             .await
             .expect("lifecycle join")
             .expect("clean service stop");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct BlockingRuntime {
+        now: AtomicI64,
+        tunnels_dir: PathBuf,
+        uapi_entered: Arc<tokio::sync::Notify>,
+        dns_entered: Arc<tokio::sync::Notify>,
+        dns_release: Arc<tokio::sync::Notify>,
+        block_uapi: std::sync::atomic::AtomicBool,
+        block_dns: std::sync::atomic::AtomicBool,
+        inner: Mutex<MockState>,
+    }
+
+    impl BlockingRuntime {
+        fn new(tunnels_dir: PathBuf, now_unix: i64) -> Self {
+            Self {
+                now: AtomicI64::new(now_unix),
+                tunnels_dir,
+                uapi_entered: Arc::new(tokio::sync::Notify::new()),
+                dns_entered: Arc::new(tokio::sync::Notify::new()),
+                dns_release: Arc::new(tokio::sync::Notify::new()),
+                block_uapi: std::sync::atomic::AtomicBool::new(false),
+                block_dns: std::sync::atomic::AtomicBool::new(false),
+                inner: Mutex::new(MockState {
+                    events: Vec::new(),
+                    service_states: VecDeque::new(),
+                    current_service_state: 0,
+                    uninstall_result: Ok(()),
+                    install_result: Ok(()),
+                    uapi_responses: VecDeque::new(),
+                    default_uapi: Ok("errno=0\n".to_owned()),
+                    dns_results: VecDeque::new(),
+                    default_dns: true,
+                    dns_calls: 0,
+                }),
+            }
+        }
+
+        fn conf_path(&self, tunnel_name: &str) -> PathBuf {
+            self.tunnels_dir.join(format!("{tunnel_name}.conf"))
+        }
+    }
+
+    impl TunnelRuntime for BlockingRuntime {
+        fn now_unix(&self) -> i64 {
+            self.now.load(Ordering::SeqCst)
+        }
+
+        fn service_state<'a>(&'a self, tunnel_name: &'a str) -> BoxFuture<'a, Result<u32, String>> {
+            Box::pin(async move {
+                let mut st = self.inner.lock().expect("lock");
+                let res = match st.service_states.pop_front() {
+                    Some(v) => {
+                        if let Ok(code) = v {
+                            st.current_service_state = code;
+                        }
+                        v
+                    }
+                    None => Ok(st.current_service_state),
+                };
+                if let Ok(code) = res {
+                    st.events.push(format!("state:{tunnel_name}:{code}"));
+                }
+                res
+            })
+        }
+
+        fn write_conf<'a>(
+            &'a self,
+            tunnel_name: &'a str,
+            conf_content: &'a str,
+        ) -> BoxFuture<'a, Result<PathBuf, String>> {
+            Box::pin(async move {
+                fs::create_dir_all(&self.tunnels_dir).map_err(|e| e.to_string())?;
+                let path = self.conf_path(tunnel_name);
+                fs::write(&path, conf_content).map_err(|e| e.to_string())?;
+                self.inner
+                    .lock()
+                    .expect("lock")
+                    .events
+                    .push(format!("write_conf:{tunnel_name}"));
+                Ok(path)
+            })
+        }
+
+        fn remove_conf<'a>(&'a self, tunnel_name: &'a str) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                let path = self.conf_path(tunnel_name);
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err.to_string()),
+                }
+                self.inner
+                    .lock()
+                    .expect("lock")
+                    .events
+                    .push(format!("remove_conf:{tunnel_name}"));
+                Ok(())
+            })
+        }
+
+        fn install_and_start_tunnel<'a>(
+            &'a self,
+            tunnel_name: &'a str,
+            _conf_path: &'a Path,
+        ) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                let mut st = self.inner.lock().expect("lock");
+                st.events.push(format!("install:{tunnel_name}"));
+                st.current_service_state = 4;
+                Ok(())
+            })
+        }
+
+        fn uninstall_tunnel<'a>(
+            &'a self,
+            tunnel_name: &'a str,
+        ) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                let mut st = self.inner.lock().expect("lock");
+                st.events.push(format!("uninstall:{tunnel_name}"));
+                st.current_service_state = 0;
+                Ok(())
+            })
+        }
+
+        fn read_uapi_state<'a>(
+            &'a self,
+            tunnel_name: &'a str,
+        ) -> BoxFuture<'a, Result<String, String>> {
+            Box::pin(async move {
+                if self.block_uapi.load(Ordering::SeqCst) {
+                    self.uapi_entered.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                let mut st = self.inner.lock().expect("lock");
+                st.events.push(format!("uapi:{tunnel_name}"));
+                Ok(st.default_uapi.clone().unwrap_or_default())
+            })
+        }
+
+        fn check_dns_through_tunnel<'a>(
+            &'a self,
+            _address: &'a str,
+            _dns: &'a str,
+            _timeout: Duration,
+        ) -> BoxFuture<'a, bool> {
+            Box::pin(async move {
+                if self.block_dns.load(Ordering::SeqCst) {
+                    let res = {
+                        let mut st = self.inner.lock().expect("lock");
+                        st.dns_calls += 1;
+                        st.dns_results.pop_front().unwrap_or(st.default_dns)
+                    };
+                    self.dns_entered.notify_one();
+                    self.dns_release.notified().await;
+                    return res;
+                }
+                let mut st = self.inner.lock().expect("lock");
+                st.dns_calls += 1;
+                st.dns_results.pop_front().unwrap_or(st.default_dns)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_shutdown_and_scm_cancel_abort_in_flight_connect_immediately() {
+        let dir = unique_temp_dir("cancel_connect");
+        let now = 1_700_000_500;
+        let runtime = Arc::new(BlockingRuntime::new(dir.clone(), now));
+        runtime.block_uapi.store(true, Ordering::SeqCst);
+
+        let long_cfg = BrokerConfig {
+            tunnel_name: DEFAULT_TUNNEL_NAME.to_owned(),
+            service_wait_timeout: Duration::from_secs(20),
+            service_poll_interval: Duration::from_millis(5),
+            connect_timeout: Duration::from_secs(30),
+            handshake_poll_interval: Duration::from_secs(5),
+            dns_probe_timeout: Duration::from_secs(5),
+            dns_recheck_interval: Duration::from_secs(30),
+        };
+        let broker = Arc::new(TunnelBroker::new(Arc::clone(&runtime), long_cfg));
+
+        // Case 1: Disconnect cancels in-flight Connect immediately and cleans up partial tunnel.
+        let b_conn = Arc::clone(&broker);
+        let connect_task = tokio::spawn(async move {
+            b_conn
+                .handle_request(ServiceRequest::Connect(sample_spec()))
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), runtime.uapi_entered.notified())
+            .await
+            .expect("connect entered wait_for_connection");
+
+        let disc_resp = tokio::time::timeout(
+            Duration::from_secs(1),
+            broker.handle_request(ServiceRequest::Disconnect),
+        )
+        .await
+        .expect("Disconnect must not wait 30s for in-flight Connect");
+        assert_eq!(disc_resp, ServiceResponse::Ok);
+
+        let conn_resp = tokio::time::timeout(Duration::from_secs(1), connect_task)
+            .await
+            .expect("Connect task finishes promptly")
+            .expect("join");
+        assert!(matches!(
+            conn_resp,
+            ServiceResponse::Error { ref code, .. } if code == "CONNECT_CANCELLED"
+        ));
+        assert!(!runtime.conf_path(DEFAULT_TUNNEL_NAME).exists());
+        assert_eq!(
+            broker.handle_request(ServiceRequest::Status).await,
+            ServiceResponse::Status(TunnelHealthState::Disconnected)
+        );
+
+        // Case 2: Subsequent normal Connect works cleanly (cancellation was per-connect).
+        runtime.block_uapi.store(false, Ordering::SeqCst);
+        {
+            let mut st = runtime.inner.lock().expect("lock");
+            st.default_uapi = Ok(uapi_with_handshake(&sample_key_hex(0xAB), now - 1));
+            st.default_dns = true;
+        }
+        assert_eq!(
+            broker
+                .handle_request(ServiceRequest::Connect(sample_spec()))
+                .await,
+            ServiceResponse::Ok
+        );
+        assert_eq!(
+            broker
+                .handle_request(ServiceRequest::ShutdownTunnelOnExit)
+                .await,
+            ServiceResponse::Ok
+        );
+
+        // Case 3: ShutdownTunnelOnExit cancels an in-flight Connect immediately.
+        runtime.block_uapi.store(true, Ordering::SeqCst);
+        let b_conn2 = Arc::clone(&broker);
+        let connect_task2 = tokio::spawn(async move {
+            b_conn2
+                .handle_request(ServiceRequest::Connect(sample_spec()))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), runtime.uapi_entered.notified())
+            .await
+            .expect("second connect entered wait_for_connection");
+        let exit_resp = tokio::time::timeout(
+            Duration::from_secs(1),
+            broker.handle_request(ServiceRequest::ShutdownTunnelOnExit),
+        )
+        .await
+        .expect("ShutdownTunnelOnExit must abort Connect immediately");
+        assert_eq!(exit_resp, ServiceResponse::Ok);
+        let conn_resp2 = tokio::time::timeout(Duration::from_secs(1), connect_task2)
+            .await
+            .expect("second Connect finishes")
+            .expect("join");
+        assert!(matches!(
+            conn_resp2,
+            ServiceResponse::Error { ref code, .. } if code == "CONNECT_CANCELLED"
+        ));
+
+        // Case 4: SCM Stop (via run_broker_lifecycle shutdown_tx) cancels in-flight Connect immediately.
+        let (_client_unused, server_unused) = tokio::io::duplex(1024);
+        let factory = Arc::new(MockPipeFactory::new(vec![Ok(MockPipeInstance::pending(
+            server_unused,
+        ))]));
+        let reporter = MockStatusReporter::new();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_session_tx, session_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let b_life = Arc::clone(&broker);
+        let life_task = tokio::spawn(async move {
+            run_broker_lifecycle(
+                &reporter,
+                factory,
+                b_life,
+                shutdown_rx,
+                session_rx,
+                PipeServerBackoff::default(),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let b_conn3 = Arc::clone(&broker);
+        let connect_task3 = tokio::spawn(async move {
+            b_conn3
+                .handle_request(ServiceRequest::Connect(sample_spec()))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), runtime.uapi_entered.notified())
+            .await
+            .expect("third connect entered wait_for_connection");
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(1), life_task)
+            .await
+            .expect("SCM Stop lifecycle must complete immediately")
+            .expect("join")
+            .expect("clean stop");
+        let conn_resp3 = tokio::time::timeout(Duration::from_secs(1), connect_task3)
+            .await
+            .expect("third Connect finishes")
+            .expect("join");
+        assert!(matches!(
+            conn_resp3,
+            ServiceResponse::Error { ref code, .. } if code == "CONNECT_CANCELLED"
+        ));
+        assert!(!runtime.conf_path(DEFAULT_TUNNEL_NAME).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_generation_prevents_same_second_stale_status_clobber() {
+        let dir = unique_temp_dir("generation_guard");
+        let same_second = 1_700_000_500;
+        let runtime = Arc::new(BlockingRuntime::new(dir.clone(), same_second));
+        {
+            let mut st = runtime.inner.lock().expect("lock");
+            st.default_uapi = Ok(uapi_with_handshake(&sample_key_hex(0xAB), same_second - 1));
+            st.default_dns = true;
+        }
+
+        let broker = Arc::new(TunnelBroker::new(
+            Arc::clone(&runtime),
+            BrokerConfig {
+                dns_recheck_interval: Duration::from_secs(30),
+                ..test_config()
+            },
+        ));
+
+        // 1. Connect session 1 at `same_second`.
+        assert_eq!(
+            broker
+                .handle_request(ServiceRequest::Connect(sample_spec()))
+                .await,
+            ServiceResponse::Ok
+        );
+        let gen1 = broker.state.lock().expect("lock").generation;
+
+        // Trigger a DNS recheck in handle_status for session 1 and pause inside check_dns_through_tunnel.
+        runtime.now.store(same_second + 40, Ordering::SeqCst);
+        {
+            let mut st = runtime.inner.lock().expect("lock");
+            st.default_uapi = Ok(uapi_with_handshake(&sample_key_hex(0xAB), same_second + 35));
+            st.dns_results = VecDeque::from([false]); // stale check will fail
+        }
+        runtime.block_dns.store(true, Ordering::SeqCst);
+        let b_status = Arc::clone(&broker);
+        let stale_status_task =
+            tokio::spawn(async move { b_status.handle_request(ServiceRequest::Status).await });
+        tokio::time::timeout(Duration::from_secs(2), runtime.dns_entered.notified())
+            .await
+            .expect("stale handle_status paused inside check_dns_through_tunnel");
+
+        // 2. While stale status check is paused, disconnect & reconnect session 2 at `same_second`!
+        runtime.block_dns.store(false, Ordering::SeqCst);
+        runtime.now.store(same_second, Ordering::SeqCst);
+        {
+            let mut st = runtime.inner.lock().expect("lock");
+            st.default_uapi = Ok(uapi_with_handshake(&sample_key_hex(0xAB), same_second - 1));
+            st.default_dns = true;
+        }
+        assert_eq!(
+            broker.handle_request(ServiceRequest::Disconnect).await,
+            ServiceResponse::Ok
+        );
+        assert_eq!(
+            broker
+                .handle_request(ServiceRequest::Connect(sample_spec()))
+                .await,
+            ServiceResponse::Ok
+        );
+        let gen2 = broker.state.lock().expect("lock").generation;
+        assert!(gen2 > gen1);
+
+        // 3. Release paused stale status from session 1 (returns DNS=false and calls invalidate_dns_cache(gen1)).
+        runtime.dns_release.notify_one();
+        let stale_resp = stale_status_task.await.expect("join stale status");
+        assert!(matches!(
+            stale_resp,
+            ServiceResponse::Status(TunnelHealthState::Unverified { .. })
+        ));
+
+        // 4. Direct calls with stale `gen1` must NOT clear or alter session 2's Active phase or DNS cache!
+        broker.clear_stale_active(gen1);
+        broker.invalidate_dns_cache(gen1);
+        broker.mark_dns_verified(gen1, same_second + 999);
+        {
+            let st = broker.state.lock().expect("lock");
+            assert_eq!(st.generation, gen2);
+            assert!(matches!(st.phase, BrokerPhase::Active(_)));
+            assert_eq!(st.last_dns_verified_unix, Some(same_second));
+        }
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

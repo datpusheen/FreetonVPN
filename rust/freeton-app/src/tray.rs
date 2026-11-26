@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
@@ -25,7 +26,24 @@ const MENU_ID_SETTINGS: &str = "settings";
 const MENU_ID_ABOUT: &str = "about";
 const MENU_ID_EXIT: &str = "exit";
 
-const TRAY_GUID: u128 = 0x46_72_65_65_74_6F_6E_56_50_4E_33_30_30_30_30_31;
+pub fn tray_guid_for_exe_path(path: &Path) -> u128 {
+    const FNV_OFFSET_BASIS_128: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const FNV_PRIME_128: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+
+    let raw = path.to_string_lossy();
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let normalized = stripped.replace('/', "\\").to_ascii_lowercase();
+
+    let mut hash = FNV_OFFSET_BASIS_128;
+    for &b in b"FreetonVPN-Tray:"
+        .iter()
+        .chain(normalized.as_bytes().iter())
+    {
+        hash ^= u128::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME_128);
+    }
+    (hash & 0xffff_ffff_ffff_0fff_3fff_ffff_ffff_ffff) | 0x0000_0000_0000_4000_8000_0000_0000_0000
+}
 
 pub struct TrayController {
     tray_icon: TrayIcon,
@@ -93,10 +111,13 @@ impl TrayController {
             }
         }));
 
+        let tray_guid = std::env::current_exe()
+            .map(|p| tray_guid_for_exe_path(&p))
+            .unwrap_or_else(|_| tray_guid_for_exe_path(Path::new("FreetonVPN.exe")));
         let icon = build_tray_icon(TrayVisualState::Idle)?;
         let tray_icon = TrayIconBuilder::new()
             .with_id("FreetonVPN")
-            .with_guid(TRAY_GUID)
+            .with_guid(tray_guid)
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
             .with_tooltip("Freeton VPN - by pishun")
@@ -238,5 +259,25 @@ mod tests {
             // Outline border uses fill color
             assert_eq!(pixel_at(&rgba, 6, 32), expected_fill);
         }
+    }
+
+    #[test]
+    fn test_tray_guid_for_exe_path_case_insensitive_and_distinct_per_install_dir() {
+        let installed_upper = Path::new(r"C:\Program Files\FreetonVPN\FreetonVPN.exe");
+        let installed_lower = Path::new(r"c:\program files\freetonvpn\freetonvpn.exe");
+        let installed_slashes = Path::new(r"\\?\C:/Program Files/FreetonVPN/FreetonVPN.exe");
+        let dev_build = Path::new(
+            r"C:\Users\dev\Documents\ChatGPT\proton-node-checker\rust\target\release\FreetonVPN.exe",
+        );
+
+        let guid_upper = tray_guid_for_exe_path(installed_upper);
+        let guid_lower = tray_guid_for_exe_path(installed_lower);
+        let guid_slashes = tray_guid_for_exe_path(installed_slashes);
+        let guid_dev = tray_guid_for_exe_path(dev_build);
+
+        assert_ne!(guid_upper, 0);
+        assert_eq!(guid_upper, guid_lower);
+        assert_eq!(guid_upper, guid_slashes);
+        assert_ne!(guid_upper, guid_dev);
     }
 }

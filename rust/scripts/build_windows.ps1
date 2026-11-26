@@ -89,7 +89,11 @@ function Resolve-AppVersion {
     }
 
     if ($Version) {
-        return $Version.Trim()
+        $requestedVersion = $Version.Trim()
+        if ($requestedVersion -ne $coreVersion) {
+            throw "Version mismatch: -Version ($requestedVersion) != freeton-core APP_VERSION ($coreVersion). Update rust/Cargo.toml and rust/freeton-core/src/lib.rs first."
+        }
+        return $requestedVersion
     }
     return $coreVersion
 }
@@ -300,17 +304,22 @@ function Build-InstallerAndManifest {
     if (Test-Path -LiteralPath $manifestPath) {
         try {
             $existing = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($existing.changelog -and $existing.changelog.Count -gt 0) {
-                $changelog = @($existing.changelog)
+            $changelogProp = $existing.PSObject.Properties['changelog']
+            if ($changelogProp -and $changelogProp.Value -and @($changelogProp.Value).Count -gt 0) {
+                $changelog = @($changelogProp.Value)
             }
-            if ($null -ne $existing.mandatory) {
-                $mandatory = [bool]$existing.mandatory
+            $mandatoryProp = $existing.PSObject.Properties['mandatory']
+            if ($mandatoryProp -and $null -ne $mandatoryProp.Value) {
+                $mandatory = [bool]$mandatoryProp.Value
             }
-            if ($existing.min_supported_version) {
-                $minSupported = [string]$existing.min_supported_version
+            $minSupportedProp = $existing.PSObject.Properties['min_supported_version']
+            if ($minSupportedProp -and $minSupportedProp.Value) {
+                $minSupported = [string]$minSupportedProp.Value
             }
-            if ($existing.version -eq $AppVersion -and $existing.title) {
-                $title = [string]$existing.title
+            $versionProp = $existing.PSObject.Properties['version']
+            $titleProp = $existing.PSObject.Properties['title']
+            if ($versionProp -and ([string]$versionProp.Value -eq $AppVersion) -and $titleProp -and $titleProp.Value) {
+                $title = [string]$titleProp.Value
             }
         } catch {
             Write-Host "Existing version-rust.json could not be parsed cleanly; regenerating defaults." -ForegroundColor Yellow

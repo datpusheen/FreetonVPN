@@ -88,13 +88,19 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
         };
         (C_SUCCESS, "ĐÃ KẾT NỐI", C_SUCCESS, sub, C_TEXT)
     } else if state.tunnel_running {
+        let reason = state
+            .tunnel_unverified_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Tunnel đang bật nhưng chưa xác minh handshake/DNS.");
         (
-                C_WARNING,
-                "VPN CHƯA XÁC MINH",
-                C_WARNING,
-                "Tunnel đang bật nhưng chưa xác minh handshake/DNS.\nBấm công tắc để ngắt hoặc thử máy chủ khác.".to_owned(),
-                C_WARNING,
-            )
+            C_WARNING,
+            "VPN CHƯA XÁC MINH",
+            C_WARNING,
+            format!("{reason}\nBấm công tắc để ngắt hoặc thử máy chủ khác."),
+            C_WARNING,
+        )
     } else {
         (
             C_BORDER,
@@ -426,4 +432,83 @@ pub fn ios_toggle_switch(
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::Rect;
+    use freeton_core::storage::{ClientConfig, StorageError};
+
+    struct NoopStore;
+    impl CredentialStore for NoopStore {
+        fn get_password(&self, _: &str, _: &str) -> Result<Option<String>, StorageError> {
+            Ok(None)
+        }
+        fn set_password(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        fn delete_password(&self, _: &str, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    fn collect_text(shapes: &[egui::epaint::ClippedShape]) -> String {
+        let mut out = String::new();
+        fn visit(shape: &egui::epaint::Shape, out: &mut String) {
+            match shape {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(items) => {
+                    for s in items {
+                        visit(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for clipped in shapes {
+            visit(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn test_home_renders_tunnel_unverified_reason() {
+        let ctx = egui::Context::default();
+        let store = NoopStore;
+        let mut state = AppState::new(
+            true,
+            Some("user@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            Vec::new(),
+        );
+        state.tunnel_running = true;
+        state.tunnel_verified = false;
+        state.tunnel_unverified_reason = Some("DNS qua VPN chưa phản hồi.".to_owned());
+
+        let raw_input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(crate::ui::WINDOW_WIDTH, crate::ui::WINDOW_HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw_input, |ui| {
+            render_home_view(ui, &mut state, &store);
+        });
+        out.textures_delta.clear();
+        let rendered = collect_text(&out.shapes);
+        assert!(
+            rendered.contains("VPN CHƯA XÁC MINH"),
+            "expected unverified heading in rendered home text: {rendered}"
+        );
+        assert!(
+            rendered.contains("DNS qua VPN chưa phản hồi."),
+            "expected tunnel_unverified_reason in rendered home text: {rendered}"
+        );
+    }
 }
