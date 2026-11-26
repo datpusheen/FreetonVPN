@@ -259,12 +259,26 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
         },
     );
 
-    // 3. Selected Server / Location Card
+    // 3. Selected Server / Location Card (smooth hover-in / hover-out border & fill highlight)
+    let anim_dur = if state.client_config.animations_enabled {
+        0.14
+    } else {
+        0.0
+    };
+    let card_hover_id = ui.scope_id().with("home_server_card_hover");
+    let prev_hovered = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(card_hover_id).unwrap_or(false));
+    let card_hover_t = ui
+        .ctx()
+        .animate_bool_with_time(card_hover_id, prev_hovered, anim_dur);
+    let card_fill = lerp_color(C_CARD, C_CARD_HIGH, card_hover_t * 0.35);
+    let card_border = lerp_color(C_BORDER, C_ACCENT, card_hover_t * 0.85);
     let card_pad_y = if compact { 8 } else { 10 };
     let server_card_resp = rounded_card(
         ui,
-        C_CARD,
-        C_BORDER,
+        card_fill,
+        card_border,
         14,
         Margin::symmetric(12, card_pad_y),
         |ui| {
@@ -352,6 +366,8 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
     .interact(Sense::click())
     .on_hover_cursor(CursorIcon::PointingHand);
 
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(card_hover_id, server_card_resp.hovered()));
     if server_card_resp.clicked() {
         state.show_drawer_view();
     }
@@ -450,6 +466,23 @@ pub fn ios_toggle_switch(
         } else {
             lerp_color(C_TOGGLE_OFF, C_TOGGLE_ON, t)
         };
+        if connecting && animations_enabled {
+            let phase = (ui.ctx().input(|i| i.time) as f32 * 2.4).fract();
+            let expand = phase * 6.0;
+            let halo_alpha = ((1.0 - phase) * 95.0).round().clamp(0.0, 255.0) as u8;
+            let halo_rect = rect.expand(expand);
+            p.rect_stroke(
+                halo_rect,
+                CornerRadius::same((radius + expand).round().min(255.0) as u8),
+                Stroke::new(
+                    2.0,
+                    Color32::from_rgba_unmultiplied(0xf5, 0x9e, 0x0b, halo_alpha),
+                ),
+                StrokeKind::Outside,
+            );
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(33));
+        }
         p.rect_filled(rect, CornerRadius::same(radius.round() as u8), track_color);
 
         let knob_r = radius - (rect.height() * 0.045).max(2.5);

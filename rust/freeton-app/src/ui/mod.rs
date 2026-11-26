@@ -286,13 +286,24 @@ pub fn open_external_url(url: &str) {
     }
 }
 
+fn render_view_contents(
+    view: AppView,
+    ui: &mut Ui,
+    state: &mut AppState,
+    store: &dyn CredentialStore,
+) {
+    match view {
+        AppView::Login => login::render_login_view(ui, state),
+        AppView::Srp => login::render_srp_view(ui, state),
+        AppView::Home => home::render_home_view(ui, state, store),
+        AppView::Drawer => drawer::render_drawer_view(ui, state),
+    }
+}
+
 pub fn render_root(ui: &mut Ui, state: &mut AppState, store: &dyn CredentialStore) {
     let ctx = ui.ctx().clone();
-    let anim_time = if state.client_config.animations_enabled {
-        0.14
-    } else {
-        0.0
-    };
+    let anim_on = state.client_config.animations_enabled;
+    let anim_time = if anim_on { 0.14 } else { 0.0 };
     ctx.style_mut_of(egui::Theme::Dark, |s| {
         s.animation_time = anim_time;
     });
@@ -308,56 +319,121 @@ pub fn render_root(ui: &mut Ui, state: &mut AppState, store: &dyn CredentialStor
         .show(ui, |ui| {
             render_top_bar(&ctx, ui, state);
 
+            // Loading bar with symmetric enter/exit animation.
+            let loading_t = ctx.animate_bool_with_time(
+                egui::Id::unique("freeton_loading_visible_t"),
+                state.loading.visible,
+                if anim_on { 0.16 } else { 0.0 },
+            );
+            let loading_text_id = egui::Id::unique("freeton_loading_cached_text");
             if state.loading.visible {
-                ui.add_space(4.0);
-                render_loading_bar(ui, state);
-                ui.add_space(6.0);
+                ctx.data_mut(|d| d.insert_temp(loading_text_id, state.loading.text.clone()));
+            }
+            let loading_text = if state.loading.visible {
+                Some(state.loading.text.clone())
+            } else if loading_t > 0.0 {
+                ctx.data(|d| d.get_temp::<String>(loading_text_id))
+            } else {
+                ctx.data_mut(|d| d.remove::<String>(loading_text_id));
+                None
+            };
+            if (state.loading.visible && loading_t < 1.0)
+                || (!state.loading.visible && loading_t > 0.0)
+            {
+                ctx.request_repaint();
+            }
+            if let Some(text) = loading_text {
+                ui.add_space(4.0 * loading_t);
+                ui.scope(|ui| {
+                    if !state.loading.visible {
+                        ui.disable();
+                    }
+                    ui.set_opacity(loading_t);
+                    render_loading_bar(ui, &ctx, state, &text, anim_on);
+                });
+                ui.add_space(6.0 * loading_t);
             } else {
                 ui.add_space(4.0);
             }
 
-            if let Some(toast) = state.info_toast.clone() {
+            // Info toast with symmetric slide + fade enter/exit animation.
+            let toast_t = ctx.animate_bool_with_time(
+                egui::Id::unique("freeton_info_toast_t"),
+                state.info_toast.is_some(),
+                if anim_on { 0.18 } else { 0.0 },
+            );
+            let toast_cache_id = egui::Id::unique("freeton_info_toast_cache");
+            if let Some(toast) = &state.info_toast {
+                ctx.data_mut(|d| d.insert_temp(toast_cache_id, toast.clone()));
+            }
+            let rendered_toast = if let Some(toast) = state.info_toast.clone() {
+                Some((toast, true))
+            } else if toast_t > 0.0 {
+                ctx.data(|d| d.get_temp::<crate::state::StatusNotice>(toast_cache_id))
+                    .map(|t| (t, false))
+            } else {
+                ctx.data_mut(|d| d.remove::<crate::state::StatusNotice>(toast_cache_id));
+                None
+            };
+            if (state.info_toast.is_some() && toast_t < 1.0)
+                || (state.info_toast.is_none() && toast_t > 0.0)
+            {
+                ctx.request_repaint();
+            }
+            if let Some((toast, interactive)) = rendered_toast {
+                let eased_toast = 1.0 - (1.0 - toast_t).powi(3);
                 let color = match toast.level {
                     NoticeLevel::Success => C_SUCCESS,
                     NoticeLevel::Warning => C_WARNING,
                     NoticeLevel::Error => C_DANGER,
                     NoticeLevel::Info => C_ACCENT,
                 };
-                rounded_card(ui, C_SURFACE, color, 8, Margin::symmetric(8, 5), |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        let close_w = 18.0;
-                        let text_w = (ui.available_width() - close_w - 6.0).max(80.0);
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(text_w, 0.0),
-                            Layout::top_down(Align::Min),
-                            |ui| {
-                                ui.set_width(text_w);
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&toast.text).size(11.0).color(color),
+                let toast_slide_y = -6.0 * (1.0 - eased_toast);
+                let row_rect = ui.available_rect_before_wrap();
+                let shifted_rect = row_rect.translate(Vec2::new(0.0, toast_slide_y));
+                let resp = ui.scope_builder(egui::UiBuilder::new().max_rect(shifted_rect), |ui| {
+                    ui.set_clip_rect(row_rect);
+                    if !interactive {
+                        ui.disable();
+                    }
+                    ui.set_opacity(eased_toast);
+                    rounded_card(ui, C_SURFACE, color, 8, Margin::symmetric(8, 5), |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let close_w = 18.0;
+                            let text_w = (ui.available_width() - close_w - 6.0).max(80.0);
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(text_w, 0.0),
+                                Layout::top_down(Align::Min),
+                                |ui| {
+                                    ui.set_width(text_w);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&toast.text).size(11.0).color(color),
+                                        )
+                                        .wrap(),
+                                    );
+                                },
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("✕").size(10.0).color(C_TEXT_DIM),
+                                        )
+                                        .frame(false),
                                     )
-                                    .wrap(),
-                                );
-                            },
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("✕").size(10.0).color(C_TEXT_DIM),
-                                    )
-                                    .frame(false),
-                                )
-                                .clicked()
-                            {
-                                state.info_toast = None;
-                            }
+                                    .clicked()
+                                {
+                                    state.info_toast = None;
+                                }
+                            });
                         });
                     });
                 });
-                ui.add_space(4.0);
+                let _ = resp;
+                ui.add_space(4.0 * eased_toast);
             }
 
             let now = std::time::Instant::now();
@@ -365,32 +441,43 @@ pub fn render_root(ui: &mut Ui, state: &mut AppState, store: &dyn CredentialStor
             if progress < 1.0 {
                 ctx.request_repaint();
             }
-            let slide_px = if progress < 1.0 {
-                let base = match state.view_transition_dir {
-                    ViewDirection::Forward => 28.0,
-                    ViewDirection::Backward => -28.0,
-                };
-                base * (1.0 - progress)
+
+            let dir_sign = match state.view_transition_dir {
+                ViewDirection::Forward => 1.0,
+                ViewDirection::Backward => -1.0,
+            };
+            let avail = ui.available_rect_before_wrap();
+
+            // Render exiting view underneath (symmetric slide-out + fade-out) during active view transitions.
+            if progress < 1.0 {
+                if let Some(prev_view) = state.previous_view.filter(|&p| p != state.current_view) {
+                    let exit_px = -34.0 * dir_sign * progress;
+                    let exit_rect = avail.translate(Vec2::new(exit_px, 0.0));
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(exit_rect), |ui| {
+                        ui.set_clip_rect(avail);
+                        ui.disable();
+                        ui.set_opacity((1.0 - progress).powf(1.2));
+                        render_view_contents(prev_view, ui, state, store);
+                    });
+                }
+            }
+
+            let enter_px = if progress < 1.0 {
+                34.0 * dir_sign * (1.0 - progress)
             } else {
                 0.0
             };
-
-            let avail = ui.available_rect_before_wrap();
-            let shifted = avail.translate(Vec2::new(slide_px, 0.0));
+            let shifted = avail.translate(Vec2::new(enter_px, 0.0));
             ui.scope_builder(egui::UiBuilder::new().max_rect(shifted), |ui| {
                 ui.set_clip_rect(avail);
-                match state.current_view {
-                    AppView::Login => login::render_login_view(ui, state),
-                    AppView::Srp => login::render_srp_view(ui, state),
-                    AppView::Home => home::render_home_view(ui, state, store),
-                    AppView::Drawer => drawer::render_drawer_view(ui, state),
+                if progress < 1.0 {
+                    ui.set_opacity(progress.clamp(0.0, 1.0));
                 }
+                render_view_contents(state.current_view, ui, state, store);
             });
         });
 
-    if state.active_dialog != ActiveDialog::None {
-        dialogs::render_dialog_overlay(&ctx, state, store);
-    }
+    dialogs::render_dialog_overlay(&ctx, state, store);
 }
 
 fn render_top_bar(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
@@ -490,11 +577,17 @@ fn render_top_bar(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
     });
 }
 
-fn render_loading_bar(ui: &mut Ui, state: &AppState) {
+fn render_loading_bar(
+    ui: &mut Ui,
+    ctx: &egui::Context,
+    state: &AppState,
+    label_text: &str,
+    animations_enabled: bool,
+) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 3.0;
         ui.label(
-            RichText::new(&state.loading.text)
+            RichText::new(label_text)
                 .size(10.5)
                 .strong()
                 .color(C_ACCENT),
@@ -504,11 +597,37 @@ fn render_loading_bar(ui: &mut Ui, state: &AppState) {
         let p = ui.painter();
         let cr = CornerRadius::same(2);
         p.rect_filled(rect, cr, C_CARD);
-        let frac = state.loading.progress.clamp(0.0, 1.0);
-        if frac > 0.0 {
-            let fill_w = (rect.width() * frac).max(4.0);
+        let target_frac = state.loading.progress.clamp(0.0, 1.0);
+        let anim_frac = ctx.animate_value_with_time(
+            egui::Id::unique("freeton_loading_frac"),
+            target_frac,
+            if animations_enabled { 0.22 } else { 0.0 },
+        );
+        if (anim_frac - target_frac).abs() > 0.005 {
+            ctx.request_repaint();
+        }
+        if anim_frac > 0.0 {
+            let fill_w = (rect.width() * anim_frac).max(4.0);
             let fill_rect = Rect::from_min_size(rect.min, Vec2::new(fill_w, rect.height()));
             p.rect_filled(fill_rect, cr, C_ACCENT);
+
+            // Subtle traveling shimmer highlight while visible.
+            if animations_enabled && state.loading.visible && fill_w > 18.0 {
+                let time = ctx.input(|i| i.time) as f32;
+                let cycle = (time * 1.15).fract();
+                let shimmer_w = (fill_w * 0.28).clamp(12.0, 48.0);
+                let x = fill_rect.left() - shimmer_w + (fill_w + shimmer_w) * cycle;
+                let clipped_min_x = x.max(fill_rect.left());
+                let clipped_max_x = (x + shimmer_w).min(fill_rect.right());
+                if clipped_max_x > clipped_min_x {
+                    let shimmer_rect = Rect::from_min_max(
+                        Pos2::new(clipped_min_x, fill_rect.top()),
+                        Pos2::new(clipped_max_x, fill_rect.bottom()),
+                    );
+                    p.rect_filled(shimmer_rect, cr, Color32::from_white_alpha(64));
+                }
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            }
         }
     });
 }
@@ -536,5 +655,133 @@ mod tests {
             resolve_windows_fonts_dir(None, None),
             PathBuf::from(r"C:\Windows\Fonts")
         );
+    }
+
+    #[test]
+    fn test_symmetric_enter_and_exit_animations_for_views_dialogs_and_toast() {
+        use crate::state::{ActiveDialog, AppState, NoticeLevel, StatusNotice};
+        use freeton_core::storage::{ClientConfig, CredentialStore, StorageError};
+
+        struct NoopStore;
+        impl CredentialStore for NoopStore {
+            fn get_password(&self, _: &str, _: &str) -> Result<Option<String>, StorageError> {
+                Ok(None)
+            }
+            fn set_password(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+            fn delete_password(&self, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+        }
+
+        fn collect_all_text(shapes: &[egui::epaint::ClippedShape]) -> String {
+            let mut out = String::new();
+            fn visit(shape: &egui::epaint::Shape, out: &mut String) {
+                match shape {
+                    egui::epaint::Shape::Text(t) => {
+                        out.push_str(t.galley.text());
+                        out.push('\n');
+                    }
+                    egui::epaint::Shape::Vec(items) => {
+                        for s in items {
+                            visit(s, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for c in shapes {
+                visit(&c.shape, &mut out);
+            }
+            out
+        }
+
+        let ctx = egui::Context::default();
+        let store = NoopStore;
+        let mut state = AppState::new(
+            true,
+            Some("user@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            Vec::new(),
+        );
+        state.window_visible = true;
+
+        let make_input = |time: f64| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(super::WINDOW_WIDTH, super::WINDOW_HEIGHT),
+            )),
+            time: Some(time),
+            ..Default::default()
+        };
+
+        // 1. Seed closed dialog/toast state at t=0.0, then open About + Toast, then close and verify
+        // exit animation keeps rendering smoothly during fade-out and unmounts after completion.
+        let mut out = ctx.run_ui(make_input(0.0), |ui| {
+            super::render_root(ui, &mut state, &store);
+        });
+        out.textures_delta.clear();
+
+        state.open_about_dialog();
+        state.info_toast = Some(StatusNotice {
+            text: "Thông báo thử nghiệm animation".to_owned(),
+            level: NoticeLevel::Info,
+        });
+        state.show_drawer_view();
+
+        let mut start_enter = ctx.run_ui(make_input(0.05), |ui| {
+            super::render_root(ui, &mut state, &store);
+        });
+        start_enter.textures_delta.clear();
+        let mut mid = ctx.run_ui(make_input(0.12), |ui| {
+            super::render_root(ui, &mut state, &store);
+        });
+        mid.textures_delta.clear();
+        let mid_text = collect_all_text(&mid.shapes);
+        assert!(
+            mid_text.contains("KẾT NỐI CỦA BẠN") && mid_text.contains("Danh Sách Máy Chủ"),
+            "view transition must render both exiting Home and entering Drawer: {mid_text}"
+        );
+        assert!(mid_text.contains("TUYÊN BỐ PHÁP LÝ"));
+        assert!(mid_text.contains("Thông báo thử nghiệm animation"));
+
+        // Ensure enter animation reaches 1.0 by t=0.50.
+        let mut settled = ctx.run_ui(make_input(0.50), |ui| {
+            super::render_root(ui, &mut state, &store);
+        });
+        settled.textures_delta.clear();
+
+        // Close dialog & toast: during exit window (t=0.55 -> t=0.62) both fade/slide out smoothly; by t=1.00 both are gone.
+        state.close_dialog();
+        state.info_toast = None;
+        assert_eq!(state.active_dialog, ActiveDialog::None);
+
+        let mut start_exit = ctx.run_ui(make_input(0.55), |ui| {
+            super::render_root(ui, &mut state, &store);
+        });
+        start_exit.textures_delta.clear();
+        let mut exiting = ctx.run_ui(make_input(0.62), |ui| {
+            super::render_root(ui, &mut state, &store);
+        });
+        exiting.textures_delta.clear();
+        let exiting_text = collect_all_text(&exiting.shapes);
+        assert!(
+            exiting_text.contains("TUYÊN BỐ PHÁP LÝ"),
+            "dialog exit animation must fade out About dialog instead of vanishing at 0ms: {exiting_text}"
+        );
+        assert!(
+            exiting_text.contains("Thông báo thử nghiệm animation"),
+            "toast exit animation must fade out toast instead of vanishing at 0ms: {exiting_text}"
+        );
+
+        let mut finished = ctx.run_ui(make_input(1.00), |ui| {
+            super::render_root(ui, &mut state, &store);
+        });
+        finished.textures_delta.clear();
+        let finished_text = collect_all_text(&finished.shapes);
+        assert!(!finished_text.contains("TUYÊN BỐ PHÁP LÝ"));
+        assert!(!finished_text.contains("Thông báo thử nghiệm animation"));
     }
 }

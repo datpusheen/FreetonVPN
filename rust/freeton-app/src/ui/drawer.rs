@@ -7,8 +7,8 @@ use freeton_core::ping::{get_country_display, SortMode};
 
 use crate::state::AppState;
 use crate::ui::{
-    pill_button, rounded_card, PillStyle, C_ACCENT, C_ACCENT_HOVER, C_BORDER, C_CARD, C_CARD_HIGH,
-    C_SUCCESS, C_SUCCESS_BG, C_TEXT, C_TEXT_DIM, C_TEXT_MUTED,
+    lerp_color, pill_button, rounded_card, PillStyle, C_ACCENT, C_ACCENT_HOVER, C_BORDER, C_CARD,
+    C_CARD_HIGH, C_SUCCESS, C_SUCCESS_BG, C_TEXT, C_TEXT_DIM, C_TEXT_MUTED,
 };
 
 const QUICK_PILLS: &[(&str, Option<&str>)] = &[
@@ -344,17 +344,28 @@ fn render_server_row(
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
     let response = response.on_hover_cursor(CursorIcon::PointingHand);
 
-    let bg = if is_connected {
+    let hover_dur = ui.style().animation_time;
+    let hover_t = ui.ctx().animate_bool_with_time(
+        response.id.with("row_hover"),
+        response.hovered(),
+        hover_dur,
+    );
+    let base_bg = if is_connected {
         C_SUCCESS_BG
     } else if is_selected {
         C_CARD_HIGH
     } else {
         C_CARD
     };
-    let border = if response.hovered() || is_selected || is_connected || is_best {
+    let bg = if is_connected || is_selected {
+        base_bg
+    } else {
+        lerp_color(base_bg, C_CARD_HIGH, hover_t * 0.55)
+    };
+    let border = if is_selected || is_connected || is_best {
         C_ACCENT
     } else {
-        C_BORDER
+        lerp_color(C_BORDER, C_ACCENT, hover_t)
     };
 
     let mut export_clicked = false;
