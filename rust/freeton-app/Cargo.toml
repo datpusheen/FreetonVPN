@@ -3,22 +3,40 @@ name = "freeton-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "FreetonVPN"
+path = "src/main.rs"
 
 [dependencies]
+eframe = "0.37"
+egui = "0.37"
 freeton-core = { path = "../freeton-core" }
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+raw-window-handle = "0.6"
+rfd = { version = "0.18", default-features = false }
 serde_json = "1.0"
 thiserror = "2.0"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
+tracing-subscriber = "0.3"
+tray-icon = { version = "0.27", default-features = false }
 url = "2.5"
 webview2-com = "0.39.1"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+winresource = "0.1.34"

@@ -138,7 +138,6 @@ static WINDOW_CLASS_REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
 
 /// Errors returned while validating or running the transient WebView2 CAPTCHA modal.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[allow(dead_code)]
 pub enum CaptchaError {
     #[error("URL xác minh người dùng (CAPTCHA) không hợp lệ: {0}")]
     InvalidUrl(String),
@@ -185,14 +184,12 @@ fn parse_allowed_captcha_url(raw_url: &str) -> Result<Url, CaptchaError> {
 }
 
 /// Returns `true` when `raw_url` uses HTTPS on an allowlisted Proton verification host.
-#[allow(dead_code)]
 pub fn is_allowed_captcha_url(raw_url: &str) -> bool {
     parse_allowed_captcha_url(raw_url).is_ok()
 }
 
 /// Validates a Proton CAPTCHA URL and normalizes `ForceWebMessaging=1` while preserving existing
 /// query parameters and fragments.
-#[allow(dead_code)]
 pub fn validate_captcha_url(raw_url: &str) -> Result<String, CaptchaError> {
     let mut url = parse_allowed_captcha_url(raw_url)?;
     let preserved_pairs: Vec<(String, String)> = url
@@ -266,12 +263,10 @@ fn extract_token_inner(raw: &str, depth: u8) -> Option<String> {
 /// Extracts a Proton human verification token from either a raw string or JSON `postMessage`
 /// payload (`Token`, `token`, `verificationToken`, `HumanVerificationToken`,
 /// `humanVerificationToken`), ignoring short strings, control characters, and `http(s)://` URLs.
-#[allow(dead_code)]
 pub fn extract_token_from_post_message(raw: &str) -> Option<String> {
     extract_token_inner(raw, 0)
 }
 
-#[allow(dead_code)]
 fn default_captcha_user_data_base() -> PathBuf {
     let root = std::env::var_os("LOCALAPPDATA")
         .filter(|val| !val.is_empty())
@@ -281,7 +276,6 @@ fn default_captcha_user_data_base() -> PathBuf {
 }
 
 /// Builds a unique per-run WebView2 user data directory path under `base_dir`.
-#[allow(dead_code)]
 pub fn build_per_run_user_data_dir(base_dir: &Path) -> PathBuf {
     let pid = std::process::id();
     let seq = RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -292,7 +286,6 @@ pub fn build_per_run_user_data_dir(base_dir: &Path) -> PathBuf {
     base_dir.join(format!("run-{pid}-{nanos}-{seq}"))
 }
 
-#[allow(dead_code)]
 fn cleanup_stale_user_data_dirs(base_dir: &Path) {
     let Ok(entries) = fs::read_dir(base_dir) else {
         return;
@@ -309,7 +302,6 @@ fn cleanup_stale_user_data_dirs(base_dir: &Path) {
     }
 }
 
-#[allow(dead_code)]
 fn cleanup_run_user_data_dir(run_dir: &Path) {
     if !run_dir.exists() {
         return;
@@ -333,7 +325,6 @@ fn cleanup_run_user_data_dir(run_dir: &Path) {
 /// Opens a transient, isolated Edge WebView2 modal window for Proton human verification and
 /// blocks until a verification token is captured, the window is closed (`Cancelled`), or
 /// `timeout` expires (`Timeout`).
-#[allow(dead_code)]
 pub fn solve_captcha_blocking(url: &str, timeout: Duration) -> Result<String, CaptchaError> {
     let validated_url = validate_captcha_url(url)?;
     if timeout.is_zero() {
@@ -351,7 +342,6 @@ pub fn solve_captcha_blocking(url: &str, timeout: Duration) -> Result<String, Ca
 }
 
 /// Convenience wrapper for [`solve_captcha_blocking`] consuming [`HumanVerificationChallenge`].
-#[allow(dead_code)]
 pub fn solve_challenge_blocking(
     challenge: &HumanVerificationChallenge,
     timeout: Duration,
@@ -359,10 +349,8 @@ pub fn solve_challenge_blocking(
     solve_captcha_blocking(&challenge.url, timeout)
 }
 
-#[allow(dead_code)]
 struct ComApartmentGuard;
 
-#[allow(dead_code)]
 impl ComApartmentGuard {
     fn enter() -> Result<Self, CaptchaError> {
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -379,7 +367,6 @@ impl Drop for ComApartmentGuard {
     }
 }
 
-#[allow(dead_code)]
 struct ModalState {
     deadline: Option<Instant>,
     bg_brush: HBRUSH,
@@ -401,7 +388,6 @@ impl Drop for ModalState {
     }
 }
 
-#[allow(dead_code)]
 fn run_captcha_sta_thread(url: &str, timeout: Duration) -> Result<String, CaptchaError> {
     let _com = ComApartmentGuard::enter()?;
 
@@ -427,7 +413,6 @@ fn run_captcha_sta_thread(url: &str, timeout: Duration) -> Result<String, Captch
     result
 }
 
-#[allow(dead_code)]
 fn register_captcha_window_class(hinstance: HINSTANCE) -> Result<(), CaptchaError> {
     let res = WINDOW_CLASS_REGISTERED.get_or_init(|| {
         let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default();
@@ -452,7 +437,6 @@ fn register_captcha_window_class(hinstance: HINSTANCE) -> Result<(), CaptchaErro
     res.clone().map_err(CaptchaError::WebView)
 }
 
-#[allow(dead_code)]
 fn apply_dark_titlebar(hwnd: HWND) {
     let use_dark: BOOL = TRUE;
     let size = std::mem::size_of::<BOOL>() as u32;
@@ -476,7 +460,6 @@ fn apply_dark_titlebar(hwnd: HWND) {
     }
 }
 
-#[allow(dead_code)]
 fn compute_centered_window_rect(
     style: windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE,
     ex_style: WINDOW_EX_STYLE,
@@ -531,7 +514,6 @@ fn compute_centered_window_rect(
     }
 }
 
-#[allow(dead_code)]
 fn run_modal_on_sta(
     url: &str,
     user_data_dir: &Path,
@@ -633,7 +615,6 @@ fn run_modal_on_sta(
     outcome
 }
 
-#[allow(dead_code)]
 fn map_webview_init_error(err: &windows::core::Error) -> CaptchaError {
     if err.code().0 == HRESULT_ERROR_FILE_NOT_FOUND {
         CaptchaError::WebView(
@@ -645,7 +626,6 @@ fn map_webview_init_error(err: &windows::core::Error) -> CaptchaError {
     }
 }
 
-#[allow(dead_code)]
 fn finish_modal_with_result(
     state: &Rc<RefCell<ModalState>>,
     hwnd: HWND,
@@ -671,7 +651,6 @@ fn finish_modal_with_result(
     }
 }
 
-#[allow(dead_code)]
 fn start_webview2_session(
     hwnd: HWND,
     state: &Rc<RefCell<ModalState>>,
@@ -798,7 +777,6 @@ fn start_webview2_session(
     .map_err(|err| map_webview_init_error(&err))
 }
 
-#[allow(dead_code)]
 fn configure_and_navigate_webview(
     hwnd: HWND,
     state: &Rc<RefCell<ModalState>>,
@@ -970,7 +948,6 @@ fn configure_and_navigate_webview(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn clone_state_from_hwnd(hwnd: HWND) -> Option<Rc<RefCell<ModalState>>> {
     let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
     if raw == 0 {
@@ -981,7 +958,6 @@ fn clone_state_from_hwnd(hwnd: HWND) -> Option<Rc<RefCell<ModalState>>> {
     Some(unsafe { Rc::from_raw(ptr) })
 }
 
-#[allow(dead_code)]
 extern "system" fn captcha_wndproc(
     hwnd: HWND,
     msg: u32,
