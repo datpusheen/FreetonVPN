@@ -1,10 +1,10 @@
 use std::future::Future;
 use std::io;
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use freeton_core::api::{
@@ -13,11 +13,13 @@ use freeton_core::api::{
 };
 use freeton_core::ping::{ping_servers, score_server, sort_and_filter_servers, SortMode};
 use freeton_core::storage::{
-    ClientConfig, CredentialStore, ServerCacheManager, StorageError, StoredAuthSession,
-    WindowsCredentialStore, DEFAULT_WG_ADDRESS, DEFAULT_WG_DNS, DEFAULT_WG_PORT,
+    ClientConfig, CredentialStore, ServerCacheManager, StartupManager, StorageError,
+    StoredAuthSession, WindowsCredentialStore, DEFAULT_WG_ADDRESS, DEFAULT_WG_DNS, DEFAULT_WG_PORT,
     KEYRING_ACCOUNT_WG_CONFIG, KEYRING_SERVICE_WG,
 };
-use freeton_core::updater::{fetch_update_info, is_newer_version, UpdateInfo};
+use freeton_core::updater::{
+    download_and_verify_update, fetch_update_info, is_newer_version, UpdateAction, UpdateInfo,
+};
 use freeton_core::wg::{
     validate_and_build_conf, ActiveTunnelInfo, ServiceRequest, ServiceResponse, TunnelHealthState,
     DEFAULT_TUNNEL_NAME, SERVICE_PIPE_NAME,
@@ -25,10 +27,20 @@ use freeton_core::wg::{
 use freeton_core::{APP_NAME, APP_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::NamedPipeClient;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
+use windows::core::{w, PCWSTR};
+use windows::Win32::System::Com::{
+    CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+};
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::captcha::{solve_challenge_blocking, CaptchaError};
+use crate::ui::dialogs::{
+    parse_wireguard_conf, sibling_service_exe_path, validate_https_browser_url, MiddleHoldTracker,
+    ParsedWireGuardConf,
+};
 
 pub const CAPTCHA_TIMEOUT_SECS: u64 = 300;
 pub const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(3500);
@@ -329,6 +341,245 @@ impl PipeTransport for WindowsPipeTransport {
     }
 }
 
+pub trait ShellLauncher: Send + Sync {
+    fn launch_elevated(
+        &self,
+        target: &Path,
+        args: &str,
+        working_dir: Option<&Path>,
+    ) -> Result<(), String>;
+    fn open_https_url(&self, url: &str) -> Result<(), String>;
+}
+
+struct ComStaGuard(bool);
+
+impl ComStaGuard {
+    fn enter() -> Self {
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+        Self(hr.is_ok())
+    }
+}
+
+impl Drop for ComStaGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+pub struct WindowsShellLauncher;
+
+impl WindowsShellLauncher {
+    pub fn open_https_url_direct(url: &str) -> Result<(), String> {
+        let safe_url = validate_https_browser_url(url)?;
+        let _com = ComStaGuard::enter();
+        let url_w: Vec<u16> = safe_url.encode_utf16().chain(Some(0)).collect();
+        let hinst = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(url_w.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        let code = hinst.0 as isize;
+        if code > 32 {
+            Ok(())
+        } else {
+            let err = io::Error::last_os_error();
+            Err(format!(
+                "Không thể mở trình duyệt (mã ShellExecuteW={code}: {err})."
+            ))
+        }
+    }
+}
+
+impl ShellLauncher for WindowsShellLauncher {
+    fn launch_elevated(
+        &self,
+        target: &Path,
+        args: &str,
+        working_dir: Option<&Path>,
+    ) -> Result<(), String> {
+        let _com = ComStaGuard::enter();
+        let target_str = target.to_string_lossy();
+        let target_w: Vec<u16> = target_str.encode_utf16().chain(Some(0)).collect();
+        let args_w: Vec<u16> = args.encode_utf16().chain(Some(0)).collect();
+        let args_ptr = if args.trim().is_empty() {
+            PCWSTR::null()
+        } else {
+            PCWSTR(args_w.as_ptr())
+        };
+        let dir_w: Option<Vec<u16>> =
+            working_dir.map(|d| d.to_string_lossy().encode_utf16().chain(Some(0)).collect());
+        let dir_ptr = dir_w
+            .as_ref()
+            .map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr()));
+
+        let hinst = unsafe {
+            ShellExecuteW(
+                None,
+                w!("runas"),
+                PCWSTR(target_w.as_ptr()),
+                args_ptr,
+                dir_ptr,
+                SW_SHOWNORMAL,
+            )
+        };
+        let code = hinst.0 as isize;
+        if code > 32 {
+            Ok(())
+        } else {
+            let last_err = io::Error::last_os_error();
+            if code == 5 || last_err.raw_os_error() == Some(1223) {
+                Err(
+                    "Người dùng đã từ chối cấp quyền quản trị (UAC) hoặc không có quyền thực thi."
+                        .to_owned(),
+                )
+            } else {
+                Err(format!(
+                    "Không thể khởi chạy tiến trình với quyền quản trị (mã ShellExecuteW={code}: {last_err})."
+                ))
+            }
+        }
+    }
+
+    fn open_https_url(&self, url: &str) -> Result<(), String> {
+        Self::open_https_url_direct(url)
+    }
+}
+
+pub trait StartupController: Send + Sync {
+    fn is_enabled(&self) -> bool;
+    fn set_enabled(&self, enable: bool) -> Result<(), StorageError>;
+}
+
+pub struct WindowsStartupController;
+
+impl StartupController for WindowsStartupController {
+    fn is_enabled(&self) -> bool {
+        StartupManager::is_enabled()
+    }
+
+    fn set_enabled(&self, enable: bool) -> Result<(), StorageError> {
+        let exe_path = std::env::current_exe()?;
+        StartupManager::set_enabled(&exe_path, enable)
+    }
+}
+
+#[derive(Default)]
+pub struct UpdateCancelCoordinator {
+    active: Option<(u64, watch::Sender<bool>)>,
+    cancelled_gens: Vec<u64>,
+}
+
+impl UpdateCancelCoordinator {
+    pub fn register(&mut self, generation: u64) -> Option<watch::Receiver<bool>> {
+        if self.cancelled_gens.contains(&generation) {
+            return None;
+        }
+        if let Some((_, prev_tx)) = self.active.take() {
+            let _ = prev_tx.send(true);
+        }
+        let (tx, rx) = watch::channel(false);
+        self.active = Some((generation, tx));
+        Some(rx)
+    }
+
+    pub fn cancel(&mut self, generation: u64) {
+        if !self.cancelled_gens.contains(&generation) {
+            if self.cancelled_gens.len() >= 16 {
+                self.cancelled_gens.remove(0);
+            }
+            self.cancelled_gens.push(generation);
+        }
+        if let Some((active_gen, tx)) = self.active.as_ref() {
+            if *active_gen == generation {
+                let _ = tx.send(true);
+            }
+        }
+    }
+
+    pub fn clear(&mut self, generation: u64) {
+        if self.active.as_ref().is_some_and(|(g, _)| *g == generation) {
+            self.active = None;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsDraft {
+    pub startup_enabled: bool,
+    pub startup_dirty: bool,
+    pub animations_enabled: bool,
+    pub auto_check_update: bool,
+    pub private_key: String,
+    pub public_key: String,
+    pub expiration: i64,
+    pub address: String,
+    pub dns: String,
+    pub port: String,
+    pub original_private_key: String,
+    pub imported_from_conf: bool,
+}
+
+impl SettingsDraft {
+    pub fn from_config(cfg: &ClientConfig, startup_enabled: bool) -> Self {
+        Self {
+            startup_enabled,
+            startup_dirty: false,
+            animations_enabled: cfg.animations_enabled,
+            auto_check_update: cfg.auto_check_update,
+            private_key: cfg.private_key.clone(),
+            public_key: cfg.public_key.clone(),
+            expiration: cfg.expiration,
+            address: cfg.address.clone(),
+            dns: cfg.dns.clone(),
+            port: cfg.port.clone(),
+            original_private_key: cfg.private_key.clone(),
+            imported_from_conf: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum UpdateDialogPhase {
+    #[default]
+    Idle,
+    Downloading {
+        downloaded_bytes: u64,
+        total_bytes: u64,
+        percent: f32,
+        confirm_cancel: bool,
+    },
+    Verifying,
+    LaunchingInstaller,
+    BrowserOpened(String),
+    Cancelled,
+    Failed(String),
+}
+
+impl UpdateDialogPhase {
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            Self::Downloading { .. } | Self::Verifying | Self::LaunchingInstaller
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ServiceRepairPhase {
+    #[default]
+    Idle,
+    LaunchingAndWaiting,
+    Succeeded,
+    Failed(String),
+}
+
 #[derive(Debug, Clone)]
 pub enum UiCommand {
     SrpLogin {
@@ -343,6 +594,14 @@ pub enum UiCommand {
     EnsureWgKey {
         auth_generation: u64,
         force: bool,
+    },
+    FetchWgKeyManual {
+        auth_generation: u64,
+    },
+    PickAndImportConf,
+    RefreshStartupStatus,
+    SetStartupEnabled {
+        enabled: bool,
     },
     Connect {
         generation: u64,
@@ -361,6 +620,20 @@ pub enum UiCommand {
     CheckForUpdates {
         manual: bool,
     },
+    StartUpdateDownload {
+        generation: u64,
+        info: UpdateInfo,
+    },
+    CancelUpdateDownload {
+        generation: u64,
+    },
+    LaunchUpdateInstaller {
+        path: PathBuf,
+    },
+    OpenExternalUrl {
+        url: String,
+    },
+    RepairService,
     ExportConf {
         auth_generation: u64,
         server: ServerNode,
@@ -413,6 +686,32 @@ pub enum WorkerEvent {
         auth_generation: u64,
         key: WgKeySnapshot,
     },
+    WgKeyManualSucceeded {
+        auth_generation: u64,
+        key: WgKeySnapshot,
+    },
+    WgKeyManualFailed {
+        auth_generation: u64,
+        friendly_msg: String,
+        detail: String,
+    },
+    ConfImportCancelled,
+    ConfImported {
+        filename: String,
+        parsed: ParsedWireGuardConf,
+    },
+    ConfImportError {
+        title: String,
+        friendly_msg: String,
+        detail: String,
+    },
+    StartupStatusLoaded {
+        enabled: bool,
+    },
+    StartupSaveResult {
+        enabled: bool,
+        error: Option<String>,
+    },
     ConnectProgress {
         generation: u64,
         text: String,
@@ -454,6 +753,30 @@ pub enum WorkerEvent {
     UpdateCheckFailed {
         manual: bool,
         message: String,
+    },
+    UpdateDownloadProgress {
+        generation: u64,
+        downloaded_bytes: u64,
+        total_bytes: u64,
+        percent: f32,
+    },
+    UpdateDownloadCancelled {
+        generation: u64,
+    },
+    UpdateDownloadFinished {
+        generation: u64,
+        action: Result<UpdateAction, String>,
+    },
+    UpdateInstallerLaunched {
+        result: Result<(), String>,
+    },
+    ExternalUrlError {
+        message: String,
+    },
+    ServiceRepairSucceeded,
+    ServiceRepairFailed {
+        message: String,
+        detail: String,
     },
     ConfExported {
         message: String,
@@ -548,9 +871,21 @@ pub struct AppState {
     pub loading: LoadingState,
     pub available_update: Option<UpdateInfo>,
     pub update_check_message: Option<String>,
+    pub update_check_pending: bool,
+    pub update_generation: u64,
+    pub update_phase: UpdateDialogPhase,
     pub service_health: ServiceHealthStatus,
+    pub service_repair_phase: ServiceRepairPhase,
+    pub service_repair_detail: Option<String>,
     pub error_modal: Option<AppErrorInfo>,
+    pub return_dialog: Option<ActiveDialog>,
     pub info_toast: Option<StatusNotice>,
+    pub startup_enabled: bool,
+    pub settings_draft: SettingsDraft,
+    pub settings_key_fetching: bool,
+    pub settings_conf_importing: bool,
+    pub settings_status_msg: Option<StatusNotice>,
+    pub settings_middle_hold: MiddleHoldTracker,
     pub window_visible: bool,
     pub user_has_custom_dragged: bool,
     pub drawer_scroll_to_top: bool,
@@ -568,13 +903,17 @@ impl AppState {
         let is_logged_in = active_account.is_some();
         let cache_path = ServerCacheManager::default_cache_path();
         let (raw_payload, cached_servers) = ServerCacheManager::load(&cache_path);
-        Self::new(
+        let mut state = Self::new(
             is_logged_in,
             active_account,
             client_config,
             raw_payload,
             cached_servers,
-        )
+        );
+        let startup_enabled = StartupManager::is_enabled();
+        state.startup_enabled = startup_enabled;
+        state.settings_draft.startup_enabled = startup_enabled;
+        state
     }
 
     pub fn new(
@@ -587,6 +926,7 @@ impl AppState {
         let now = Instant::now();
         let initial_auth_generation = u64::from(is_logged_in);
         let auth_generation_shared = Arc::new(AtomicU64::new(initial_auth_generation));
+        let settings_draft = SettingsDraft::from_config(&client_config, false);
         let mut state = Self {
             current_view: if is_logged_in {
                 AppView::Home
@@ -633,9 +973,21 @@ impl AppState {
             loading: LoadingState::default(),
             available_update: None,
             update_check_message: None,
+            update_check_pending: false,
+            update_generation: 0,
+            update_phase: UpdateDialogPhase::Idle,
             service_health: ServiceHealthStatus::Unknown,
+            service_repair_phase: ServiceRepairPhase::Idle,
+            service_repair_detail: None,
             error_modal: None,
+            return_dialog: None,
             info_toast: None,
+            startup_enabled: false,
+            settings_draft,
+            settings_key_fetching: false,
+            settings_conf_importing: false,
+            settings_status_msg: None,
+            settings_middle_hold: MiddleHoldTracker::default(),
             window_visible: true,
             user_has_custom_dragged: false,
             drawer_scroll_to_top: false,
@@ -758,23 +1110,208 @@ impl AppState {
     }
 
     pub fn open_settings_dialog(&mut self) {
+        self.settings_draft = SettingsDraft::from_config(&self.client_config, self.startup_enabled);
+        self.settings_status_msg = None;
+        self.settings_middle_hold.on_release();
+        if self.service_repair_phase != ServiceRepairPhase::LaunchingAndWaiting {
+            self.service_repair_phase = ServiceRepairPhase::Idle;
+            self.service_repair_detail = None;
+        }
+        self.return_dialog = None;
         self.active_dialog = ActiveDialog::Settings;
         self.window_visible = true;
+        self.pending_commands.push(UiCommand::RefreshStartupStatus);
         self.request_status_refresh();
     }
 
     pub fn open_about_dialog(&mut self) {
+        self.return_dialog = None;
         self.active_dialog = ActiveDialog::About;
         self.window_visible = true;
     }
 
     pub fn open_service_repair_dialog(&mut self) {
+        self.service_repair_phase = ServiceRepairPhase::Idle;
+        self.service_repair_detail = None;
+        self.return_dialog = None;
         self.active_dialog = ActiveDialog::ServiceRepair;
         self.window_visible = true;
     }
 
     pub fn close_dialog(&mut self) {
+        if self.active_dialog == ActiveDialog::Update {
+            let is_mandatory = self.available_update.as_ref().is_some_and(|u| u.mandatory);
+            if is_mandatory || self.update_phase.is_busy() {
+                return;
+            }
+        }
+        if self.active_dialog == ActiveDialog::ErrorDetail {
+            if let Some(prev) = self.return_dialog.take() {
+                self.active_dialog = prev;
+                return;
+            }
+        }
+        if self.active_dialog == ActiveDialog::ServiceRepair {
+            self.service_repair_phase = ServiceRepairPhase::Idle;
+            self.service_repair_detail = None;
+        }
+        if self.active_dialog == ActiveDialog::Settings {
+            self.settings_middle_hold.on_release();
+        }
+        self.return_dialog = None;
         self.active_dialog = ActiveDialog::None;
+    }
+
+    pub fn save_settings_dialog(&mut self) {
+        let mut cfg = self.client_config.clone();
+        let custom_priv = self.settings_draft.private_key.trim().to_owned();
+        if !custom_priv.is_empty() {
+            cfg.private_key = custom_priv.clone();
+            if self.settings_draft.imported_from_conf
+                || custom_priv != self.settings_draft.original_private_key
+            {
+                cfg.public_key.clear();
+                cfg.expiration = 0;
+            } else {
+                cfg.public_key = self.settings_draft.public_key.clone();
+                cfg.expiration = self.settings_draft.expiration;
+            }
+        }
+        let addr = self.settings_draft.address.trim();
+        cfg.address = if addr.is_empty() {
+            DEFAULT_WG_ADDRESS.to_owned()
+        } else {
+            addr.to_owned()
+        };
+        let dns = self.settings_draft.dns.trim();
+        cfg.dns = if dns.is_empty() {
+            DEFAULT_WG_DNS.to_owned()
+        } else {
+            dns.to_owned()
+        };
+        let port = self.settings_draft.port.trim();
+        cfg.port = if port.is_empty() {
+            DEFAULT_WG_PORT.to_owned()
+        } else {
+            port.to_owned()
+        };
+        cfg.animations_enabled = self.settings_draft.animations_enabled;
+        cfg.auto_check_update = self.settings_draft.auto_check_update;
+        cfg.debug_mode = self.client_config.debug_mode;
+
+        self.startup_enabled = self.settings_draft.startup_enabled;
+        self.save_client_config(cfg);
+        self.pending_commands.push(UiCommand::SetStartupEnabled {
+            enabled: self.settings_draft.startup_enabled,
+        });
+        self.settings_middle_hold.on_release();
+        self.return_dialog = None;
+        self.active_dialog = ActiveDialog::None;
+        self.info_toast = Some(StatusNotice {
+            text: "Đã lưu và áp dụng cài đặt thành công!".to_owned(),
+            level: NoticeLevel::Success,
+        });
+    }
+
+    pub fn toggle_dev_mode(&mut self) {
+        let mut cfg = self.client_config.clone();
+        cfg.debug_mode = !cfg.debug_mode;
+        self.save_client_config(cfg);
+
+        let notice = if self.client_config.debug_mode {
+            StatusNotice {
+                text: "🛠️ ĐÃ KÍCH HOẠT CHẾ ĐỘ DEBUG! Mở khóa '💾 Xuất .conf' và chi tiết lỗi kỹ thuật.".to_owned(),
+                level: NoticeLevel::Success,
+            }
+        } else {
+            StatusNotice {
+                text: "🔒 ĐÃ TẮT CHẾ ĐỘ DEBUG! Đã chuyển về Chế độ Người dùng Tiêu chuẩn."
+                    .to_owned(),
+                level: NoticeLevel::Info,
+            }
+        };
+        self.settings_status_msg = Some(notice.clone());
+        self.info_toast = Some(notice);
+    }
+
+    pub fn fetch_wg_key_from_settings(&mut self) {
+        if self.settings_key_fetching || self.closing {
+            return;
+        }
+        if !self.is_logged_in {
+            self.settings_status_msg = Some(StatusNotice {
+                text: "Vui lòng đăng nhập Proton để cấp Key mới từ API.".to_owned(),
+                level: NoticeLevel::Warning,
+            });
+            return;
+        }
+        self.settings_key_fetching = true;
+        self.settings_status_msg = Some(StatusNotice {
+            text: "● Đang cấp WireGuard Key mới từ Proton API...".to_owned(),
+            level: NoticeLevel::Warning,
+        });
+        self.pending_commands.push(UiCommand::FetchWgKeyManual {
+            auth_generation: self.auth_generation,
+        });
+    }
+
+    pub fn pick_and_import_conf(&mut self) {
+        if self.settings_conf_importing || self.closing {
+            return;
+        }
+        self.settings_conf_importing = true;
+        self.pending_commands.push(UiCommand::PickAndImportConf);
+    }
+
+    pub fn start_update_download(&mut self) {
+        if self.update_phase.is_busy() || self.closing {
+            return;
+        }
+        let Some(info) = self.available_update.clone() else {
+            return;
+        };
+        self.update_generation = self.update_generation.saturating_add(1);
+        let generation = self.update_generation;
+        self.update_phase = UpdateDialogPhase::Downloading {
+            downloaded_bytes: 0,
+            total_bytes: info.file_size_bytes,
+            percent: 0.0,
+            confirm_cancel: false,
+        };
+        self.pending_commands
+            .push(UiCommand::StartUpdateDownload { generation, info });
+    }
+
+    pub fn cancel_update_download(&mut self) {
+        if !matches!(
+            self.update_phase,
+            UpdateDialogPhase::Downloading { .. } | UpdateDialogPhase::Verifying
+        ) {
+            return;
+        }
+        let cancelled_gen = self.update_generation;
+        self.update_generation = self.update_generation.saturating_add(1);
+        self.pending_commands.push(UiCommand::CancelUpdateDownload {
+            generation: cancelled_gen,
+        });
+        let is_mandatory = self.available_update.as_ref().is_some_and(|u| u.mandatory);
+        self.update_phase = UpdateDialogPhase::Cancelled;
+        if !is_mandatory && self.active_dialog == ActiveDialog::Update {
+            self.active_dialog = ActiveDialog::None;
+            self.info_toast = Some(StatusNotice {
+                text: "Đã hủy quá trình tải bản cập nhật.".to_owned(),
+                level: NoticeLevel::Info,
+            });
+        }
+    }
+
+    pub fn start_service_repair(&mut self) {
+        if self.service_repair_phase == ServiceRepairPhase::LaunchingAndWaiting || self.closing {
+            return;
+        }
+        self.service_repair_phase = ServiceRepairPhase::LaunchingAndWaiting;
+        self.service_repair_detail = None;
+        self.pending_commands.push(UiCommand::RepairService);
     }
 
     pub fn tick(&mut self, now: Instant) {
@@ -975,6 +1512,9 @@ impl AppState {
         self.bump_auth_generation();
         self.connection_generation = self.connection_generation.saturating_add(1);
         self.is_scanning = false;
+        self.settings_key_fetching = false;
+        self.settings_conf_importing = false;
+        self.settings_status_msg = None;
         self.client_config = store.load_client_config().unwrap_or_default();
         self.all_free_servers.clear();
         self.raw_payload = None;
@@ -1002,6 +1542,16 @@ impl AppState {
         if self.closing {
             return;
         }
+        if matches!(
+            self.update_phase,
+            UpdateDialogPhase::Downloading { .. } | UpdateDialogPhase::Verifying
+        ) {
+            let cancelled_gen = self.update_generation;
+            self.update_generation = self.update_generation.saturating_add(1);
+            self.pending_commands.push(UiCommand::CancelUpdateDownload {
+                generation: cancelled_gen,
+            });
+        }
         self.closing = true;
         self.connection_generation = self.connection_generation.saturating_add(1);
         self.pending_commands.push(UiCommand::ShutdownOnExit);
@@ -1021,6 +1571,10 @@ impl AppState {
     }
 
     pub fn check_for_updates(&mut self, manual: bool) {
+        if manual {
+            self.update_check_pending = true;
+            self.update_check_message = None;
+        }
         self.pending_commands
             .push(UiCommand::CheckForUpdates { manual });
     }
@@ -1304,6 +1858,115 @@ impl AppState {
             } => {
                 if auth_generation == self.auth_generation && self.is_logged_in && !self.closing {
                     key.apply_to(&mut self.client_config);
+                    if self.active_dialog == ActiveDialog::Settings
+                        && !self.settings_draft.imported_from_conf
+                        && self.settings_draft.private_key
+                            == self.settings_draft.original_private_key
+                    {
+                        self.settings_draft.private_key = key.private_key.clone();
+                        self.settings_draft.original_private_key = key.private_key;
+                        self.settings_draft.public_key = key.public_key;
+                        self.settings_draft.expiration = key.expiration;
+                    }
+                }
+            }
+            WorkerEvent::WgKeyManualSucceeded {
+                auth_generation,
+                key,
+            } => {
+                self.settings_key_fetching = false;
+                if auth_generation == self.auth_generation && self.is_logged_in && !self.closing {
+                    key.apply_to(&mut self.client_config);
+                    self.settings_draft.private_key = key.private_key.clone();
+                    self.settings_draft.original_private_key = key.private_key;
+                    self.settings_draft.public_key = key.public_key;
+                    self.settings_draft.expiration = key.expiration;
+                    self.settings_draft.imported_from_conf = false;
+                    let msg = "Đã cấp và kích hoạt WireGuard Key mới thành công!".to_owned();
+                    self.settings_status_msg = Some(StatusNotice {
+                        text: format!("✓ {msg}"),
+                        level: NoticeLevel::Success,
+                    });
+                    self.info_toast = Some(StatusNotice {
+                        text: msg,
+                        level: NoticeLevel::Success,
+                    });
+                }
+            }
+            WorkerEvent::WgKeyManualFailed {
+                auth_generation,
+                friendly_msg,
+                detail,
+            } => {
+                self.settings_key_fetching = false;
+                if auth_generation == self.auth_generation && !self.closing {
+                    self.settings_status_msg = Some(StatusNotice {
+                        text: format!("❌ {friendly_msg}"),
+                        level: NoticeLevel::Error,
+                    });
+                    if self.active_dialog == ActiveDialog::Settings {
+                        self.return_dialog = Some(ActiveDialog::Settings);
+                    }
+                    self.error_modal = Some(AppErrorInfo {
+                        title: "Lỗi Cấp Key".to_owned(),
+                        friendly_msg,
+                        detail,
+                    });
+                    self.active_dialog = ActiveDialog::ErrorDetail;
+                }
+            }
+            WorkerEvent::ConfImportCancelled => {
+                self.settings_conf_importing = false;
+            }
+            WorkerEvent::ConfImported { filename, parsed } => {
+                self.settings_conf_importing = false;
+                self.settings_draft.private_key = parsed.private_key;
+                self.settings_draft.public_key.clear();
+                if let Some(addr) = parsed.address {
+                    self.settings_draft.address = addr;
+                }
+                if let Some(dns) = parsed.dns {
+                    self.settings_draft.dns = dns;
+                }
+                self.settings_draft.expiration = 0;
+                self.settings_draft.imported_from_conf = true;
+                self.settings_status_msg = Some(StatusNotice {
+                    text: format!(
+                        "✓ Đã nạp cấu hình từ file: {filename} (bấm Lưu & Áp dụng để ghi nhận)"
+                    ),
+                    level: NoticeLevel::Success,
+                });
+            }
+            WorkerEvent::ConfImportError {
+                title,
+                friendly_msg,
+                detail,
+            } => {
+                self.settings_conf_importing = false;
+                if self.active_dialog == ActiveDialog::Settings {
+                    self.return_dialog = Some(ActiveDialog::Settings);
+                }
+                self.error_modal = Some(AppErrorInfo {
+                    title,
+                    friendly_msg,
+                    detail,
+                });
+                self.active_dialog = ActiveDialog::ErrorDetail;
+            }
+            WorkerEvent::StartupStatusLoaded { enabled } => {
+                self.startup_enabled = enabled;
+                if !self.settings_draft.startup_dirty {
+                    self.settings_draft.startup_enabled = enabled;
+                }
+            }
+            WorkerEvent::StartupSaveResult { enabled, error } => {
+                if let Some(err) = error {
+                    self.info_toast = Some(StatusNotice {
+                        text: format!("Không thể cập nhật khởi động cùng Windows: {err}"),
+                        level: NoticeLevel::Warning,
+                    });
+                } else {
+                    self.startup_enabled = enabled;
                 }
             }
             WorkerEvent::ConnectProgress {
@@ -1430,6 +2093,9 @@ impl AppState {
                 match status {
                     Ok(TunnelHealthState::Disconnected) => {
                         self.service_health = ServiceHealthStatus::Healthy;
+                        if self.active_dialog == ActiveDialog::ServiceRepair {
+                            self.service_repair_phase = ServiceRepairPhase::Succeeded;
+                        }
                         self.tunnel_running = false;
                         self.tunnel_verified = false;
                         self.tunnel_unverified_reason = None;
@@ -1439,6 +2105,9 @@ impl AppState {
                     }
                     Ok(TunnelHealthState::Connecting) => {
                         self.service_health = ServiceHealthStatus::Healthy;
+                        if self.active_dialog == ActiveDialog::ServiceRepair {
+                            self.service_repair_phase = ServiceRepairPhase::Succeeded;
+                        }
                         self.tunnel_running = true;
                         self.tunnel_verified = false;
                         self.tunnel_unverified_reason =
@@ -1446,6 +2115,9 @@ impl AppState {
                     }
                     Ok(TunnelHealthState::Verifying(info)) => {
                         self.service_health = ServiceHealthStatus::Healthy;
+                        if self.active_dialog == ActiveDialog::ServiceRepair {
+                            self.service_repair_phase = ServiceRepairPhase::Succeeded;
+                        }
                         self.tunnel_running = true;
                         self.tunnel_verified = false;
                         self.tunnel_unverified_reason =
@@ -1455,6 +2127,9 @@ impl AppState {
                     Ok(TunnelHealthState::Connected(info)) => {
                         let was_verified = self.tunnel_verified;
                         self.service_health = ServiceHealthStatus::Healthy;
+                        if self.active_dialog == ActiveDialog::ServiceRepair {
+                            self.service_repair_phase = ServiceRepairPhase::Succeeded;
+                        }
                         self.tunnel_running = true;
                         self.tunnel_verified = true;
                         self.tunnel_unverified_reason = None;
@@ -1466,6 +2141,9 @@ impl AppState {
                     }
                     Ok(TunnelHealthState::Unverified { info, reason }) => {
                         self.service_health = ServiceHealthStatus::Healthy;
+                        if self.active_dialog == ActiveDialog::ServiceRepair {
+                            self.service_repair_phase = ServiceRepairPhase::Succeeded;
+                        }
                         self.tunnel_running = true;
                         self.tunnel_verified = false;
                         self.tunnel_unverified_reason = Some(reason);
@@ -1492,8 +2170,14 @@ impl AppState {
                 }
             }
             WorkerEvent::UpdateAvailable { info } => {
+                self.update_check_pending = false;
+                if self.active_dialog == ActiveDialog::Update && self.update_phase.is_busy() {
+                    return;
+                }
                 self.available_update = Some(info);
                 self.update_check_message = None;
+                self.update_phase = UpdateDialogPhase::Idle;
+                self.return_dialog = None;
                 self.active_dialog = ActiveDialog::Update;
                 self.window_visible = true;
             }
@@ -1501,6 +2185,7 @@ impl AppState {
                 manual,
                 current_version,
             } => {
+                self.update_check_pending = false;
                 if manual {
                     self.update_check_message = Some(format!(
                         "🎉 Bạn đang sử dụng phiên bản mới nhất ({APP_NAME} v{current_version})!\nKhông có bản cập nhật nào."
@@ -1512,6 +2197,7 @@ impl AppState {
                 }
             }
             WorkerEvent::UpdateCheckFailed { manual, message } => {
+                self.update_check_pending = false;
                 if manual {
                     self.update_check_message = Some(message.clone());
                     self.info_toast = Some(StatusNotice {
@@ -1519,6 +2205,85 @@ impl AppState {
                         level: NoticeLevel::Warning,
                     });
                 }
+            }
+            WorkerEvent::UpdateDownloadProgress {
+                generation,
+                downloaded_bytes,
+                total_bytes,
+                percent,
+            } => {
+                if generation != self.update_generation || self.closing {
+                    return;
+                }
+                if let UpdateDialogPhase::Downloading { confirm_cancel, .. } = &self.update_phase {
+                    self.update_phase = UpdateDialogPhase::Downloading {
+                        downloaded_bytes,
+                        total_bytes,
+                        percent,
+                        confirm_cancel: *confirm_cancel,
+                    };
+                }
+            }
+            WorkerEvent::UpdateDownloadCancelled { generation } => {
+                if generation == self.update_generation && !self.closing {
+                    self.update_phase = UpdateDialogPhase::Cancelled;
+                }
+            }
+            WorkerEvent::UpdateDownloadFinished { generation, action } => {
+                if generation != self.update_generation || self.closing {
+                    return;
+                }
+                match action {
+                    Ok(UpdateAction::LaunchVerifiedInstaller(path)) => {
+                        self.update_phase = UpdateDialogPhase::LaunchingInstaller;
+                        self.pending_commands
+                            .push(UiCommand::LaunchUpdateInstaller { path });
+                    }
+                    Ok(UpdateAction::OpenReleasePageInBrowser(url)) => {
+                        match validate_https_browser_url(&url) {
+                            Ok(safe_url) => {
+                                self.update_phase =
+                                    UpdateDialogPhase::BrowserOpened(safe_url.clone());
+                                self.pending_commands
+                                    .push(UiCommand::OpenExternalUrl { url: safe_url });
+                            }
+                            Err(err) => {
+                                self.update_phase = UpdateDialogPhase::Failed(err);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        self.update_phase = UpdateDialogPhase::Failed(err);
+                    }
+                }
+            }
+            WorkerEvent::UpdateInstallerLaunched { result } => match result {
+                Ok(()) => {
+                    self.request_quit();
+                }
+                Err(err) => {
+                    self.update_phase = UpdateDialogPhase::Failed(err);
+                }
+            },
+            WorkerEvent::ExternalUrlError { message } => {
+                self.info_toast = Some(StatusNotice {
+                    text: message,
+                    level: NoticeLevel::Warning,
+                });
+            }
+            WorkerEvent::ServiceRepairSucceeded => {
+                self.service_health = ServiceHealthStatus::Healthy;
+                self.service_repair_phase = ServiceRepairPhase::Succeeded;
+                self.service_repair_detail = None;
+                self.info_toast = Some(StatusNotice {
+                    text: "FreetonVPNService đã được sửa và đang hoạt động!".to_owned(),
+                    level: NoticeLevel::Success,
+                });
+                self.request_status_refresh();
+            }
+            WorkerEvent::ServiceRepairFailed { message, detail } => {
+                self.service_repair_phase = ServiceRepairPhase::Failed(message);
+                self.service_repair_detail = Some(detail);
             }
             WorkerEvent::ConfExported { message } => {
                 self.info_toast = Some(StatusNotice {
@@ -1648,10 +2413,17 @@ pub struct WorkerDeps {
     pub store: Arc<dyn CredentialStore>,
     pub proton: Arc<ProtonClient>,
     pub pipe: Arc<dyn PipeTransport>,
+    pub shell: Arc<dyn ShellLauncher>,
+    pub startup: Arc<dyn StartupController>,
     pub cache_path: PathBuf,
     pub update_manifest_url: Option<String>,
     pub update_repo: Option<String>,
+    pub update_download_dir: Option<PathBuf>,
+    pub service_exe_path: Option<PathBuf>,
+    pub service_repair_poll_attempts: u32,
+    pub service_repair_poll_interval: Duration,
     pub auth_generation: Arc<AtomicU64>,
+    pub update_cancel: Arc<StdMutex<UpdateCancelCoordinator>>,
 }
 
 impl WorkerDeps {
@@ -1671,10 +2443,17 @@ impl WorkerDeps {
             store,
             proton,
             pipe,
+            shell: Arc::new(WindowsShellLauncher),
+            startup: Arc::new(WindowsStartupController),
             cache_path: ServerCacheManager::default_cache_path(),
             update_manifest_url: None,
             update_repo: None,
+            update_download_dir: None,
+            service_exe_path: None,
+            service_repair_poll_attempts: 24,
+            service_repair_poll_interval: Duration::from_millis(500),
             auth_generation,
+            update_cancel: Arc::new(StdMutex::new(UpdateCancelCoordinator::default())),
         }
     }
 
@@ -1779,6 +2558,29 @@ pub async fn handle_ui_command(
                 Err(err) => debug!(error = %err, "background WireGuard key check failed"),
             }
         }
+        UiCommand::FetchWgKeyManual { auth_generation } => {
+            handle_fetch_wg_key_manual(&deps, auth_generation, tx, wake).await;
+        }
+        UiCommand::PickAndImportConf => {
+            handle_pick_and_import_conf(tx, wake).await;
+        }
+        UiCommand::RefreshStartupStatus => {
+            let startup = Arc::clone(&deps.startup);
+            let enabled = tokio::task::spawn_blocking(move || startup.is_enabled())
+                .await
+                .unwrap_or(false);
+            emit(tx, wake, WorkerEvent::StartupStatusLoaded { enabled });
+        }
+        UiCommand::SetStartupEnabled { enabled } => {
+            let startup = Arc::clone(&deps.startup);
+            let res = tokio::task::spawn_blocking(move || startup.set_enabled(enabled)).await;
+            let error = match res {
+                Ok(Ok(())) => None,
+                Ok(Err(err)) => Some(err.to_string()),
+                Err(err) => Some(err.to_string()),
+            };
+            emit(tx, wake, WorkerEvent::StartupSaveResult { enabled, error });
+        }
         UiCommand::Connect {
             generation,
             auth_generation,
@@ -1813,6 +2615,45 @@ pub async fn handle_ui_command(
         }
         UiCommand::CheckForUpdates { manual } => {
             handle_check_updates(&deps, manual, tx, wake).await;
+        }
+        UiCommand::StartUpdateDownload { generation, info } => {
+            handle_start_update_download(&deps, generation, info, tx, wake).await;
+        }
+        UiCommand::CancelUpdateDownload { generation } => {
+            if let Ok(mut guard) = deps.update_cancel.lock() {
+                guard.cancel(generation);
+            }
+        }
+        UiCommand::LaunchUpdateInstaller { path } => {
+            let shell = Arc::clone(&deps.shell);
+            let res = tokio::task::spawn_blocking(move || {
+                let dir = path.parent().map(Path::to_path_buf);
+                shell.launch_elevated(&path, "/S", dir.as_deref())
+            })
+            .await;
+            let result = match res {
+                Ok(inner) => inner,
+                Err(err) => Err(format!("Không thể khởi chạy trình cài đặt: {err}")),
+            };
+            emit(tx, wake, WorkerEvent::UpdateInstallerLaunched { result });
+        }
+        UiCommand::OpenExternalUrl { url } => {
+            let shell = Arc::clone(&deps.shell);
+            let res = tokio::task::spawn_blocking(move || shell.open_https_url(&url)).await;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => emit(tx, wake, WorkerEvent::ExternalUrlError { message }),
+                Err(err) => emit(
+                    tx,
+                    wake,
+                    WorkerEvent::ExternalUrlError {
+                        message: err.to_string(),
+                    },
+                ),
+            }
+        }
+        UiCommand::RepairService => {
+            handle_repair_service(&deps, tx, wake).await;
         }
         UiCommand::ExportConf {
             auth_generation,
@@ -2599,6 +3440,295 @@ async fn handle_export_conf(
     }
 }
 
+async fn handle_fetch_wg_key_manual(
+    deps: &WorkerDeps,
+    auth_generation: u64,
+    tx: &mpsc::UnboundedSender<WorkerEvent>,
+    wake: &(dyn Fn() + Send + Sync),
+) {
+    if !deps.is_auth_current(auth_generation) {
+        return;
+    }
+    let res = TASK_AUTH_GENERATION
+        .scope(auth_generation, deps.proton.ensure_wg_key(true))
+        .await;
+    if !deps.is_auth_current(auth_generation) {
+        return;
+    }
+    match res {
+        Ok(cfg) => emit(
+            tx,
+            wake,
+            WorkerEvent::WgKeyManualSucceeded {
+                auth_generation,
+                key: WgKeySnapshot::from_config(&cfg),
+            },
+        ),
+        Err(err) => emit(
+            tx,
+            wake,
+            WorkerEvent::WgKeyManualFailed {
+                auth_generation,
+                friendly_msg: "Không thể tự động cấp WireGuard Key từ tài khoản.".to_owned(),
+                detail: err.to_string(),
+            },
+        ),
+    }
+}
+
+async fn handle_pick_and_import_conf(
+    tx: &mpsc::UnboundedSender<WorkerEvent>,
+    wake: &(dyn Fn() + Send + Sync),
+) {
+    let picked = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .add_filter("WireGuard Config", &["conf"])
+            .set_title("Chọn file cấu hình WireGuard (.conf)")
+            .pick_file()
+    })
+    .await;
+
+    let Some(path) = picked.ok().flatten() else {
+        emit(tx, wake, WorkerEvent::ConfImportCancelled);
+        return;
+    };
+
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.conf")
+        .to_owned();
+
+    match tokio::task::spawn_blocking(move || std::fs::read_to_string(&path)).await {
+        Ok(Ok(content)) => match parse_wireguard_conf(&content) {
+            Ok(parsed) => emit(tx, wake, WorkerEvent::ConfImported { filename, parsed }),
+            Err(err) => emit(
+                tx,
+                wake,
+                WorkerEvent::ConfImportError {
+                    title: "Lỗi Nạp File .conf".to_owned(),
+                    friendly_msg: "File cấu hình WireGuard không hợp lệ.".to_owned(),
+                    detail: err,
+                },
+            ),
+        },
+        Ok(Err(err)) => emit(
+            tx,
+            wake,
+            WorkerEvent::ConfImportError {
+                title: "Lỗi Nạp File .conf".to_owned(),
+                friendly_msg: "Không thể đọc file cấu hình WireGuard.".to_owned(),
+                detail: err.to_string(),
+            },
+        ),
+        Err(err) => emit(
+            tx,
+            wake,
+            WorkerEvent::ConfImportError {
+                title: "Lỗi Nạp File .conf".to_owned(),
+                friendly_msg: "Không thể đọc file cấu hình WireGuard.".to_owned(),
+                detail: err.to_string(),
+            },
+        ),
+    }
+}
+
+fn default_update_download_dir() -> PathBuf {
+    std::env::temp_dir().join("FreetonVPN_Update")
+}
+
+fn cleanup_partial_updates(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.ends_with(".part"))
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+async fn handle_start_update_download(
+    deps: &WorkerDeps,
+    generation: u64,
+    info: UpdateInfo,
+    tx: &mpsc::UnboundedSender<WorkerEvent>,
+    wake: &(dyn Fn() + Send + Sync),
+) {
+    let cancel_rx_opt = {
+        let mut guard = deps
+            .update_cancel
+            .lock()
+            .expect("update cancel mutex poisoned");
+        guard.register(generation)
+    };
+    let Some(mut cancel_rx) = cancel_rx_opt else {
+        emit(
+            tx,
+            wake,
+            WorkerEvent::UpdateDownloadCancelled { generation },
+        );
+        return;
+    };
+
+    let dest_dir = deps
+        .update_download_dir
+        .clone()
+        .unwrap_or_else(default_update_download_dir);
+    let last_emit = StdMutex::new(Instant::now() - Duration::from_secs(1));
+
+    let download_fut = download_and_verify_update(
+        &info,
+        &dest_dir,
+        |downloaded_bytes, total_bytes, percent| {
+            let mut guard = last_emit.lock().expect("progress mutex");
+            if percent >= 99.9 || guard.elapsed() >= Duration::from_millis(50) {
+                *guard = Instant::now();
+                emit(
+                    tx,
+                    wake,
+                    WorkerEvent::UpdateDownloadProgress {
+                        generation,
+                        downloaded_bytes,
+                        total_bytes,
+                        percent,
+                    },
+                );
+            }
+        },
+    );
+
+    tokio::select! {
+        biased;
+        _ = cancel_rx.wait_for(|&cancelled| cancelled) => {
+            cleanup_partial_updates(&dest_dir);
+            if let Ok(mut guard) = deps.update_cancel.lock() {
+                guard.clear(generation);
+            }
+            emit(tx, wake, WorkerEvent::UpdateDownloadCancelled { generation });
+        }
+        res = download_fut => {
+            if let Ok(mut guard) = deps.update_cancel.lock() {
+                guard.clear(generation);
+            }
+            emit(
+                tx,
+                wake,
+                WorkerEvent::UpdateDownloadFinished {
+                    generation,
+                    action: res.map_err(|e| e.to_string()),
+                },
+            );
+        }
+    }
+}
+
+async fn handle_repair_service(
+    deps: &WorkerDeps,
+    tx: &mpsc::UnboundedSender<WorkerEvent>,
+    wake: &(dyn Fn() + Send + Sync),
+) {
+    let exe_opt = deps.service_exe_path.clone().or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| sibling_service_exe_path(&exe))
+    });
+    let Some(service_exe) = exe_opt else {
+        emit(
+            tx,
+            wake,
+            WorkerEvent::ServiceRepairFailed {
+                message: "Không thể xác định đường dẫn FreetonVPNService.exe.".to_owned(),
+                detail: "std::env::current_exe() failed".to_owned(),
+            },
+        );
+        return;
+    };
+    if !service_exe.is_file() {
+        emit(
+            tx,
+            wake,
+            WorkerEvent::ServiceRepairFailed {
+                message: "Không tìm thấy FreetonVPNService.exe cạnh ứng dụng. Vui lòng cài đặt lại Freeton VPN.".to_owned(),
+                detail: format!("Missing sibling executable: {}", service_exe.display()),
+            },
+        );
+        return;
+    }
+
+    let shell = Arc::clone(&deps.shell);
+    let exe_clone = service_exe.clone();
+    let launch_res = tokio::task::spawn_blocking(move || {
+        let dir = exe_clone.parent().map(Path::to_path_buf);
+        shell.launch_elevated(&exe_clone, "--install", dir.as_deref())
+    })
+    .await;
+
+    match launch_res {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            emit(
+                tx,
+                wake,
+                WorkerEvent::ServiceRepairFailed {
+                    message: err.clone(),
+                    detail: err,
+                },
+            );
+            return;
+        }
+        Err(err) => {
+            emit(
+                tx,
+                wake,
+                WorkerEvent::ServiceRepairFailed {
+                    message: "Không thể khởi chạy trình cài đặt dịch vụ (UAC).".to_owned(),
+                    detail: err.to_string(),
+                },
+            );
+            return;
+        }
+    }
+
+    let attempts = deps.service_repair_poll_attempts.max(1);
+    let mut last_err = "FreetonVPNService chưa phản hồi".to_owned();
+    for attempt in 0..attempts {
+        match deps
+            .pipe
+            .send_request(&ServiceRequest::Status, PIPE_STATUS_TIMEOUT)
+            .await
+        {
+            Ok(ServiceResponse::Status(_)) => {
+                emit(tx, wake, WorkerEvent::ServiceRepairSucceeded);
+                return;
+            }
+            Ok(other) => {
+                last_err = format!("Phản hồi không mong đợi từ FreetonVPNService: {other:?}");
+            }
+            Err(err) => {
+                last_err = err.to_string();
+            }
+        }
+        if attempt + 1 < attempts && !deps.service_repair_poll_interval.is_zero() {
+            tokio::time::sleep(deps.service_repair_poll_interval).await;
+        }
+    }
+
+    emit(
+        tx,
+        wake,
+        WorkerEvent::ServiceRepairFailed {
+            message: "Đã chạy cài đặt nhưng FreetonVPNService chưa phản hồi. Hãy bấm 'Kiểm tra lại' sau vài giây.".to_owned(),
+            detail: last_err,
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2704,6 +3834,95 @@ mod tests {
             self.sent.lock().expect("mock pipe lock").push(req.clone());
             let res = self.response.lock().expect("mock pipe lock").clone();
             Box::pin(async move { res })
+        }
+    }
+
+    #[derive(Default)]
+    struct MockShellLauncher {
+        elevated_calls: Mutex<Vec<(PathBuf, String)>>,
+        opened_urls: Mutex<Vec<String>>,
+        elevated_result: Mutex<Option<Result<(), String>>>,
+    }
+
+    impl MockShellLauncher {
+        fn ok() -> Self {
+            Self {
+                elevated_calls: Mutex::new(Vec::new()),
+                opened_urls: Mutex::new(Vec::new()),
+                elevated_result: Mutex::new(Some(Ok(()))),
+            }
+        }
+
+        fn elevated_err(msg: &str) -> Self {
+            Self {
+                elevated_calls: Mutex::new(Vec::new()),
+                opened_urls: Mutex::new(Vec::new()),
+                elevated_result: Mutex::new(Some(Err(msg.to_owned()))),
+            }
+        }
+    }
+
+    impl ShellLauncher for MockShellLauncher {
+        fn launch_elevated(
+            &self,
+            target: &Path,
+            args: &str,
+            _working_dir: Option<&Path>,
+        ) -> Result<(), String> {
+            self.elevated_calls
+                .lock()
+                .expect("elevated lock")
+                .push((target.to_path_buf(), args.to_owned()));
+            self.elevated_result
+                .lock()
+                .expect("res lock")
+                .clone()
+                .unwrap_or(Ok(()))
+        }
+
+        fn open_https_url(&self, url: &str) -> Result<(), String> {
+            let safe = validate_https_browser_url(url)?;
+            self.opened_urls.lock().expect("url lock").push(safe);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MockStartupController {
+        enabled: Mutex<bool>,
+    }
+
+    impl StartupController for MockStartupController {
+        fn is_enabled(&self) -> bool {
+            *self.enabled.lock().expect("startup lock")
+        }
+
+        fn set_enabled(&self, enable: bool) -> Result<(), StorageError> {
+            *self.enabled.lock().expect("startup lock") = enable;
+            Ok(())
+        }
+    }
+
+    fn make_test_deps(
+        store: Arc<dyn CredentialStore>,
+        proton: Arc<ProtonClient>,
+        pipe: Arc<dyn PipeTransport>,
+    ) -> WorkerDeps {
+        WorkerDeps {
+            store,
+            proton,
+            pipe,
+            shell: Arc::new(MockShellLauncher::ok()),
+            startup: Arc::new(MockStartupController::default()),
+            cache_path: std::env::temp_dir().join("freeton_unused_cache.json"),
+            update_manifest_url: None,
+            update_repo: None,
+            update_download_dir: None,
+            service_exe_path: None,
+            service_repair_poll_attempts: 3,
+            service_repair_poll_interval: Duration::from_millis(5),
+            auth_generation: Arc::new(AtomicU64::new(0)),
+            update_cancel: Arc::new(StdMutex::new(UpdateCancelCoordinator::default())),
         }
     }
 
@@ -2955,15 +4174,11 @@ mod tests {
     async fn test_quit_sends_shutdown_tunnel_on_exit_and_ignores_unavailable_pipe() {
         let pipe = Arc::new(MockPipeTransport::ok(ServiceResponse::Ok));
         let store = Arc::new(MockCredentialStore::default());
-        let deps = Arc::new(WorkerDeps {
-            store: Arc::clone(&store) as Arc<dyn CredentialStore>,
-            proton: Arc::new(ProtonClient::new(store)),
-            pipe: Arc::clone(&pipe) as Arc<dyn PipeTransport>,
-            cache_path: std::env::temp_dir().join("freeton_unused_cache.json"),
-            update_manifest_url: None,
-            update_repo: None,
-            auth_generation: Arc::new(AtomicU64::new(0)),
-        });
+        let deps = Arc::new(make_test_deps(
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
+            Arc::new(ProtonClient::new(store)),
+            Arc::clone(&pipe) as Arc<dyn PipeTransport>,
+        ));
 
         let mut app = AppState::new(false, None, ClientConfig::default(), None, Vec::new());
         let _ = app.drain_commands();
@@ -2984,17 +4199,13 @@ mod tests {
 
         // Unavailable pipe still exits cleanly without trapping the user.
         let unavail_store = Arc::new(MockCredentialStore::default());
-        let unavail_deps = Arc::new(WorkerDeps {
-            store: Arc::clone(&unavail_store) as Arc<dyn CredentialStore>,
-            proton: Arc::new(ProtonClient::new(unavail_store)),
-            pipe: Arc::new(MockPipeTransport::err(PipeClientError::Unavailable(
+        let unavail_deps = Arc::new(make_test_deps(
+            Arc::clone(&unavail_store) as Arc<dyn CredentialStore>,
+            Arc::new(ProtonClient::new(unavail_store)),
+            Arc::new(MockPipeTransport::err(PipeClientError::Unavailable(
                 "not installed".to_owned(),
             ))),
-            cache_path: std::env::temp_dir().join("freeton_unused_cache.json"),
-            update_manifest_url: None,
-            update_repo: None,
-            auth_generation: Arc::new(AtomicU64::new(0)),
-        });
+        ));
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         handle_ui_command(unavail_deps, UiCommand::ShutdownOnExit, &tx2, &|| {}).await;
         let ev2 = rx2.recv().await.expect("exit event 2");
@@ -3073,15 +4284,11 @@ mod tests {
             vec![base.clone()],
             base,
         ));
-        let deps = WorkerDeps {
+        let deps = make_test_deps(
             store,
             proton,
-            pipe: Arc::new(MockPipeTransport::ok(ServiceResponse::Ok)),
-            cache_path: std::env::temp_dir().join("freeton_unused_cache.json"),
-            update_manifest_url: None,
-            update_repo: None,
-            auth_generation: Arc::new(AtomicU64::new(0)),
-        };
+            Arc::new(MockPipeTransport::ok(ServiceResponse::Ok)),
+        );
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let captured_url = Arc::new(Mutex::new(None::<String>));
@@ -3331,15 +4538,14 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&cache_path);
 
-        let deps = Arc::new(WorkerDeps {
-            store: Arc::clone(&store) as Arc<dyn CredentialStore>,
+        let mut deps_inner = make_test_deps(
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
             proton,
-            pipe: Arc::new(MockPipeTransport::ok(ServiceResponse::Ok)),
-            cache_path: cache_path.clone(),
-            update_manifest_url: None,
-            update_repo: None,
-            auth_generation: Arc::clone(&auth_gen),
-        });
+            Arc::new(MockPipeTransport::ok(ServiceResponse::Ok)),
+        );
+        deps_inner.cache_path = cache_path.clone();
+        deps_inner.auth_generation = Arc::clone(&auth_gen);
+        let deps = Arc::new(deps_inner);
 
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -3602,5 +4808,303 @@ mod tests {
             .await
             .expect_err("stalled pipe must timeout cleanly");
         assert!(matches!(err_stall, PipeClientError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn test_worker_update_verified_launches_runas_and_missing_sha_opens_browser() {
+        let payload = b"FAKE-INSTALLER-PAYLOAD-FOR-TASK9";
+        let temp_dir =
+            std::env::temp_dir().join(format!("freeton_task9_upd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let seed_file = temp_dir.join("seed.bin");
+        std::fs::write(&seed_file, payload).expect("write seed");
+        let expected_sha =
+            freeton_core::updater::compute_file_sha256(&seed_file).expect("compute sha256");
+        let _ = std::fs::remove_file(&seed_file);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(hdr.as_bytes()).await;
+                    let _ = socket.write_all(payload).await;
+                });
+            }
+        });
+
+        let shell = Arc::new(MockShellLauncher::ok());
+        let store = Arc::new(MockCredentialStore::default());
+        let mut deps = make_test_deps(
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
+            Arc::new(ProtonClient::new(store)),
+            Arc::new(MockPipeTransport::ok(ServiceResponse::Ok)),
+        );
+        deps.shell = Arc::clone(&shell) as Arc<dyn ShellLauncher>;
+        deps.update_download_dir = Some(temp_dir.clone());
+        let deps = Arc::new(deps);
+
+        let info_verified = UpdateInfo {
+            version: "3.1.0".to_owned(),
+            release_date: "2026-12-01".to_owned(),
+            title: "v3.1.0".to_owned(),
+            changelog: vec!["Fix".to_owned()],
+            download_url: format!("http://{addr}/FreetonVPN-Setup-x64.exe"),
+            file_size_bytes: payload.len() as u64,
+            sha256: expected_sha,
+            mandatory: false,
+            min_supported_version: "3.0.0".to_owned(),
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_ui_command(
+            Arc::clone(&deps),
+            UiCommand::StartUpdateDownload {
+                generation: 1,
+                info: info_verified,
+            },
+            &tx,
+            &|| {},
+        )
+        .await;
+
+        let mut finished_path = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let WorkerEvent::UpdateDownloadFinished {
+                generation: 1,
+                action: Ok(UpdateAction::LaunchVerifiedInstaller(path)),
+            } = ev
+            {
+                finished_path = Some(path);
+            }
+        }
+        let installer_path = finished_path.expect("verified installer path");
+        assert!(installer_path.exists());
+
+        handle_ui_command(
+            Arc::clone(&deps),
+            UiCommand::LaunchUpdateInstaller {
+                path: installer_path.clone(),
+            },
+            &tx,
+            &|| {},
+        )
+        .await;
+        let launched_ev = rx.try_recv().expect("launch event");
+        assert!(matches!(
+            launched_ev,
+            WorkerEvent::UpdateInstallerLaunched { result: Ok(()) }
+        ));
+        assert_eq!(
+            *shell.elevated_calls.lock().expect("elevated lock"),
+            vec![(installer_path, "/S".to_owned())]
+        );
+
+        // Missing SHA-256 -> browser fallback without touching runas.
+        let info_no_sha = UpdateInfo {
+            version: "3.1.0".to_owned(),
+            release_date: "2026-12-01".to_owned(),
+            title: "v3.1.0".to_owned(),
+            changelog: vec![],
+            download_url: "https://github.com/datpusheen/FreetonVPN/releases/download/v3.1.0/FreetonVPN-Setup-x64.exe".to_owned(),
+            file_size_bytes: 0,
+            sha256: String::new(),
+            mandatory: false,
+            min_supported_version: "3.0.0".to_owned(),
+        };
+        handle_ui_command(
+            Arc::clone(&deps),
+            UiCommand::StartUpdateDownload {
+                generation: 2,
+                info: info_no_sha,
+            },
+            &tx,
+            &|| {},
+        )
+        .await;
+        let fallback_ev = rx.try_recv().expect("fallback event");
+        match fallback_ev {
+            WorkerEvent::UpdateDownloadFinished {
+                generation: 2,
+                action: Ok(UpdateAction::OpenReleasePageInBrowser(url)),
+            } => {
+                handle_ui_command(
+                    Arc::clone(&deps),
+                    UiCommand::OpenExternalUrl { url: url.clone() },
+                    &tx,
+                    &|| {},
+                )
+                .await;
+                assert_eq!(*shell.opened_urls.lock().expect("url lock"), vec![url]);
+            }
+            other => panic!("expected OpenReleasePageInBrowser, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_worker_service_repair_runs_install_elevated_and_rechecks_status() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("freeton_task9_svc_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let dummy_svc = temp_dir.join("FreetonVPNService.exe");
+        std::fs::write(&dummy_svc, b"stub").expect("write dummy service exe");
+
+        // 1. Success path: launches elevated `--install` and sees pipe Status -> ServiceRepairSucceeded.
+        let shell_ok = Arc::new(MockShellLauncher::ok());
+        let pipe_ok = Arc::new(MockPipeTransport::ok(ServiceResponse::Status(
+            TunnelHealthState::Disconnected,
+        )));
+        let store = Arc::new(MockCredentialStore::default());
+        let mut deps = make_test_deps(
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
+            Arc::new(ProtonClient::new(store)),
+            Arc::clone(&pipe_ok) as Arc<dyn PipeTransport>,
+        );
+        deps.shell = Arc::clone(&shell_ok) as Arc<dyn ShellLauncher>;
+        deps.service_exe_path = Some(dummy_svc.clone());
+        let deps = Arc::new(deps);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_ui_command(deps, UiCommand::RepairService, &tx, &|| {}).await;
+        assert!(matches!(
+            rx.try_recv().expect("repair ok event"),
+            WorkerEvent::ServiceRepairSucceeded
+        ));
+        assert_eq!(
+            *shell_ok.elevated_calls.lock().expect("elevated lock"),
+            vec![(dummy_svc.clone(), "--install".to_owned())]
+        );
+        assert!(pipe_ok
+            .sent
+            .lock()
+            .expect("pipe sent")
+            .contains(&ServiceRequest::Status));
+
+        // 2. UAC declined -> ServiceRepairFailed without polling pipe.
+        let shell_deny = Arc::new(MockShellLauncher::elevated_err("UAC declined"));
+        let pipe_unused = Arc::new(MockPipeTransport::err(PipeClientError::Unavailable(
+            "down".to_owned(),
+        )));
+        let store2 = Arc::new(MockCredentialStore::default());
+        let mut deps_deny = make_test_deps(
+            Arc::clone(&store2) as Arc<dyn CredentialStore>,
+            Arc::new(ProtonClient::new(store2)),
+            Arc::clone(&pipe_unused) as Arc<dyn PipeTransport>,
+        );
+        deps_deny.shell = Arc::clone(&shell_deny) as Arc<dyn ShellLauncher>;
+        deps_deny.service_exe_path = Some(dummy_svc);
+        handle_ui_command(Arc::new(deps_deny), UiCommand::RepairService, &tx, &|| {}).await;
+        assert!(matches!(
+            rx.try_recv().expect("repair fail event"),
+            WorkerEvent::ServiceRepairFailed { .. }
+        ));
+        assert!(pipe_unused.sent.lock().expect("pipe sent").is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_worker_update_download_cancel_cleans_partial_file() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered_srv = Arc::clone(&entered);
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(hdr.as_bytes()).await;
+                let _ = socket.write_all(b"PARTIAL-DATA-").await;
+                let _ = socket.flush().await;
+                entered_srv.notify_one();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("freeton_task9_cancel_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let store = Arc::new(MockCredentialStore::default());
+        let mut deps = make_test_deps(
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
+            Arc::new(ProtonClient::new(store)),
+            Arc::new(MockPipeTransport::ok(ServiceResponse::Ok)),
+        );
+        deps.update_download_dir = Some(temp_dir.clone());
+        let deps = Arc::new(deps);
+
+        let info = UpdateInfo {
+            version: "3.1.0".to_owned(),
+            release_date: "2026-12-01".to_owned(),
+            title: "v3.1.0".to_owned(),
+            changelog: vec![],
+            download_url: format!("http://{addr}/FreetonVPN-Setup-x64.exe"),
+            file_size_bytes: 1_000_000,
+            sha256: "a".repeat(64),
+            mandatory: false,
+            min_supported_version: "3.0.0".to_owned(),
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let deps_dl = Arc::clone(&deps);
+        let tx_dl = tx.clone();
+        let dl_task = tokio::spawn(async move {
+            handle_ui_command(
+                deps_dl,
+                UiCommand::StartUpdateDownload {
+                    generation: 9,
+                    info,
+                },
+                &tx_dl,
+                &|| {},
+            )
+            .await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .expect("download should reach server");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        handle_ui_command(
+            Arc::clone(&deps),
+            UiCommand::CancelUpdateDownload { generation: 9 },
+            &tx,
+            &|| {},
+        )
+        .await;
+        dl_task.await.expect("download task finishes cleanly");
+
+        let mut saw_cancel = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, WorkerEvent::UpdateDownloadCancelled { generation: 9 }) {
+                saw_cancel = true;
+            }
+            assert!(
+                !matches!(ev, WorkerEvent::UpdateDownloadFinished { .. }),
+                "cancelled download must not emit UpdateDownloadFinished"
+            );
+        }
+        assert!(saw_cancel);
+        assert!(
+            !temp_dir.join("FreetonVPN-Setup-x64.exe.part").exists(),
+            ".part file must be removed after cancel"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

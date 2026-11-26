@@ -7,7 +7,7 @@ use egui::{
 use freeton_core::ping::get_country_display;
 use freeton_core::storage::CredentialStore;
 
-use crate::state::AppState;
+use crate::state::{AppState, ServiceHealthStatus};
 use crate::ui::{
     lerp_color, pill_button, rounded_card, PillStyle, C_ACCENT, C_BG, C_BORDER, C_CARD,
     C_CARD_HIGH, C_DANGER, C_SUCCESS, C_TEXT, C_TEXT_DIM, C_TEXT_MUTED, C_TOGGLE_CONNECTING,
@@ -131,6 +131,33 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
             ui.label(RichText::new(status_sub).size(11.0).color(status_sub_color));
         },
     );
+
+    if matches!(state.service_health, ServiceHealthStatus::Unavailable(_)) && !state.closing {
+        ui.add_space(6.0);
+        let repair_pill = PillStyle {
+            bg: Color32::from_rgb(0x2b, 0x22, 0x16),
+            fg: C_WARNING,
+            border: C_WARNING,
+            hover_bg: Color32::from_rgb(0x3a, 0x2d, 0x1c),
+            hover_fg: C_TEXT,
+            hover_border: C_WARNING,
+            radius: 9,
+            height: 28.0,
+            font_size: 11.0,
+            bold: true,
+            pad_x: 10.0,
+        };
+        if pill_button(
+            ui,
+            "⚠ Dịch vụ VPN chưa sẵn sàng • Bấm để sửa (UAC)",
+            Some(ui.available_width()),
+            repair_pill,
+        )
+        .clicked()
+        {
+            state.open_service_repair_dialog();
+        }
+    }
 
     // 2. Central Giant iOS Pill Switch Area
     let bottom_reserved = 166.0;
@@ -293,28 +320,25 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
             let show_export = state.client_config.debug_mode;
             let count = if show_export { 4 } else { 3 };
             let gap = 5.0;
+            ui.spacing_mut().item_spacing.x = gap;
             let total_w = ui.available_width();
             let btn_w = ((total_w - gap * (count - 1) as f32) / count as f32).max(58.0);
 
-            if show_export {
-                if pill_button(ui, "💾 Xuất .conf", Some(btn_w), PillStyle::secondary(34.0))
+            if show_export
+                && pill_button(ui, "💾 Xuất .conf", Some(btn_w), PillStyle::secondary(34.0))
                     .clicked()
-                {
-                    state.export_selected_conf();
-                }
-                ui.add_space(gap);
+            {
+                state.export_selected_conf();
             }
 
             if pill_button(ui, "Cài đặt", Some(btn_w), PillStyle::secondary(34.0)).clicked() {
                 state.open_settings_dialog();
             }
-            ui.add_space(gap);
 
             if pill_button(ui, "Giới thiệu", Some(btn_w), PillStyle::secondary(34.0)).clicked()
             {
                 state.open_about_dialog();
             }
-            ui.add_space(gap);
 
             let logout_style = PillStyle {
                 fg: if state.is_logged_in {

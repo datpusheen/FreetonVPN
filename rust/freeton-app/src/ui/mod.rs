@@ -1,3 +1,4 @@
+pub mod dialogs;
 pub mod drawer;
 pub mod home;
 pub mod login;
@@ -10,13 +11,11 @@ use egui::{
     RichText, Sense, Stroke, StrokeKind, Ui, Vec2, ViewportCommand,
 };
 use freeton_core::storage::CredentialStore;
-use freeton_core::{APP_NAME, APP_VERSION};
-use windows::core::{w, PCWSTR};
-use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use freeton_core::APP_NAME;
+use tracing::warn;
 
 use crate::state::{
-    ActiveDialog, AppState, AppView, NoticeLevel, ServiceHealthStatus, ViewDirection,
+    ActiveDialog, AppState, AppView, NoticeLevel, ViewDirection, WindowsShellLauncher,
 };
 
 // Design Tokens (Dark Glass Theme matching proton_warp_material_gui.py)
@@ -267,16 +266,8 @@ pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
 }
 
 pub fn open_external_url(url: &str) {
-    let url_wide: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
-    unsafe {
-        let _ = ShellExecuteW(
-            None,
-            w!("open"),
-            PCWSTR(url_wide.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        );
+    if let Err(err) = WindowsShellLauncher::open_https_url_direct(url) {
+        warn!(url = %url, error = %err, "rejected or failed opening external URL");
     }
 }
 
@@ -367,7 +358,7 @@ pub fn render_root(ui: &mut Ui, state: &mut AppState, store: &dyn CredentialStor
         });
 
     if state.active_dialog != ActiveDialog::None {
-        render_dialog_overlay(&ctx, state, store);
+        dialogs::render_dialog_overlay(&ctx, state, store);
     }
 }
 
@@ -489,220 +480,4 @@ fn render_loading_bar(ui: &mut Ui, state: &AppState) {
             p.rect_filled(fill_rect, cr, C_ACCENT);
         }
     });
-}
-
-/// Lightweight overlay handler for dialog hooks (`Settings`, `About`, `Update`, `ServiceRepair`,
-/// `ErrorDetail`, `LogoutConfirm`) so Task 8 works seamlessly before Task 9 replaces it with
-/// full interactive `ui/dialogs.rs`.
-fn render_dialog_overlay(ctx: &egui::Context, state: &mut AppState, store: &dyn CredentialStore) {
-    let screen_rect = ctx.content_rect();
-    egui::Area::new(egui::Id::unique("dialog_backdrop"))
-        .order(egui::Order::Middle)
-        .fixed_pos(screen_rect.min)
-        .show(ctx, |ui| {
-            let resp = ui.allocate_response(screen_rect.size(), Sense::click());
-            ui.painter()
-                .rect_filled(screen_rect, 0.0, Color32::from_black_alpha(175));
-            let _ = resp;
-        });
-
-    egui::Area::new(egui::Id::unique("dialog_card"))
-        .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-        .show(ctx, |ui| {
-            ui.set_max_width(338.0);
-            rounded_card(ui, C_CARD, C_BORDER, 14, Margin::same(16), |ui| {
-                ui.set_width(306.0);
-                match state.active_dialog {
-                    ActiveDialog::None => {}
-                    ActiveDialog::LogoutConfirm => {
-                        ui.label(RichText::new("Tài khoản").size(15.0).strong().color(C_TEXT));
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new("Đang lưu phiên đăng nhập.\n\nBạn có muốn đăng xuất để đổi tài khoản không?")
-                                .size(12.0)
-                                .color(C_TEXT_MUTED),
-                        );
-                        ui.add_space(14.0);
-                        ui.horizontal(|ui| {
-                            if pill_button(ui, "Hủy", Some(110.0), PillStyle::secondary(32.0))
-                                .clicked()
-                            {
-                                state.close_dialog();
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let danger_style = PillStyle {
-                                    bg: C_DANGER,
-                                    fg: Color32::BLACK,
-                                    border: C_DANGER,
-                                    hover_bg: Color32::from_rgb(0xf4, 0xb8, 0xb8),
-                                    hover_fg: Color32::BLACK,
-                                    hover_border: C_DANGER,
-                                    ..PillStyle::accent(32.0)
-                                };
-                                if pill_button(ui, "Đăng xuất", Some(120.0), danger_style).clicked() {
-                                    state.request_logout(store);
-                                }
-                            });
-                        });
-                    }
-                    ActiveDialog::About => {
-                        ui.vertical_centered(|ui| {
-                            ui.label(RichText::new("⚡").size(28.0).color(C_ACCENT));
-                            ui.label(RichText::new(APP_NAME).size(17.0).strong().color(C_TEXT));
-                            ui.label(
-                                RichText::new(format!("by pishun • v{APP_VERSION}"))
-                                    .size(11.5)
-                                    .italics()
-                                    .color(C_ACCENT),
-                            );
-                        });
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new("Phần mềm kết nối WireGuard tốc độ cao, siêu nhẹ cho các cụm máy chủ Proton VPN Free với thuật toán tự động chọn node tối ưu.")
-                                .size(11.5)
-                                .color(C_TEXT_MUTED),
-                        );
-                        ui.add_space(10.0);
-                        rounded_card(ui, C_CARD_HIGH, C_BORDER, 10, Margin::same(10), |ui| {
-                            ui.label(
-                                RichText::new("TUYÊN BỐ PHÁP LÝ (LEGAL DISCLAIMER)")
-                                    .size(10.0)
-                                    .strong()
-                                    .color(C_TEXT_DIM),
-                            );
-                            ui.add_space(3.0);
-                            ui.label(
-                                RichText::new("Freeton VPN là một dự án mã nguồn mở độc lập và KHÔNG thuộc sở hữu, KHÔNG liên kết, cũng như KHÔNG được ủy quyền hay tài trợ bởi Proton AG hoặc Proton VPN.")
-                                    .size(10.5)
-                                    .color(C_TEXT_MUTED),
-                            );
-                        });
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            if pill_button(
-                                ui,
-                                "🔄 Kiểm tra bản mới",
-                                Some(148.0),
-                                PillStyle::secondary(32.0),
-                            )
-                            .clicked()
-                            {
-                                state.check_for_updates(true);
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if pill_button(ui, "Đóng", Some(100.0), PillStyle::accent(32.0))
-                                    .clicked()
-                                {
-                                    state.close_dialog();
-                                }
-                            });
-                        });
-                    }
-                    ActiveDialog::Settings => {
-                        ui.label(
-                            RichText::new("⚙️ Cài Đặt Hệ Thống")
-                                .size(15.0)
-                                .strong()
-                                .color(C_TEXT),
-                        );
-                        ui.add_space(8.0);
-                        let svc_label = match &state.service_health {
-                            ServiceHealthStatus::Healthy => "● FreetonVPNService: Đang hoạt động",
-                            ServiceHealthStatus::Unavailable(_) => {
-                                "⚠ FreetonVPNService: Chưa sẵn sàng"
-                            }
-                            ServiceHealthStatus::Unknown => "○ FreetonVPNService: Đang kiểm tra...",
-                        };
-                        let svc_color = match &state.service_health {
-                            ServiceHealthStatus::Healthy => C_SUCCESS,
-                            ServiceHealthStatus::Unavailable(_) => C_WARNING,
-                            ServiceHealthStatus::Unknown => C_TEXT_MUTED,
-                        };
-                        ui.label(RichText::new(svc_label).size(12.0).color(svc_color));
-                        ui.add_space(6.0);
-                        let mut anim = state.client_config.animations_enabled;
-                        if ui.checkbox(&mut anim, "Hiệu ứng chuyển động (Animations)").changed() {
-                            let mut cfg = state.client_config.clone();
-                            cfg.animations_enabled = anim;
-                            state.save_client_config(cfg);
-                        }
-                        let mut auto_upd = state.client_config.auto_check_update;
-                        if ui.checkbox(&mut auto_upd, "Tự động kiểm tra bản cập nhật").changed() {
-                            let mut cfg = state.client_config.clone();
-                            cfg.auto_check_update = auto_upd;
-                            state.save_client_config(cfg);
-                        }
-                        ui.add_space(10.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if pill_button(ui, "Đóng", Some(100.0), PillStyle::accent(32.0))
-                                .clicked()
-                            {
-                                state.close_dialog();
-                            }
-                        });
-                    }
-                    ActiveDialog::Update => {
-                        ui.label(
-                            RichText::new("🚀 Có Bản Cập Nhật Mới")
-                                .size(15.0)
-                                .strong()
-                                .color(C_ACCENT),
-                        );
-                        ui.add_space(8.0);
-                        if let Some(info) = &state.available_update {
-                            ui.label(
-                                RichText::new(format!("{} (v{})", info.title, info.version))
-                                    .size(13.0)
-                                    .strong()
-                                    .color(C_TEXT),
-                            );
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new(info.formatted_changelog())
-                                    .size(11.5)
-                                    .color(C_TEXT_MUTED),
-                            );
-                        }
-                        ui.add_space(12.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if pill_button(ui, "Để sau", Some(100.0), PillStyle::secondary(32.0))
-                                .clicked()
-                            {
-                                state.close_dialog();
-                            }
-                        });
-                    }
-                    ActiveDialog::ServiceRepair | ActiveDialog::ErrorDetail => {
-                        let (title, friendly, detail) = if let Some(err) = &state.error_modal {
-                            (err.title.as_str(), err.friendly_msg.as_str(), err.detail.as_str())
-                        } else {
-                            ("Thông báo", "Đã xảy ra sự cố.", "")
-                        };
-                        ui.label(RichText::new(title).size(14.5).strong().color(C_DANGER));
-                        ui.add_space(8.0);
-                        ui.label(RichText::new(friendly).size(12.0).color(C_TEXT));
-                        if state.client_config.debug_mode && !detail.is_empty() && detail != friendly {
-                            ui.add_space(8.0);
-                            rounded_card(ui, C_BG, C_BORDER, 8, Margin::same(8), |ui| {
-                                ui.label(
-                                    RichText::new(format!("[DEBUG]\n{detail}"))
-                                        .size(10.5)
-                                        .monospace()
-                                        .color(C_TEXT_MUTED),
-                                );
-                            });
-                        }
-                        ui.add_space(12.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if pill_button(ui, "Đóng", Some(100.0), PillStyle::accent(32.0))
-                                .clicked()
-                            {
-                                state.close_dialog();
-                            }
-                        });
-                    }
-                }
-            });
-        });
 }
