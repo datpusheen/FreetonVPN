@@ -38,15 +38,6 @@ What `build_windows.ps1` does:
    - `dist/FreetonVPN-Setup-x64.exe.sha256`
    - Updated [`version-rust.json`](version-rust.json) with exact `file_size_bytes` and `sha256`.
 
-### Legacy Python v2.4.3 Desktop (Cutover Pending)
-
-The legacy Python desktop files (`proton_warp_material_gui.py`, `windows_vpn.py`, `build_exe.ps1`, `version.json`, etc.) remain temporarily during v3.0.0 desktop verification:
-
-```powershell
-.\run_freeton.bat
-.\build_exe.ps1
-```
-
 ## Browser VPN extension
 
 The companion extension lists Proton VPN Free servers and can route browser web traffic through a Proton HTTPS proxy. Sign in to Proton VPN in the browser first; the extension uses that tab's existing session and does not store account credentials. It only protects browser traffic, not other apps on the computer; use the desktop app for a full-device WireGuard tunnel and ICMP latency checks.
