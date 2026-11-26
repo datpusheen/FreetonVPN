@@ -150,6 +150,10 @@ fn apply_win11_rounded_corners_and_position(hwnd: HWND, reposition: bool) {
     }
 }
 
+fn should_reveal_window(was_visible: bool, is_visible: bool, force_reveal: bool) -> bool {
+    is_visible && (!was_visible || force_reveal)
+}
+
 struct FreetonDesktopApp {
     state: AppState,
     store: Arc<dyn CredentialStore>,
@@ -158,6 +162,7 @@ struct FreetonDesktopApp {
     evt_rx: mpsc::UnboundedReceiver<WorkerEvent>,
     tray: Option<TrayController>,
     dwm_initialized: bool,
+    last_window_visible: bool,
 }
 
 impl FreetonDesktopApp {
@@ -166,14 +171,17 @@ impl FreetonDesktopApp {
 
         let store: Arc<dyn CredentialStore> = Arc::new(WindowsCredentialStore::new());
         let mut state = AppState::from_local_storage(store.as_ref());
+        let last_window_visible = state.window_visible;
 
         let wake_ctx = cc.egui_ctx.clone();
         let on_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             wake_ctx.request_repaint();
         });
 
-        let (runtime, cmd_tx, evt_rx) =
-            spawn_worker_runtime(WorkerDeps::production(), Arc::clone(&on_wake));
+        let (runtime, cmd_tx, evt_rx) = spawn_worker_runtime(
+            WorkerDeps::production_with_auth(state.auth_generation_handle()),
+            Arc::clone(&on_wake),
+        );
 
         for cmd in state.drain_commands() {
             let _ = cmd_tx.send(cmd);
@@ -195,6 +203,25 @@ impl FreetonDesktopApp {
             evt_rx,
             tray,
             dwm_initialized: false,
+            last_window_visible,
+        }
+    }
+
+    fn reveal_window(&self, ctx: &egui::Context, frame: &eframe::Frame) {
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+        if let Some(hwnd) = extract_hwnd(frame) {
+            unsafe {
+                if IsIconic(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                } else {
+                    let _ = ShowWindow(hwnd, SW_SHOW);
+                }
+                let _ = SetForegroundWindow(hwnd);
+            }
+            if !self.state.user_has_custom_dragged {
+                apply_win11_rounded_corners_and_position(hwnd, true);
+            }
         }
     }
 
@@ -206,35 +233,24 @@ impl FreetonDesktopApp {
             }
         }
 
+        let mut force_reveal = false;
         if let Some(tray) = &self.tray {
             for action in tray.drain_actions() {
                 match action {
                     TrayAction::OpenWindow => {
                         self.state.window_visible = true;
-                        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(ViewportCommand::Focus);
-                        if let Some(hwnd) = extract_hwnd(frame) {
-                            unsafe {
-                                let _ = ShowWindow(hwnd, SW_SHOW);
-                                let _ = SetForegroundWindow(hwnd);
-                            }
-                            if !self.state.user_has_custom_dragged {
-                                apply_win11_rounded_corners_and_position(hwnd, true);
-                            }
-                        }
+                        force_reveal = true;
                     }
                     TrayAction::ToggleVpn => {
                         self.state.toggle_vpn();
                     }
                     TrayAction::OpenSettings => {
                         self.state.open_settings_dialog();
-                        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(ViewportCommand::Focus);
+                        force_reveal = true;
                     }
                     TrayAction::OpenAbout => {
                         self.state.open_about_dialog();
-                        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(ViewportCommand::Focus);
+                        force_reveal = true;
                     }
                     TrayAction::Exit => {
                         self.state.request_quit();
@@ -257,6 +273,15 @@ impl FreetonDesktopApp {
 
         self.state.tick(Instant::now());
 
+        if should_reveal_window(
+            self.last_window_visible,
+            self.state.window_visible,
+            force_reveal,
+        ) {
+            self.reveal_window(ctx, frame);
+        }
+        self.last_window_visible = self.state.window_visible;
+
         for cmd in self.state.drain_commands() {
             let _ = self.cmd_tx.send(cmd);
         }
@@ -277,6 +302,7 @@ impl FreetonDesktopApp {
         if ctx.input(|i| i.viewport().close_requested()) && !self.state.exit_ready {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.state.window_visible = false;
+            self.last_window_visible = false;
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
 
@@ -342,5 +368,18 @@ fn main() {
         Box::new(|cc| Ok(Box::new(FreetonDesktopApp::new(cc)))),
     ) {
         error!(error = %err, "eframe run_native failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_reveal_window;
+
+    #[test]
+    fn test_window_reveal_transition_handles_tray_and_background_events() {
+        assert!(should_reveal_window(false, true, false));
+        assert!(should_reveal_window(true, true, true));
+        assert!(!should_reveal_window(true, true, false));
+        assert!(!should_reveal_window(false, false, true));
     }
 }

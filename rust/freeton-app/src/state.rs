@@ -1,7 +1,9 @@
 use std::future::Future;
 use std::io;
+use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,8 +13,9 @@ use freeton_core::api::{
 };
 use freeton_core::ping::{ping_servers, score_server, sort_and_filter_servers, SortMode};
 use freeton_core::storage::{
-    ClientConfig, CredentialStore, ServerCacheManager, StoredAuthSession, WindowsCredentialStore,
-    DEFAULT_WG_ADDRESS, DEFAULT_WG_DNS, DEFAULT_WG_PORT,
+    ClientConfig, CredentialStore, ServerCacheManager, StorageError, StoredAuthSession,
+    WindowsCredentialStore, DEFAULT_WG_ADDRESS, DEFAULT_WG_DNS, DEFAULT_WG_PORT,
+    KEYRING_ACCOUNT_WG_CONFIG, KEYRING_SERVICE_WG,
 };
 use freeton_core::updater::{fetch_update_info, is_newer_version, UpdateInfo};
 use freeton_core::wg::{
@@ -21,6 +24,7 @@ use freeton_core::wg::{
 };
 use freeton_core::{APP_NAME, APP_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::windows::named_pipe::NamedPipeClient;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -213,64 +217,85 @@ impl WindowsPipeTransport {
         }
     }
 
-    fn send_blocking(
-        pipe_name: &str,
-        req: &ServiceRequest,
-        timeout: Duration,
-    ) -> Result<ServiceResponse, PipeClientError> {
-        use std::io::{BufRead, BufReader as StdBufReader, Write};
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows::Win32::Storage::FileSystem::{FILE_READ_DATA, FILE_WRITE_DATA};
-
-        const ERROR_PIPE_BUSY_CODE: i32 = 231;
-
-        let access = FILE_READ_DATA.0 | FILE_WRITE_DATA.0;
-        let deadline = Instant::now() + timeout.min(Duration::from_secs(2));
-        let mut file = loop {
-            match std::fs::OpenOptions::new()
-                .access_mode(access)
-                .open(pipe_name)
-            {
-                Ok(f) => break f,
-                Err(err)
-                    if err.raw_os_error() == Some(ERROR_PIPE_BUSY_CODE)
-                        && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::NotFound
-                            | io::ErrorKind::PermissionDenied
-                            | io::ErrorKind::ConnectionRefused
-                    ) =>
-                {
-                    return Err(PipeClientError::Unavailable(err.to_string()));
-                }
-                Err(err) => return Err(PipeClientError::Io(err.to_string())),
-            }
+    fn try_open_pipe_once(
+        wide_name: &[u16],
+        past_deadline: bool,
+    ) -> Result<Option<NamedPipeClient>, PipeClientError> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::ERROR_PIPE_BUSY;
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_OVERLAPPED, FILE_READ_DATA, FILE_SHARE_MODE, FILE_WRITE_DATA,
+            OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
         };
 
-        let payload =
-            serde_json::to_string(req).map_err(|e| PipeClientError::Protocol(e.to_string()))?;
-        writeln!(file, "{payload}").map_err(|e| PipeClientError::Io(e.to_string()))?;
-        file.flush()
-            .map_err(|e| PipeClientError::Io(e.to_string()))?;
-
-        let mut reader = StdBufReader::new(file);
-        let mut line = String::new();
-        let read_bytes = reader
-            .read_line(&mut line)
-            .map_err(|e| PipeClientError::Io(e.to_string()))?;
-        if read_bytes == 0 {
-            return Err(PipeClientError::Io(
-                "FreetonVPNService closed the pipe without a response".to_owned(),
-            ));
+        let access = FILE_READ_DATA.0 | FILE_WRITE_DATA.0;
+        let flags = FILE_FLAG_OVERLAPPED | SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT;
+        let res = unsafe {
+            CreateFileW(
+                PCWSTR(wide_name.as_ptr()),
+                access,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                flags,
+                None,
+            )
+        };
+        match res {
+            Ok(handle) => {
+                if handle.is_invalid() {
+                    return Err(PipeClientError::Io(
+                        "CreateFileW returned an invalid pipe handle".to_owned(),
+                    ));
+                }
+                // SAFETY: `CreateFileW` just created an exclusive valid Win32 handle.
+                let owned = unsafe { OwnedHandle::from_raw_handle(handle.0 as RawHandle) };
+                // SAFETY: Runs on an I/O-enabled Tokio runtime with `FILE_FLAG_OVERLAPPED`,
+                // transferring sole ownership of the handle into `NamedPipeClient`.
+                let client = unsafe { NamedPipeClient::from_raw_handle(owned.into_raw_handle()) }
+                    .map_err(|e| PipeClientError::Io(e.to_string()))?;
+                Ok(Some(client))
+            }
+            Err(err) => {
+                let hresult = err.code().0 as u32;
+                let os_err = if (hresult & 0xFFFF_0000) == 0x8007_0000 {
+                    io::Error::from_raw_os_error((hresult & 0xFFFF) as i32)
+                } else {
+                    io::Error::other(err.to_string())
+                };
+                if os_err.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) {
+                    if !past_deadline {
+                        return Ok(None);
+                    }
+                    return Err(PipeClientError::Unavailable(os_err.to_string()));
+                }
+                if matches!(
+                    os_err.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::ConnectionRefused
+                ) {
+                    return Err(PipeClientError::Unavailable(os_err.to_string()));
+                }
+                Err(PipeClientError::Io(os_err.to_string()))
+            }
         }
+    }
 
-        serde_json::from_str::<ServiceResponse>(line.trim())
-            .map_err(|e| PipeClientError::Protocol(e.to_string()))
+    async fn open_named_pipe_client(
+        pipe_name: &str,
+        timeout: Duration,
+    ) -> Result<NamedPipeClient, PipeClientError> {
+        let wide_name: Vec<u16> = pipe_name.encode_utf16().chain(Some(0)).collect();
+        let open_deadline = Instant::now() + timeout.min(Duration::from_secs(2));
+
+        loop {
+            let past_deadline = Instant::now() >= open_deadline;
+            if let Some(client) = Self::try_open_pipe_once(&wide_name, past_deadline)? {
+                return Ok(client);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }
 
@@ -289,12 +314,13 @@ impl PipeTransport for WindowsPipeTransport {
         let pipe_name = self.pipe_name.clone();
         let req_owned = req.clone();
         Box::pin(async move {
-            let fut = tokio::task::spawn_blocking(move || {
-                Self::send_blocking(&pipe_name, &req_owned, timeout)
-            });
-            match tokio::time::timeout(timeout, fut).await {
-                Ok(Ok(res)) => res,
-                Ok(Err(join_err)) => Err(PipeClientError::Io(join_err.to_string())),
+            let started = Instant::now();
+            let client = Self::open_named_pipe_client(&pipe_name, timeout).await?;
+            let remaining = timeout
+                .saturating_sub(started.elapsed())
+                .max(Duration::from_millis(50));
+            match tokio::time::timeout(remaining, frame_ipc_exchange(client, &req_owned)).await {
+                Ok(res) => res,
                 Err(_) => Err(PipeClientError::Io(
                     "Hết thời gian chờ phản hồi từ FreetonVPNService.".to_owned(),
                 )),
@@ -311,12 +337,16 @@ pub enum UiCommand {
         two_factor: String,
         pending_session: Option<(String, StoredAuthSession)>,
     },
-    StartScan,
+    StartScan {
+        auth_generation: u64,
+    },
     EnsureWgKey {
+        auth_generation: u64,
         force: bool,
     },
     Connect {
         generation: u64,
+        auth_generation: u64,
         server: ServerNode,
     },
     Disconnect {
@@ -332,6 +362,7 @@ pub enum UiCommand {
         manual: bool,
     },
     ExportConf {
+        auth_generation: u64,
         server: ServerNode,
     },
     SaveClientConfig {
@@ -357,22 +388,31 @@ pub enum WorkerEvent {
         inline_msg: String,
     },
     LoadingProgress {
+        auth_generation: u64,
         text: String,
         progress: f32,
     },
     ScanStatus {
+        auth_generation: u64,
         text: String,
     },
     ScanComplete {
+        auth_generation: u64,
         raw_payload: Option<serde_json::Value>,
         servers: Vec<ServerNode>,
     },
     ScanError {
+        auth_generation: u64,
         friendly_msg: String,
         detail: String,
     },
-    ScanNeedsLogin,
-    ClientConfigUpdated(ClientConfig),
+    ScanNeedsLogin {
+        auth_generation: u64,
+    },
+    WgKeyRefreshed {
+        auth_generation: u64,
+        key: WgKeySnapshot,
+    },
     ConnectProgress {
         generation: u64,
         text: String,
@@ -428,11 +468,34 @@ pub enum WorkerEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WgKeySnapshot {
+    pub private_key: String,
+    pub public_key: String,
+    pub expiration: i64,
+}
+
+impl WgKeySnapshot {
+    pub fn from_config(cfg: &ClientConfig) -> Self {
+        Self {
+            private_key: cfg.private_key.clone(),
+            public_key: cfg.public_key.clone(),
+            expiration: cfg.expiration,
+        }
+    }
+
+    pub fn apply_to(&self, target: &mut ClientConfig) {
+        target.private_key = self.private_key.clone();
+        target.public_key = self.public_key.clone();
+        target.expiration = self.expiration;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ConnectSuccessPayload {
     pub server: ServerNode,
     pub info: ActiveTunnelInfo,
-    pub config: ClientConfig,
+    pub wg_key: Option<WgKeySnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -472,6 +535,7 @@ pub struct AppState {
     pub tunnel_unverified_reason: Option<String>,
     pub status_check_pending: bool,
     pub connection_generation: u64,
+    pub auth_generation: u64,
     pub closing: bool,
     pub exit_ready: bool,
     pub logout_after_disconnect: bool,
@@ -490,6 +554,7 @@ pub struct AppState {
     pub window_visible: bool,
     pub user_has_custom_dragged: bool,
     pub drawer_scroll_to_top: bool,
+    auth_generation_shared: Arc<AtomicU64>,
     last_status_poll: Instant,
     startup_update_checked: bool,
     started_at: Instant,
@@ -520,6 +585,8 @@ impl AppState {
         cached_servers: Vec<ServerNode>,
     ) -> Self {
         let now = Instant::now();
+        let initial_auth_generation = u64::from(is_logged_in);
+        let auth_generation_shared = Arc::new(AtomicU64::new(initial_auth_generation));
         let mut state = Self {
             current_view: if is_logged_in {
                 AppView::Home
@@ -553,6 +620,7 @@ impl AppState {
             tunnel_unverified_reason: None,
             status_check_pending: false,
             connection_generation: 0,
+            auth_generation: initial_auth_generation,
             closing: false,
             exit_ready: false,
             logout_after_disconnect: false,
@@ -571,6 +639,7 @@ impl AppState {
             window_visible: true,
             user_has_custom_dragged: false,
             drawer_scroll_to_top: false,
+            auth_generation_shared,
             last_status_poll: now,
             startup_update_checked: false,
             started_at: now,
@@ -591,15 +660,27 @@ impl AppState {
                 .client_config
                 .needs_key_refresh(freeton_core::api::WG_KEY_REFRESH_WINDOW_SECS)
             {
-                state
-                    .pending_commands
-                    .push(UiCommand::EnsureWgKey { force: false });
+                state.pending_commands.push(UiCommand::EnsureWgKey {
+                    auth_generation: state.auth_generation,
+                    force: false,
+                });
             }
         } else {
             state.hide_loading_with_delay("● Vui lòng đăng nhập để bắt đầu.");
         }
 
         state
+    }
+
+    pub fn auth_generation_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.auth_generation_shared)
+    }
+
+    fn bump_auth_generation(&mut self) -> u64 {
+        self.auth_generation = self.auth_generation.saturating_add(1);
+        self.auth_generation_shared
+            .store(self.auth_generation, Ordering::Release);
+        self.auth_generation
     }
 
     pub fn drain_commands(&mut self) -> Vec<UiCommand> {
@@ -772,7 +853,9 @@ impl AppState {
         }
         self.is_scanning = true;
         self.show_loading_status("● Đang kết nối Proton API & lấy danh sách máy chủ...", 0.1);
-        self.pending_commands.push(UiCommand::StartScan);
+        self.pending_commands.push(UiCommand::StartScan {
+            auth_generation: self.auth_generation,
+        });
     }
 
     pub fn select_and_connect_server(&mut self, server: ServerNode) {
@@ -830,8 +913,11 @@ impl AppState {
         self.selected_server = Some(server.clone());
 
         self.show_loading_status("● [1/4] 🔑 Kiểm tra WireGuard Key & Chứng chỉ...", 0.25);
-        self.pending_commands
-            .push(UiCommand::Connect { generation, server });
+        self.pending_commands.push(UiCommand::Connect {
+            generation,
+            auth_generation: self.auth_generation,
+            server,
+        });
     }
 
     pub fn disconnect_vpn(&mut self) {
@@ -861,7 +947,22 @@ impl AppState {
     }
 
     pub fn request_logout(&mut self, store: &dyn CredentialStore) {
-        if self.is_connecting_vpn || self.closing {
+        if self.active_dialog == ActiveDialog::LogoutConfirm {
+            self.active_dialog = ActiveDialog::None;
+        }
+        if self.closing {
+            return;
+        }
+        if self.is_disconnecting_vpn {
+            self.logout_after_disconnect = true;
+            return;
+        }
+        if self.is_connecting_vpn {
+            self.info_toast = Some(StatusNotice {
+                text: "Đang thiết lập kết nối VPN, vui lòng chờ hoàn tất rồi thử đăng xuất lại."
+                    .to_owned(),
+                level: NoticeLevel::Warning,
+            });
             return;
         }
         if self.tunnel_running {
@@ -871,6 +972,9 @@ impl AppState {
         }
         let _ = store.clear_all_sessions();
         let _ = ServerCacheManager::clear(&ServerCacheManager::default_cache_path());
+        self.bump_auth_generation();
+        self.connection_generation = self.connection_generation.saturating_add(1);
+        self.is_scanning = false;
         self.client_config = store.load_client_config().unwrap_or_default();
         self.all_free_servers.clear();
         self.raw_payload = None;
@@ -910,7 +1014,10 @@ impl AppState {
     }
 
     pub fn export_server_conf(&mut self, server: ServerNode) {
-        self.pending_commands.push(UiCommand::ExportConf { server });
+        self.pending_commands.push(UiCommand::ExportConf {
+            auth_generation: self.auth_generation,
+            server,
+        });
     }
 
     pub fn check_for_updates(&mut self, manual: bool) {
@@ -1069,9 +1176,13 @@ impl AppState {
                 self.srp_status = None;
                 self.pending_srp_account = None;
                 self.pending_srp_session = None;
+                self.is_scanning = false;
+                let auth_gen = self.bump_auth_generation();
                 self.show_home_view();
-                self.pending_commands
-                    .push(UiCommand::EnsureWgKey { force: false });
+                self.pending_commands.push(UiCommand::EnsureWgKey {
+                    auth_generation: auth_gen,
+                    force: false,
+                });
                 self.start_scan();
             }
             WorkerEvent::LoginError {
@@ -1092,21 +1203,37 @@ impl AppState {
                 });
                 self.active_dialog = ActiveDialog::ErrorDetail;
             }
-            WorkerEvent::LoadingProgress { text, progress } => {
-                if !self.is_connecting_vpn && !self.closing {
+            WorkerEvent::LoadingProgress {
+                auth_generation,
+                text,
+                progress,
+            } => {
+                if auth_generation == self.auth_generation
+                    && self.is_logged_in
+                    && !self.is_connecting_vpn
+                    && !self.closing
+                {
                     self.show_loading_status(text, progress);
                 }
             }
-            WorkerEvent::ScanStatus { text } => {
-                if !self.is_connecting_vpn && !self.closing {
+            WorkerEvent::ScanStatus {
+                auth_generation,
+                text,
+            } => {
+                if auth_generation == self.auth_generation
+                    && self.is_logged_in
+                    && !self.is_connecting_vpn
+                    && !self.closing
+                {
                     self.show_loading_status(text, self.loading.progress);
                 }
             }
             WorkerEvent::ScanComplete {
+                auth_generation,
                 raw_payload,
                 servers,
             } => {
-                if self.closing {
+                if auth_generation != self.auth_generation || !self.is_logged_in || self.closing {
                     return;
                 }
                 self.raw_payload = raw_payload;
@@ -1140,9 +1267,13 @@ impl AppState {
                 }
             }
             WorkerEvent::ScanError {
+                auth_generation,
                 friendly_msg,
                 detail,
             } => {
+                if auth_generation != self.auth_generation || !self.is_logged_in || self.closing {
+                    return;
+                }
                 self.is_scanning = false;
                 if !self.is_connecting_vpn {
                     self.hide_loading_with_delay("● Lỗi quét danh sách.");
@@ -1154,7 +1285,10 @@ impl AppState {
                 });
                 self.active_dialog = ActiveDialog::ErrorDetail;
             }
-            WorkerEvent::ScanNeedsLogin => {
+            WorkerEvent::ScanNeedsLogin { auth_generation } => {
+                if auth_generation != self.auth_generation || self.closing {
+                    return;
+                }
                 self.is_scanning = false;
                 if self.is_logged_in {
                     self.hide_loading_with_delay("● Không thể nạp server. Bấm ↻ để thử lại.");
@@ -1164,8 +1298,13 @@ impl AppState {
                     self.show_login_view();
                 }
             }
-            WorkerEvent::ClientConfigUpdated(cfg) => {
-                self.client_config = cfg;
+            WorkerEvent::WgKeyRefreshed {
+                auth_generation,
+                key,
+            } => {
+                if auth_generation == self.auth_generation && self.is_logged_in && !self.closing {
+                    key.apply_to(&mut self.client_config);
+                }
             }
             WorkerEvent::ConnectProgress {
                 generation,
@@ -1180,13 +1319,13 @@ impl AppState {
                 generation,
                 payload,
             } => {
-                if generation != self.connection_generation || self.closing {
+                if generation != self.connection_generation || self.closing || !self.is_logged_in {
                     return;
                 }
                 let ConnectSuccessPayload {
                     server,
                     info,
-                    config,
+                    wg_key,
                 } = *payload;
                 self.is_connecting_vpn = false;
                 self.is_disconnecting_vpn = false;
@@ -1194,7 +1333,9 @@ impl AppState {
                 self.tunnel_verified = true;
                 self.tunnel_unverified_reason = None;
                 self.service_health = ServiceHealthStatus::Healthy;
-                self.client_config = config;
+                if let Some(key) = wg_key {
+                    key.apply_to(&mut self.client_config);
+                }
                 self.connected_server = Some(server.clone());
                 self.vpn_connect_time_unix = Some(info.connected_at_unix);
                 self.hide_loading_with_delay(format!(
@@ -1402,6 +1543,7 @@ impl AppState {
                     self.closing = false;
                     self.is_connecting_vpn = false;
                     self.is_disconnecting_vpn = false;
+                    self.window_visible = true;
                     self.request_status_refresh();
                     self.error_modal = Some(AppErrorInfo {
                         title: "Không thể ngắt VPN để thoát".to_owned(),
@@ -1447,6 +1589,61 @@ impl AppState {
     }
 }
 
+tokio::task_local! {
+    static TASK_AUTH_GENERATION: u64;
+}
+
+/// Wraps a `CredentialStore` for `ProtonClient` so background WireGuard key writes
+/// (`KEYRING_SERVICE_WG` / `KEYRING_ACCOUNT_WG_CONFIG`) fail closed after logout or
+/// superseded `auth_generation`.
+pub struct AuthGuardedStore {
+    inner: Arc<dyn CredentialStore>,
+    auth_generation: Arc<AtomicU64>,
+}
+
+impl AuthGuardedStore {
+    pub fn new(inner: Arc<dyn CredentialStore>, auth_generation: Arc<AtomicU64>) -> Self {
+        Self {
+            inner,
+            auth_generation,
+        }
+    }
+}
+
+impl CredentialStore for AuthGuardedStore {
+    fn get_password(&self, service: &str, username: &str) -> Result<Option<String>, StorageError> {
+        self.inner.get_password(service, username)
+    }
+
+    fn set_password(
+        &self,
+        service: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<(), StorageError> {
+        if service == KEYRING_SERVICE_WG && username == KEYRING_ACCOUNT_WG_CONFIG {
+            let has_session = self.inner.load_auth_session().ok().flatten().is_some();
+            if !has_session {
+                return Err(StorageError::Credential(
+                    "Phiên đăng nhập đã kết thúc; bỏ qua lưu ClientConfig.".to_owned(),
+                ));
+            }
+            if let Ok(expected_gen) = TASK_AUTH_GENERATION.try_with(|&g| g) {
+                if self.auth_generation.load(Ordering::Acquire) != expected_gen {
+                    return Err(StorageError::Credential(
+                        "Phiên đăng nhập đã thay đổi; bỏ qua lưu ClientConfig cũ.".to_owned(),
+                    ));
+                }
+            }
+        }
+        self.inner.set_password(service, username, password)
+    }
+
+    fn delete_password(&self, service: &str, username: &str) -> Result<(), StorageError> {
+        self.inner.delete_password(service, username)
+    }
+}
+
 pub struct WorkerDeps {
     pub store: Arc<dyn CredentialStore>,
     pub proton: Arc<ProtonClient>,
@@ -1454,12 +1651,21 @@ pub struct WorkerDeps {
     pub cache_path: PathBuf,
     pub update_manifest_url: Option<String>,
     pub update_repo: Option<String>,
+    pub auth_generation: Arc<AtomicU64>,
 }
 
 impl WorkerDeps {
     pub fn production() -> Self {
+        Self::production_with_auth(Arc::new(AtomicU64::new(0)))
+    }
+
+    pub fn production_with_auth(auth_generation: Arc<AtomicU64>) -> Self {
         let store: Arc<dyn CredentialStore> = Arc::new(WindowsCredentialStore::new());
-        let proton = Arc::new(ProtonClient::new(Arc::clone(&store)));
+        let guarded: Arc<dyn CredentialStore> = Arc::new(AuthGuardedStore::new(
+            Arc::clone(&store),
+            Arc::clone(&auth_generation),
+        ));
+        let proton = Arc::new(ProtonClient::new(guarded));
         let pipe: Arc<dyn PipeTransport> = Arc::new(WindowsPipeTransport::default());
         Self {
             store,
@@ -1468,7 +1674,13 @@ impl WorkerDeps {
             cache_path: ServerCacheManager::default_cache_path(),
             update_manifest_url: None,
             update_repo: None,
+            auth_generation,
         }
+    }
+
+    pub fn is_auth_current(&self, expected_gen: u64) -> bool {
+        self.auth_generation.load(Ordering::Acquire) == expected_gen
+            && self.store.load_auth_session().ok().flatten().is_some()
     }
 }
 
@@ -1539,15 +1751,40 @@ pub async fn handle_ui_command(
             )
             .await;
         }
-        UiCommand::StartScan => {
-            handle_scan(&deps, tx, wake).await;
+        UiCommand::StartScan { auth_generation } => {
+            handle_scan(&deps, auth_generation, tx, wake).await;
         }
-        UiCommand::EnsureWgKey { force } => match deps.proton.ensure_wg_key(force).await {
-            Ok(cfg) => emit(tx, wake, WorkerEvent::ClientConfigUpdated(cfg)),
-            Err(err) => debug!(error = %err, "background WireGuard key check failed"),
-        },
-        UiCommand::Connect { generation, server } => {
-            handle_connect(&deps, generation, server, tx, wake).await;
+        UiCommand::EnsureWgKey {
+            auth_generation,
+            force,
+        } => {
+            if !deps.is_auth_current(auth_generation) {
+                return;
+            }
+            let res = TASK_AUTH_GENERATION
+                .scope(auth_generation, deps.proton.ensure_wg_key(force))
+                .await;
+            if !deps.is_auth_current(auth_generation) {
+                return;
+            }
+            match res {
+                Ok(cfg) => emit(
+                    tx,
+                    wake,
+                    WorkerEvent::WgKeyRefreshed {
+                        auth_generation,
+                        key: WgKeySnapshot::from_config(&cfg),
+                    },
+                ),
+                Err(err) => debug!(error = %err, "background WireGuard key check failed"),
+            }
+        }
+        UiCommand::Connect {
+            generation,
+            auth_generation,
+            server,
+        } => {
+            handle_connect(&deps, generation, auth_generation, server, tx, wake).await;
         }
         UiCommand::Disconnect { generation } => {
             handle_disconnect(&deps, generation, tx, wake).await;
@@ -1577,8 +1814,11 @@ pub async fn handle_ui_command(
         UiCommand::CheckForUpdates { manual } => {
             handle_check_updates(&deps, manual, tx, wake).await;
         }
-        UiCommand::ExportConf { server } => {
-            handle_export_conf(&deps, server, tx, wake).await;
+        UiCommand::ExportConf {
+            auth_generation,
+            server,
+        } => {
+            handle_export_conf(&deps, auth_generation, server, tx, wake).await;
         }
         UiCommand::SaveClientConfig { config } => {
             if let Err(err) = deps.store.save_client_config(&config) {
@@ -1806,13 +2046,19 @@ fn emit_login_error(
 
 async fn handle_scan(
     deps: &WorkerDeps,
+    auth_generation: u64,
     tx: &mpsc::UnboundedSender<WorkerEvent>,
     wake: &(dyn Fn() + Send + Sync),
 ) {
+    if !deps.is_auth_current(auth_generation) {
+        return;
+    }
+
     emit(
         tx,
         wake,
         WorkerEvent::ScanStatus {
+            auth_generation,
             text: "● Đang đọc phiên đăng nhập SRP...".to_owned(),
         },
     );
@@ -1820,21 +2066,30 @@ async fn handle_scan(
     let (raw_payload, mut servers) = match deps.proton.fetch_logicals_raw().await {
         Ok(res) => res,
         Err(ApiError::NotAuthenticated) => {
-            emit(tx, wake, WorkerEvent::ScanNeedsLogin);
+            if deps.auth_generation.load(Ordering::Acquire) == auth_generation {
+                emit(tx, wake, WorkerEvent::ScanNeedsLogin { auth_generation });
+            }
             return;
         }
         Err(err) => {
-            emit(
-                tx,
-                wake,
-                WorkerEvent::ScanError {
-                    friendly_msg: "Không thể lấy danh sách máy chủ Proton VPN. Vui lòng kiểm tra kết nối mạng và thử lại.".to_owned(),
-                    detail: err.to_string(),
-                },
-            );
+            if deps.is_auth_current(auth_generation) {
+                emit(
+                    tx,
+                    wake,
+                    WorkerEvent::ScanError {
+                        auth_generation,
+                        friendly_msg: "Không thể lấy danh sách máy chủ Proton VPN. Vui lòng kiểm tra kết nối mạng và thử lại.".to_owned(),
+                        detail: err.to_string(),
+                    },
+                );
+            }
             return;
         }
     };
+
+    if !deps.is_auth_current(auth_generation) {
+        return;
+    }
 
     let last_emit = std::sync::Mutex::new(Instant::now() - Duration::from_secs(1));
     ping_servers(
@@ -1842,6 +2097,9 @@ async fn handle_scan(
         DEFAULT_PING_TIMEOUT_MS,
         DEFAULT_PING_WORKERS,
         |cur, total| {
+            if !deps.is_auth_current(auth_generation) {
+                return;
+            }
             let mut guard = last_emit.lock().expect("progress mutex");
             if cur == 0 || cur == total || guard.elapsed() >= Duration::from_millis(100) {
                 *guard = Instant::now();
@@ -1855,6 +2113,7 @@ async fn handle_scan(
                     tx,
                     wake,
                     WorkerEvent::LoadingProgress {
+                        auth_generation,
                         text: format!("● Đang đo ping: {cur}/{total} máy chủ ({pct_int}%)..."),
                         progress: pct,
                     },
@@ -1864,14 +2123,23 @@ async fn handle_scan(
     )
     .await;
 
+    if !deps.is_auth_current(auth_generation) {
+        return;
+    }
+
     if let Err(err) = ServerCacheManager::save(&deps.cache_path, Some(&raw_payload), &servers) {
         debug!(error = %err, "failed saving servers cache");
+    }
+
+    if !deps.is_auth_current(auth_generation) {
+        return;
     }
 
     emit(
         tx,
         wake,
         WorkerEvent::ScanComplete {
+            auth_generation,
             raw_payload: Some(raw_payload),
             servers,
         },
@@ -1881,6 +2149,7 @@ async fn handle_scan(
 async fn handle_connect(
     deps: &WorkerDeps,
     generation: u64,
+    auth_generation: u64,
     server: ServerNode,
     tx: &mpsc::UnboundedSender<WorkerEvent>,
     wake: &(dyn Fn() + Send + Sync),
@@ -1902,6 +2171,7 @@ async fn handle_connect(
         }
     };
 
+    let mut refreshed_key: Option<WgKeySnapshot> = None;
     if !config.has_usable_key(60) {
         emit(
             tx,
@@ -1913,8 +2183,14 @@ async fn handle_connect(
                 progress: 0.25,
             },
         );
-        match deps.proton.ensure_wg_key(false).await {
-            Ok(updated) => config = updated,
+        match TASK_AUTH_GENERATION
+            .scope(auth_generation, deps.proton.ensure_wg_key(false))
+            .await
+        {
+            Ok(updated) => {
+                refreshed_key = Some(WgKeySnapshot::from_config(&updated));
+                config = updated;
+            }
             Err(err) => {
                 emit(
                     tx,
@@ -2039,7 +2315,7 @@ async fn handle_connect(
                     payload: Box::new(ConnectSuccessPayload {
                         server,
                         info,
-                        config,
+                        wg_key: refreshed_key,
                     }),
                 },
             );
@@ -2196,6 +2472,7 @@ async fn handle_check_updates(
 
 async fn handle_export_conf(
     deps: &WorkerDeps,
+    auth_generation: u64,
     server: ServerNode,
     tx: &mpsc::UnboundedSender<WorkerEvent>,
     wake: &(dyn Fn() + Send + Sync),
@@ -2217,10 +2494,27 @@ async fn handle_export_conf(
     };
 
     if !config.has_usable_key(60) {
-        match deps.proton.ensure_wg_key(false).await {
+        if !deps.is_auth_current(auth_generation) {
+            return;
+        }
+        match TASK_AUTH_GENERATION
+            .scope(auth_generation, deps.proton.ensure_wg_key(false))
+            .await
+        {
             Ok(updated) => {
-                config = updated.clone();
-                emit(tx, wake, WorkerEvent::ClientConfigUpdated(updated));
+                if !deps.is_auth_current(auth_generation) {
+                    return;
+                }
+                let key = WgKeySnapshot::from_config(&updated);
+                config = updated;
+                emit(
+                    tx,
+                    wake,
+                    WorkerEvent::WgKeyRefreshed {
+                        auth_generation,
+                        key,
+                    },
+                );
             }
             Err(err) => {
                 emit(
@@ -2477,6 +2771,7 @@ mod tests {
         state.loading.text = "● [3/4] Đang xác minh...".to_owned();
 
         state.apply_event(WorkerEvent::ScanComplete {
+            auth_generation: state.auth_generation,
             raw_payload: None,
             servers: vec![
                 fastest,
@@ -2667,6 +2962,7 @@ mod tests {
             cache_path: std::env::temp_dir().join("freeton_unused_cache.json"),
             update_manifest_url: None,
             update_repo: None,
+            auth_generation: Arc::new(AtomicU64::new(0)),
         });
 
         let mut app = AppState::new(false, None, ClientConfig::default(), None, Vec::new());
@@ -2697,6 +2993,7 @@ mod tests {
             cache_path: std::env::temp_dir().join("freeton_unused_cache.json"),
             update_manifest_url: None,
             update_repo: None,
+            auth_generation: Arc::new(AtomicU64::new(0)),
         });
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         handle_ui_command(unavail_deps, UiCommand::ShutdownOnExit, &tx2, &|| {}).await;
@@ -2783,6 +3080,7 @@ mod tests {
             cache_path: std::env::temp_dir().join("freeton_unused_cache.json"),
             update_manifest_url: None,
             update_repo: None,
+            auth_generation: Arc::new(AtomicU64::new(0)),
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2830,5 +3128,479 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, WorkerEvent::LoginError { .. })));
+    }
+
+    #[test]
+    fn test_logout_closes_confirm_dialog_and_discards_stale_scan_and_key_events() {
+        let store = MockCredentialStore::default();
+        let active = make_server("JP-FREE#1", "JP", "Tokyo", Some(25.0), Some(15.0));
+        let mut state = AppState::new(
+            true,
+            Some("user@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            vec![active.clone()],
+        );
+        let initial_gen = state.auth_generation;
+        assert_eq!(initial_gen, 1);
+        let _ = state.drain_commands();
+
+        // 1. Logout while connected closes LogoutConfirm immediately and sets logout_after_disconnect.
+        state.tunnel_running = true;
+        state.tunnel_verified = true;
+        state.active_dialog = ActiveDialog::LogoutConfirm;
+        state.request_logout(&store);
+        assert_eq!(state.active_dialog, ActiveDialog::None);
+        assert!(state.logout_after_disconnect);
+        assert!(state.is_disconnecting_vpn);
+        let _ = state.drain_commands();
+
+        // 2. Logout clicked while connecting also closes LogoutConfirm cleanly with warning toast.
+        state.logout_after_disconnect = false;
+        state.is_disconnecting_vpn = false;
+        state.is_connecting_vpn = true;
+        state.active_dialog = ActiveDialog::LogoutConfirm;
+        state.request_logout(&store);
+        assert_eq!(state.active_dialog, ActiveDialog::None);
+        assert!(state.info_toast.is_some());
+
+        // 3. Complete idle logout: increments auth_generation and discards stale scan/key events.
+        state.is_connecting_vpn = false;
+        state.tunnel_running = false;
+        state.tunnel_verified = false;
+        state.request_logout(&store);
+        assert!(!state.is_logged_in);
+        assert_eq!(state.auth_generation, 2);
+        assert!(state.all_free_servers.is_empty());
+
+        let stale_server = make_server("SG-FREE#9", "SG", "Singapore", Some(12.0), Some(5.0));
+        state.apply_event(WorkerEvent::ScanStatus {
+            auth_generation: initial_gen,
+            text: "stale".to_owned(),
+        });
+        state.apply_event(WorkerEvent::LoadingProgress {
+            auth_generation: initial_gen,
+            text: "stale".to_owned(),
+            progress: 0.5,
+        });
+        state.apply_event(WorkerEvent::ScanComplete {
+            auth_generation: initial_gen,
+            raw_payload: Some(serde_json::json!({"LogicalServers": []})),
+            servers: vec![stale_server.clone()],
+        });
+        state.apply_event(WorkerEvent::ScanError {
+            auth_generation: initial_gen,
+            friendly_msg: "stale err".to_owned(),
+            detail: "stale detail".to_owned(),
+        });
+        state.apply_event(WorkerEvent::ScanNeedsLogin {
+            auth_generation: initial_gen,
+        });
+        state.apply_event(WorkerEvent::WgKeyRefreshed {
+            auth_generation: initial_gen,
+            key: WgKeySnapshot {
+                private_key: "stale-priv".to_owned(),
+                public_key: "stale-pub".to_owned(),
+                expiration: 1_999_999_999,
+            },
+        });
+        assert!(state.all_free_servers.is_empty());
+        assert_eq!(state.active_dialog, ActiveDialog::None);
+        assert!(state.client_config.private_key.is_empty());
+
+        // 4. Re-login bumps auth_generation again so events from session 1 stay rejected.
+        state.apply_event(WorkerEvent::LoginSuccess {
+            account: "new@proton.me".to_owned(),
+        });
+        assert!(state.is_logged_in);
+        assert_eq!(state.auth_generation, 3);
+        let _ = state.drain_commands();
+
+        state.apply_event(WorkerEvent::ScanComplete {
+            auth_generation: initial_gen,
+            raw_payload: None,
+            servers: vec![stale_server],
+        });
+        assert!(state.all_free_servers.is_empty());
+
+        let fresh_server = make_server("JP-FREE#2", "JP", "Tokyo", Some(18.0), Some(8.0));
+        state.apply_event(WorkerEvent::ScanComplete {
+            auth_generation: 3,
+            raw_payload: None,
+            servers: vec![fresh_server],
+        });
+        assert_eq!(state.all_free_servers.len(), 1);
+        assert_eq!(state.all_free_servers[0].name, "JP-FREE#2");
+    }
+
+    #[tokio::test]
+    async fn test_post_logout_scan_and_key_workers_do_not_write_cache_or_client_config() {
+        let store = Arc::new(MockCredentialStore::default());
+        let session = StoredAuthSession {
+            uid: "uid-test".to_owned(),
+            access_token: "acc-test".to_owned(),
+            refresh_token: "ref-test".to_owned(),
+            scopes: vec!["full".to_owned()],
+        };
+        store
+            .save_auth_session("user@proton.me", &session)
+            .expect("seed auth session");
+
+        let auth_gen = Arc::new(AtomicU64::new(1));
+        let guarded_store: Arc<dyn CredentialStore> = Arc::new(AuthGuardedStore::new(
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
+            Arc::clone(&auth_gen),
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let logicals_entered = Arc::new(tokio::sync::Notify::new());
+        let logicals_release = Arc::new(tokio::sync::Notify::new());
+        let cert_entered = Arc::new(tokio::sync::Notify::new());
+        let cert_release = Arc::new(tokio::sync::Notify::new());
+
+        let l_ent = Arc::clone(&logicals_entered);
+        let l_rel = Arc::clone(&logicals_release);
+        let c_ent = Arc::clone(&cert_entered);
+        let c_rel = Arc::clone(&cert_release);
+
+        tokio::spawn(async move {
+            let pem = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f\n-----END PRIVATE KEY-----\n";
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let l_ent = Arc::clone(&l_ent);
+                let l_rel = Arc::clone(&l_rel);
+                let c_ent = Arc::clone(&c_ent);
+                let c_rel = Arc::clone(&c_rel);
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = socket.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        raw.extend_from_slice(&buf[..n]);
+                        if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&raw);
+                    let first_line = req.lines().next().unwrap_or("");
+                    let body = if first_line.starts_with("GET /vpn/v1/logicals") {
+                        l_ent.notify_one();
+                        l_rel.notified().await;
+                        r#"{"Code":1000,"LogicalServers":[]}"#.to_owned()
+                    } else if first_line.starts_with("GET /vpn/v1/certificate/key/EC") {
+                        serde_json::json!({
+                            "Code": 1000,
+                            "PrivateKey": pem,
+                            "PublicKey": "PUB-PEM"
+                        })
+                        .to_string()
+                    } else if first_line.starts_with("POST /vpn/v1/certificate") {
+                        c_ent.notify_one();
+                        c_rel.notified().await;
+                        r#"{"Code":1000,"ExpirationTime":2000000000}"#.to_owned()
+                    } else {
+                        r#"{"Code":1000}"#.to_owned()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let proton = Arc::new(ProtonClient::with_endpoints(
+            guarded_store,
+            base.clone(),
+            vec![base.clone()],
+            base,
+        ));
+        let cache_path = std::env::temp_dir().join(format!(
+            "freeton_post_logout_scan_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&cache_path);
+
+        let deps = Arc::new(WorkerDeps {
+            store: Arc::clone(&store) as Arc<dyn CredentialStore>,
+            proton,
+            pipe: Arc::new(MockPipeTransport::ok(ServiceResponse::Ok)),
+            cache_path: cache_path.clone(),
+            update_manifest_url: None,
+            update_repo: None,
+            auth_generation: Arc::clone(&auth_gen),
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // 1. Start scan in-flight at auth_generation 1, then log out before HTTP responds.
+        let deps_scan = Arc::clone(&deps);
+        let tx_scan = tx.clone();
+        let scan_task = tokio::spawn(async move {
+            handle_ui_command(
+                deps_scan,
+                UiCommand::StartScan { auth_generation: 1 },
+                &tx_scan,
+                &|| {},
+            )
+            .await;
+        });
+        tokio::time::timeout(Duration::from_secs(3), logicals_entered.notified())
+            .await
+            .expect("scan worker should reach local HTTP endpoint");
+        store.clear_all_sessions().expect("clear sessions");
+        let _ = std::fs::remove_file(&cache_path);
+        auth_gen.store(2, Ordering::Release);
+        logicals_release.notify_one();
+        scan_task.await.expect("scan task");
+
+        assert!(
+            !cache_path.exists(),
+            "servers_cache.json must not be created after logout"
+        );
+        while let Ok(ev) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    ev,
+                    WorkerEvent::ScanComplete { .. } | WorkerEvent::ScanError { .. }
+                ),
+                "stale scan event leaked after logout: {ev:?}"
+            );
+        }
+
+        // 2. Re-login with session 2, start EnsureWgKey at auth_generation 2, then log out mid-flight.
+        store
+            .save_auth_session("user@proton.me", &session)
+            .expect("re-seed auth session");
+        let deps_key = Arc::clone(&deps);
+        let tx_key = tx.clone();
+        let key_task = tokio::spawn(async move {
+            handle_ui_command(
+                deps_key,
+                UiCommand::EnsureWgKey {
+                    auth_generation: 2,
+                    force: true,
+                },
+                &tx_key,
+                &|| {},
+            )
+            .await;
+        });
+        tokio::time::timeout(Duration::from_secs(3), cert_entered.notified())
+            .await
+            .expect("ensure_wg_key worker should reach local HTTP endpoint");
+        store.clear_all_sessions().expect("clear sessions 2");
+        auth_gen.store(3, Ordering::Release);
+        cert_release.notify_one();
+        key_task.await.expect("key task");
+
+        let saved_cfg = store
+            .get_password(KEYRING_SERVICE_WG, KEYRING_ACCOUNT_WG_CONFIG)
+            .expect("read mock cred");
+        assert!(
+            saved_cfg.is_none(),
+            "ClientConfig must not be persisted to CredentialStore after logout"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no WgKeyRefreshed event expected after logout"
+        );
+    }
+
+    #[test]
+    fn test_exit_ready_error_reveals_hidden_window() {
+        let mut state = AppState::new(false, None, ClientConfig::default(), None, Vec::new());
+        let _ = state.drain_commands();
+        state.window_visible = false;
+        state.closing = true;
+
+        state.apply_event(WorkerEvent::ExitReady {
+            error: Some("pipe teardown failed".to_owned()),
+        });
+
+        assert!(state.window_visible);
+        assert!(!state.closing);
+        assert_eq!(state.active_dialog, ActiveDialog::ErrorDetail);
+        assert!(state.error_modal.is_some());
+    }
+
+    #[test]
+    fn test_connect_succeeded_preserves_post_start_client_config_settings() {
+        let srv = make_server("JP-FREE#1", "JP", "Tokyo", Some(25.0), Some(15.0));
+        let initial_cfg = ClientConfig {
+            private_key: "old-priv".to_owned(),
+            public_key: "old-pub".to_owned(),
+            expiration: 100,
+            animations_enabled: true,
+            auto_check_update: true,
+            debug_mode: false,
+            ..ClientConfig::default()
+        };
+        let mut state = AppState::new(
+            true,
+            Some("user@proton.me".to_owned()),
+            initial_cfg,
+            None,
+            vec![srv.clone()],
+        );
+        let _ = state.drain_commands();
+
+        state.connect_to_server(srv.clone());
+        let gen = state.connection_generation;
+
+        // Simulate user modifying preferences while WireGuard connection is being established.
+        let mut updated_prefs = state.client_config.clone();
+        updated_prefs.animations_enabled = false;
+        updated_prefs.auto_check_update = false;
+        updated_prefs.debug_mode = true;
+        updated_prefs.dns = "1.1.1.1".to_owned();
+        state.save_client_config(updated_prefs);
+
+        state.apply_event(WorkerEvent::ConnectSucceeded {
+            generation: gen,
+            payload: Box::new(ConnectSuccessPayload {
+                server: srv,
+                info: ActiveTunnelInfo {
+                    server_name: "JP-FREE#1".to_owned(),
+                    country: "JP".to_owned(),
+                    entry_ip: "198.51.100.10".to_owned(),
+                    x25519_pubkey: "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=".to_owned(),
+                    address: DEFAULT_WG_ADDRESS.to_owned(),
+                    dns: DEFAULT_WG_DNS.to_owned(),
+                    port: 51820,
+                    connected_at_unix: 1_700_000_500,
+                },
+                wg_key: Some(WgKeySnapshot {
+                    private_key: "new-priv".to_owned(),
+                    public_key: "new-pub".to_owned(),
+                    expiration: 1_900_000_000,
+                }),
+            }),
+        });
+
+        assert_eq!(state.client_config.private_key, "new-priv");
+        assert_eq!(state.client_config.public_key, "new-pub");
+        assert_eq!(state.client_config.expiration, 1_900_000_000);
+        assert!(!state.client_config.animations_enabled);
+        assert!(!state.client_config.auto_check_update);
+        assert!(state.client_config.debug_mode);
+        assert_eq!(state.client_config.dns, "1.1.1.1");
+    }
+
+    #[tokio::test]
+    async fn test_windows_pipe_transport_reuses_frame_ipc_exchange_bounds_and_maps_pipe_busy() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+        let pid = std::process::id();
+
+        // 1. Successful roundtrip over a real Windows named pipe via CreateFileW + frame_ipc_exchange.
+        let ok_pipe = format!(r"\\.\pipe\freeton_app_ok_{pid}");
+        let mut ok_server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&ok_pipe)
+            .expect("create ok server");
+        let ok_task = tokio::spawn(async move {
+            ok_server.connect().await.expect("accept ok");
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 256];
+            loop {
+                let n = ok_server.read(&mut buf).await.expect("read ok");
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if raw.contains(&b'\n') {
+                    break;
+                }
+            }
+            let resp = ServiceResponse::Status(TunnelHealthState::Disconnected);
+            let mut line = serde_json::to_string(&resp).expect("ser");
+            line.push('\n');
+            ok_server
+                .write_all(line.as_bytes())
+                .await
+                .expect("write ok");
+            ok_server.flush().await.expect("flush ok");
+        });
+        let transport_ok = WindowsPipeTransport::new(&ok_pipe);
+        let res = transport_ok
+            .send_request(&ServiceRequest::Status, Duration::from_secs(2))
+            .await
+            .expect("pipe roundtrip succeeds");
+        assert_eq!(
+            res,
+            ServiceResponse::Status(TunnelHealthState::Disconnected)
+        );
+        ok_task.await.expect("ok server task");
+
+        // 2. Oversized response (> MAX_IPC_RESPONSE_BYTES) fails with Protocol bound error.
+        let big_pipe = format!(r"\\.\pipe\freeton_app_big_{pid}");
+        let mut big_server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&big_pipe)
+            .expect("create big server");
+        let big_task = tokio::spawn(async move {
+            big_server.connect().await.expect("accept big");
+            let mut buf = [0u8; 256];
+            let _ = big_server.read(&mut buf).await;
+            let oversized = vec![b'x'; MAX_IPC_RESPONSE_BYTES + 128];
+            let _ = big_server.write_all(&oversized).await;
+            let _ = big_server.write_all(b"\n").await;
+        });
+        let transport_big = WindowsPipeTransport::new(&big_pipe);
+        let err_big = transport_big
+            .send_request(&ServiceRequest::Status, Duration::from_secs(2))
+            .await
+            .expect_err("oversized response must be rejected");
+        assert!(matches!(err_big, PipeClientError::Protocol(_)));
+        let _ = big_task.await;
+
+        // 3. Persistent ERROR_PIPE_BUSY past deadline maps to PipeClientError::Unavailable.
+        let busy_pipe = format!(r"\\.\pipe\freeton_app_busy_{pid}");
+        let _busy_server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .max_instances(1)
+            .create(&busy_pipe)
+            .expect("create busy server");
+        let _held_client = ClientOptions::new()
+            .open(&busy_pipe)
+            .expect("occupy single pipe instance");
+        let transport_busy = WindowsPipeTransport::new(&busy_pipe);
+        let err_busy = transport_busy
+            .send_request(&ServiceRequest::Status, Duration::from_millis(120))
+            .await
+            .expect_err("persistent busy must error");
+        assert!(
+            matches!(err_busy, PipeClientError::Unavailable(_)),
+            "expected Unavailable for persistent ERROR_PIPE_BUSY, got {err_busy:?}"
+        );
+
+        // 4. Stalled server response cancels cleanly under async tokio::time::timeout.
+        let stall_pipe = format!(r"\\.\pipe\freeton_app_stall_{pid}");
+        let stall_server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&stall_pipe)
+            .expect("create stall server");
+        let _stall_task = tokio::spawn(async move {
+            if stall_server.connect().await.is_ok() {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        let transport_stall = WindowsPipeTransport::new(&stall_pipe);
+        let err_stall = transport_stall
+            .send_request(&ServiceRequest::Status, Duration::from_millis(120))
+            .await
+            .expect_err("stalled pipe must timeout cleanly");
+        assert!(matches!(err_stall, PipeClientError::Io(_)));
     }
 }

@@ -26,7 +26,9 @@ const SORT_OPTIONS: &[(&str, SortMode)] = &[
     ("🔤 A-Z", SortMode::Name),
 ];
 
-const SERVER_ROW_HEIGHT: f32 = 58.0;
+pub const SERVER_ROW_HEIGHT: f32 = 54.0;
+pub const SERVER_ROW_SPACING: f32 = 4.0;
+pub const SERVER_ROW_STRIDE: f32 = SERVER_ROW_HEIGHT + SERVER_ROW_SPACING;
 
 pub fn render_drawer_view(ui: &mut Ui, state: &mut AppState) {
     // Header with Back & Title
@@ -289,28 +291,31 @@ pub fn render_drawer_view(ui: &mut Ui, state: &mut AppState) {
     );
     ui.add_space(4.0);
 
-    let mut scroll = ScrollArea::vertical()
-        .id_salt("drawer_server_scroll")
-        .auto_shrink([false, false]);
-    if state.drawer_scroll_to_top {
-        scroll = scroll.vertical_scroll_offset(0.0);
-        state.drawer_scroll_to_top = false;
-    }
-
-    scroll.show_rows(ui, SERVER_ROW_HEIGHT, filtered.len(), |ui, row_range| {
-        for idx in row_range {
-            let srv = &filtered[idx];
-            let is_selected = selected_name.as_deref() == Some(srv.name.as_str());
-            let is_connected = connected_name.as_deref() == Some(srv.name.as_str());
-            let (connect, export) =
-                render_server_row(ui, srv, false, is_selected, is_connected, debug_mode);
-            if connect {
-                action_connect = Some(srv.clone());
-            }
-            if export {
-                action_export = Some(srv.clone());
-            }
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = SERVER_ROW_SPACING;
+        let mut scroll = ScrollArea::vertical()
+            .id_salt("drawer_server_scroll")
+            .auto_shrink([false, false]);
+        if state.drawer_scroll_to_top {
+            scroll = scroll.vertical_scroll_offset(0.0);
+            state.drawer_scroll_to_top = false;
         }
+
+        scroll.show_rows(ui, SERVER_ROW_HEIGHT, filtered.len(), |ui, row_range| {
+            for idx in row_range {
+                let srv = &filtered[idx];
+                let is_selected = selected_name.as_deref() == Some(srv.name.as_str());
+                let is_connected = connected_name.as_deref() == Some(srv.name.as_str());
+                let (connect, export) =
+                    render_server_row(ui, srv, false, is_selected, is_connected, debug_mode);
+                if connect {
+                    action_connect = Some(srv.clone());
+                }
+                if export {
+                    action_export = Some(srv.clone());
+                }
+            }
+        });
     });
 
     if let Some(server) = action_export {
@@ -328,11 +333,7 @@ fn render_server_row(
     is_connected: bool,
     debug_mode: bool,
 ) -> (bool, bool) {
-    let row_h = if is_best {
-        74.0
-    } else {
-        SERVER_ROW_HEIGHT - 4.0
-    };
+    let row_h = if is_best { 74.0 } else { SERVER_ROW_HEIGHT };
     let width = ui.available_width().max(60.0);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
     let response = response.on_hover_cursor(CursorIcon::PointingHand);
@@ -434,4 +435,72 @@ fn render_server_row(
 
     let row_clicked = response.clicked() && !export_clicked;
     (row_clicked, export_clicked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_drawer_row_height_matches_show_rows_stride() {
+        assert_eq!(SERVER_ROW_STRIDE, SERVER_ROW_HEIGHT + SERVER_ROW_SPACING);
+
+        let total_rows = 24usize;
+        let ctx = egui::Context::default();
+        let mut raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(360.0, 260.0),
+            )),
+            ..Default::default()
+        };
+        let mut observed_tops = Vec::new();
+        let mut observed_heights = Vec::new();
+        let mut content_height = 0.0_f32;
+
+        // Run a couple frames so ScrollArea computes steady-state viewport and content height.
+        for _ in 0..2 {
+            observed_tops.clear();
+            observed_heights.clear();
+            let mut full_output = ctx.run_ui(raw_input.take(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.y = SERVER_ROW_SPACING;
+                        let out = ScrollArea::vertical()
+                            .id_salt("drawer_stride_test_scroll")
+                            .auto_shrink([false, false])
+                            .show_rows(ui, SERVER_ROW_HEIGHT, total_rows, |ui, range| {
+                                for _ in range {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        Vec2::new(ui.available_width(), SERVER_ROW_HEIGHT),
+                                        Sense::hover(),
+                                    );
+                                    observed_tops.push(rect.top());
+                                    observed_heights.push(rect.height());
+                                }
+                            });
+                        content_height = out.content_size.y;
+                    });
+                });
+            });
+            full_output.textures_delta.clear();
+        }
+
+        let expected_total_h = SERVER_ROW_STRIDE * total_rows as f32 - SERVER_ROW_SPACING;
+        assert!(
+            (content_height - expected_total_h).abs() < 0.01,
+            "content height {content_height} drifted from {expected_total_h}"
+        );
+        assert!(observed_heights.len() >= 2);
+        for h in &observed_heights {
+            assert!((*h - SERVER_ROW_HEIGHT).abs() < 0.01);
+        }
+        for pair in observed_tops.windows(2) {
+            let stride = pair[1] - pair[0];
+            assert!(
+                (stride - SERVER_ROW_STRIDE).abs() < 0.01,
+                "row stride {stride} drifted from {SERVER_ROW_STRIDE}"
+            );
+        }
+    }
 }
