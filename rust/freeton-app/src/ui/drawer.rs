@@ -33,6 +33,7 @@ pub const SERVER_ROW_STRIDE: f32 = SERVER_ROW_HEIGHT + SERVER_ROW_SPACING;
 pub fn render_drawer_view(ui: &mut Ui, state: &mut AppState) {
     // Header with Back & Title
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
         let back_style = PillStyle {
             fg: C_ACCENT,
             hover_fg: C_ACCENT_HOVER,
@@ -44,14 +45,19 @@ pub fn render_drawer_view(ui: &mut Ui, state: &mut AppState) {
         if pill_button(ui, "‹ Quay lại", Some(78.0), back_style).clicked() {
             state.show_home_view();
         }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new("Danh Sách Máy Chủ")
-                    .size(14.0)
-                    .strong()
-                    .color(C_TEXT),
-            );
-        });
+        let rem_w = ui.available_width().max(60.0);
+        ui.allocate_ui_with_layout(
+            Vec2::new(rem_w, 26.0),
+            Layout::right_to_left(Align::Center),
+            |ui| {
+                ui.label(
+                    RichText::new("Danh Sách Máy Chủ")
+                        .size(14.0)
+                        .strong()
+                        .color(C_TEXT),
+                );
+            },
+        );
     });
 
     ui.add_space(6.0);
@@ -107,15 +113,15 @@ pub fn render_drawer_view(ui: &mut Ui, state: &mut AppState) {
     };
 
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
         ui.label(
             RichText::new("Quốc gia:")
                 .size(11.5)
                 .strong()
                 .color(C_TEXT_MUTED),
         );
-        ui.add_space(4.0);
         ComboBox::from_id_salt("drawer_country_dropdown")
-            .width(ui.available_width())
+            .width(ui.available_width().max(120.0))
             .selected_text(RichText::new(&current_label).size(11.5).color(C_TEXT))
             .show_ui(ui, |ui| {
                 let all_lbl = format!("Tất cả quốc gia ({total_count} máy chủ)");
@@ -142,10 +148,11 @@ pub fn render_drawer_view(ui: &mut Ui, state: &mut AppState) {
     // 3. Quick Popular Country Filter Pills
     ui.horizontal(|ui| {
         let gap = 4.0;
+        ui.spacing_mut().item_spacing.x = gap;
         let total_w = ui.available_width();
         let pill_w =
-            ((total_w - gap * (QUICK_PILLS.len() - 1) as f32) / QUICK_PILLS.len() as f32).max(52.0);
-        for (idx, &(label, code)) in QUICK_PILLS.iter().enumerate() {
+            ((total_w - gap * (QUICK_PILLS.len() - 1) as f32) / QUICK_PILLS.len() as f32).max(40.0);
+        for &(label, code) in QUICK_PILLS {
             let is_active = state.selected_country_code.as_deref() == code;
             let style = if is_active {
                 PillStyle {
@@ -180,9 +187,6 @@ pub fn render_drawer_view(ui: &mut Ui, state: &mut AppState) {
                 state.selected_country_code = code.map(str::to_owned);
                 state.drawer_scroll_to_top = true;
             }
-            if idx + 1 < QUICK_PILLS.len() {
-                ui.add_space(gap);
-            }
         }
     });
 
@@ -190,19 +194,19 @@ pub fn render_drawer_view(ui: &mut Ui, state: &mut AppState) {
 
     // 4. Sort Bar
     ui.horizontal(|ui| {
+        let gap = 3.0;
+        ui.spacing_mut().item_spacing.x = gap;
         ui.label(
             RichText::new("Sắp xếp:")
                 .size(10.5)
                 .strong()
                 .color(C_TEXT_DIM),
         );
-        ui.add_space(4.0);
-        let gap = 3.0;
         let avail_w = ui.available_width();
         let chip_w = ((avail_w - gap * (SORT_OPTIONS.len() - 1) as f32)
             / SORT_OPTIONS.len() as f32)
-            .max(54.0);
-        for (idx, &(label, mode)) in SORT_OPTIONS.iter().enumerate() {
+            .max(40.0);
+        for &(label, mode) in SORT_OPTIONS {
             let is_active = state.sort_mode == mode;
             let style = if is_active {
                 PillStyle {
@@ -236,9 +240,6 @@ pub fn render_drawer_view(ui: &mut Ui, state: &mut AppState) {
             if pill_button(ui, label, Some(chip_w), style).clicked() {
                 state.sort_mode = mode;
                 state.drawer_scroll_to_top = true;
-            }
-            if idx + 1 < SORT_OPTIONS.len() {
-                ui.add_space(gap);
             }
         }
     });
@@ -334,7 +335,12 @@ fn render_server_row(
     debug_mode: bool,
 ) -> (bool, bool) {
     let row_h = if is_best { 74.0 } else { SERVER_ROW_HEIGHT };
-    let width = ui.available_width().max(60.0);
+    // Inside ScrollArea, leave a small gap for the floating scrollbar when not the top best card.
+    let width = if is_best {
+        ui.available_width().max(60.0)
+    } else {
+        (ui.available_width() - 6.0).max(60.0)
+    };
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
     let response = response.on_hover_cursor(CursorIcon::PointingHand);
 
@@ -502,5 +508,208 @@ mod tests {
                 "row stride {stride} drifted from {SERVER_ROW_STRIDE}"
             );
         }
+    }
+
+    #[test]
+    fn test_drawer_login_srp_fit_within_390x610_horizontal_and_vertical_bounds() {
+        use crate::state::AppView;
+        use freeton_core::storage::{ClientConfig, CredentialStore, StorageError};
+
+        struct NoopStore;
+        impl CredentialStore for NoopStore {
+            fn get_password(&self, _: &str, _: &str) -> Result<Option<String>, StorageError> {
+                Ok(None)
+            }
+            fn set_password(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+            fn delete_password(&self, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+        }
+
+        fn measure_view(mut state: AppState, label: &str) {
+            let ctx = egui::Context::default();
+            let store = NoopStore;
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(crate::ui::WINDOW_WIDTH, crate::ui::WINDOW_HEIGHT),
+                )),
+                ..Default::default()
+            };
+            // Two frames allow ScrollArea to settle viewport and scrollbar geometry.
+            let mut out = ctx.run_ui(raw_input.clone(), |ui| {
+                crate::ui::render_root(ui, &mut state, &store);
+            });
+            out.textures_delta.clear();
+            let mut out = ctx.run_ui(raw_input, |ui| {
+                crate::ui::render_root(ui, &mut state, &store);
+            });
+            out.textures_delta.clear();
+
+            let mut max_right = 0.0f32;
+            let mut max_bottom = 0.0f32;
+            let mut text = String::new();
+            let mut offenders = Vec::new();
+            let panel_inner_right = crate::ui::WINDOW_WIDTH - 14.0;
+            let panel_inner_bottom = crate::ui::WINDOW_HEIGHT - 12.0;
+            fn visit(
+                shape: &egui::epaint::Shape,
+                max_right: &mut f32,
+                max_bottom: &mut f32,
+                text: &mut String,
+                offenders: &mut Vec<String>,
+                panel_inner_right: f32,
+                panel_inner_bottom: f32,
+            ) {
+                match shape {
+                    egui::epaint::Shape::Text(t) => {
+                        let rect = t.galley.rect.translate(t.pos.to_vec2());
+                        *max_right = max_right.max(rect.max.x);
+                        *max_bottom = max_bottom.max(rect.max.y);
+                        if rect.max.x > panel_inner_right + 0.5
+                            || rect.max.y > panel_inner_bottom + 0.5
+                        {
+                            offenders.push(format!(
+                                "Text({:?}, x={:.1}..{:.1}, y={:.1}..{:.1})",
+                                t.galley.text(),
+                                rect.min.x,
+                                rect.max.x,
+                                rect.min.y,
+                                rect.max.y
+                            ));
+                        }
+                        text.push_str(t.galley.text());
+                        text.push('\n');
+                    }
+                    egui::epaint::Shape::Rect(r) => {
+                        if r.rect.width() < crate::ui::WINDOW_WIDTH - 2.0 {
+                            *max_right = max_right.max(r.rect.max.x);
+                            if r.rect.max.x > panel_inner_right + 0.5 {
+                                offenders.push(format!("Rect({:?})", r.rect));
+                            }
+                        }
+                        if r.rect.height() < crate::ui::WINDOW_HEIGHT - 2.0 {
+                            *max_bottom = max_bottom.max(r.rect.max.y);
+                            if r.rect.max.y > panel_inner_bottom + 0.5 {
+                                offenders.push(format!("RectY({:?})", r.rect));
+                            }
+                        }
+                    }
+                    egui::epaint::Shape::Vec(items) => {
+                        for item in items {
+                            visit(
+                                item,
+                                max_right,
+                                max_bottom,
+                                text,
+                                offenders,
+                                panel_inner_right,
+                                panel_inner_bottom,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for clipped in &out.shapes {
+                let is_scroll_row = clipped.clip_rect.max.y < panel_inner_bottom
+                    && clipped.clip_rect.min.y > 200.0
+                    && matches!(
+                        &clipped.shape,
+                        egui::epaint::Shape::Rect(_)
+                            | egui::epaint::Shape::Text(_)
+                            | egui::epaint::Shape::Vec(_)
+                    );
+                if is_scroll_row {
+                    // Only enforce horizontal bounds for scrolled rows inside the ScrollArea viewport.
+                    let mut dummy_bottom = 0.0f32;
+                    visit(
+                        &clipped.shape,
+                        &mut max_right,
+                        &mut dummy_bottom,
+                        &mut text,
+                        &mut offenders,
+                        panel_inner_right,
+                        f32::INFINITY,
+                    );
+                } else {
+                    visit(
+                        &clipped.shape,
+                        &mut max_right,
+                        &mut max_bottom,
+                        &mut text,
+                        &mut offenders,
+                        panel_inner_right,
+                        panel_inner_bottom,
+                    );
+                }
+            }
+
+            assert!(
+                max_right <= panel_inner_right + 0.5,
+                "{label}: right edge {max_right:.1} overflows inner right {panel_inner_right:.1}; offenders: {offenders:?}"
+            );
+            assert!(
+                max_bottom <= panel_inner_bottom + 0.5,
+                "{label}: bottom edge {max_bottom:.1} overflows inner bottom {panel_inner_bottom:.1}; offenders: {offenders:?}"
+            );
+            if matches!(state.current_view, AppView::Drawer) {
+                assert!(
+                    text.contains("Hà Lan"),
+                    "Drawer missing 'Hà Lan' pill: {text}"
+                );
+                assert!(
+                    text.contains("A-Z"),
+                    "Drawer missing 'A-Z' sort chip: {text}"
+                );
+                assert!(
+                    text.contains("Kết nối ngay"),
+                    "Drawer missing 'Kết nối ngay' label: {text}"
+                );
+            }
+        }
+
+        let servers: Vec<ServerNode> = (1..=30)
+            .map(|i| ServerNode {
+                name: format!("SG-FREE#{i}"),
+                country: "SG".to_owned(),
+                city: "Singapore".to_owned(),
+                domain: format!("node-{i}.protonvpn.net"),
+                entry_ip: format!("149.40.50.{i}"),
+                ping_target: format!("149.40.50.{i}"),
+                x25519_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+                load: Some(65.0),
+                ping_ms: Some(50.0 + i as f64),
+                ..ServerNode::default()
+            })
+            .collect();
+
+        let cfg = ClientConfig {
+            debug_mode: true,
+            ..Default::default()
+        };
+
+        let mut drawer_state = AppState::new(
+            true,
+            Some("pishun@duck.com".to_owned()),
+            cfg.clone(),
+            None,
+            servers.clone(),
+        );
+        drawer_state.current_view = AppView::Drawer;
+        drawer_state.window_visible = true;
+        measure_view(drawer_state, "drawer view");
+
+        let mut login_state = AppState::new(false, None, cfg.clone(), None, Vec::new());
+        login_state.current_view = AppView::Login;
+        login_state.window_visible = true;
+        measure_view(login_state, "login view");
+
+        let mut srp_state = AppState::new(false, None, cfg, None, Vec::new());
+        srp_state.current_view = AppView::Srp;
+        srp_state.window_visible = true;
+        measure_view(srp_state, "srp view");
     }
 }

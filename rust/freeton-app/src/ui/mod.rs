@@ -324,8 +324,24 @@ pub fn render_root(ui: &mut Ui, state: &mut AppState, store: &dyn CredentialStor
                     NoticeLevel::Info => C_ACCENT,
                 };
                 rounded_card(ui, C_SURFACE, color, 8, Margin::symmetric(8, 5), |ui| {
+                    ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(&toast.text).size(11.0).color(color));
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let close_w = 18.0;
+                        let text_w = (ui.available_width() - close_w - 6.0).max(80.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(text_w, 0.0),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.set_width(text_w);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&toast.text).size(11.0).color(color),
+                                    )
+                                    .wrap(),
+                                );
+                            },
+                        );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui
                                 .add(
