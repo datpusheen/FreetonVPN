@@ -112,7 +112,7 @@ fn validate_metadata_text(field: &str, value: &str) -> Result<String, WgError> {
     Ok(value.trim().to_owned())
 }
 
-fn validate_wg_key(field: &str, raw: &str) -> Result<String, WgError> {
+pub fn validate_wg_key(field: &str, raw: &str) -> Result<String, WgError> {
     reject_control_chars(field, raw)?;
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
@@ -156,7 +156,7 @@ fn parse_cidr_ip(token: &str) -> Option<(IpAddr, Option<u8>)> {
     }
 }
 
-fn validate_address_list(raw: &str) -> Result<String, WgError> {
+pub fn validate_address_list(raw: &str) -> Result<String, WgError> {
     reject_control_chars("address", raw)?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -180,7 +180,7 @@ fn validate_address_list(raw: &str) -> Result<String, WgError> {
     Ok(normalized.join(", "))
 }
 
-fn validate_dns_list(raw: &str) -> Result<String, WgError> {
+pub fn validate_dns_list(raw: &str) -> Result<String, WgError> {
     reject_control_chars("dns", raw)?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -206,7 +206,7 @@ fn validate_dns_list(raw: &str) -> Result<String, WgError> {
     Ok(normalized.join(", "))
 }
 
-fn validate_port_str(raw: &str) -> Result<u16, WgError> {
+pub fn validate_port_str(raw: &str) -> Result<u16, WgError> {
     reject_control_chars("port", raw)?;
     let trimmed = raw.trim();
     if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {

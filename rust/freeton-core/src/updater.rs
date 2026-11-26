@@ -515,6 +515,15 @@ fn sanitize_installer_filename(url: &Url) -> String {
     }
 }
 
+/// Returns the deterministic `.part` temporary filename used by `download_and_verify_update`
+/// for `download_url`.
+pub fn expected_part_filename(download_url: &str) -> String {
+    let filename = Url::parse(download_url.trim())
+        .map(|u| sanitize_installer_filename(&u))
+        .unwrap_or_else(|_| INSTALLER_ASSET_NAME.to_owned());
+    format!("{filename}.part")
+}
+
 /// Fetches update metadata from `version-rust.json` first, falling back to the GitHub Releases
 /// API (and fetching any companion `.sha256` release asset) if the primary manifest fails.
 pub async fn fetch_update_info(

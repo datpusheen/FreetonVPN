@@ -18,10 +18,12 @@ use freeton_core::storage::{
     KEYRING_ACCOUNT_WG_CONFIG, KEYRING_SERVICE_WG,
 };
 use freeton_core::updater::{
-    download_and_verify_update, fetch_update_info, is_newer_version, UpdateAction, UpdateInfo,
+    download_and_verify_update, expected_part_filename, fetch_update_info, is_newer_version,
+    UpdateAction, UpdateError, UpdateInfo,
 };
 use freeton_core::wg::{
-    validate_and_build_conf, ActiveTunnelInfo, ServiceRequest, ServiceResponse, TunnelHealthState,
+    validate_address_list, validate_and_build_conf, validate_dns_list, validate_port_str,
+    validate_wg_key, ActiveTunnelInfo, ServiceRequest, ServiceResponse, TunnelHealthState,
     DEFAULT_TUNNEL_NAME, SERVICE_PIPE_NAME,
 };
 use freeton_core::{APP_NAME, APP_VERSION};
@@ -881,6 +883,7 @@ pub struct AppState {
     pub return_dialog: Option<ActiveDialog>,
     pub info_toast: Option<StatusNotice>,
     pub startup_enabled: bool,
+    startup_before_save: Option<bool>,
     pub settings_draft: SettingsDraft,
     pub settings_key_fetching: bool,
     pub settings_conf_importing: bool,
@@ -983,6 +986,7 @@ impl AppState {
             return_dialog: None,
             info_toast: None,
             startup_enabled: false,
+            startup_before_save: None,
             settings_draft,
             settings_key_fetching: false,
             settings_conf_importing: false,
@@ -1165,10 +1169,31 @@ impl AppState {
     pub fn save_settings_dialog(&mut self) {
         let mut cfg = self.client_config.clone();
         let custom_priv = self.settings_draft.private_key.trim().to_owned();
-        if !custom_priv.is_empty() {
-            cfg.private_key = custom_priv.clone();
+        if custom_priv.is_empty() {
+            cfg.private_key.clear();
+            cfg.public_key.clear();
+            cfg.expiration = 0;
+        } else {
+            let validated_priv = match validate_wg_key("Private Key", &custom_priv) {
+                Ok(key) => key,
+                Err(err) => {
+                    let msg = format!(
+                        "❌ Private Key WireGuard không hợp lệ (cần khóa Base64 32 byte hoặc để trống để xóa): {err}"
+                    );
+                    self.settings_status_msg = Some(StatusNotice {
+                        text: msg.clone(),
+                        level: NoticeLevel::Error,
+                    });
+                    self.info_toast = Some(StatusNotice {
+                        text: msg,
+                        level: NoticeLevel::Error,
+                    });
+                    return;
+                }
+            };
+            cfg.private_key = validated_priv.clone();
             if self.settings_draft.imported_from_conf
-                || custom_priv != self.settings_draft.original_private_key
+                || validated_priv != self.settings_draft.original_private_key
             {
                 cfg.public_key.clear();
                 cfg.expiration = 0;
@@ -1177,34 +1202,74 @@ impl AppState {
                 cfg.expiration = self.settings_draft.expiration;
             }
         }
-        let addr = self.settings_draft.address.trim();
-        cfg.address = if addr.is_empty() {
+
+        let addr_raw = self.settings_draft.address.trim();
+        cfg.address = if addr_raw.is_empty() {
             DEFAULT_WG_ADDRESS.to_owned()
         } else {
-            addr.to_owned()
+            match validate_address_list(addr_raw) {
+                Ok(addr) => addr,
+                Err(err) => {
+                    let msg = format!("❌ Địa chỉ Interface WireGuard không hợp lệ: {err}");
+                    self.settings_status_msg = Some(StatusNotice {
+                        text: msg.clone(),
+                        level: NoticeLevel::Error,
+                    });
+                    self.info_toast = Some(StatusNotice {
+                        text: msg,
+                        level: NoticeLevel::Error,
+                    });
+                    return;
+                }
+            }
         };
-        let dns = self.settings_draft.dns.trim();
-        cfg.dns = if dns.is_empty() {
-            DEFAULT_WG_DNS.to_owned()
-        } else {
-            dns.to_owned()
+
+        cfg.dns = match validate_dns_list(self.settings_draft.dns.trim()) {
+            Ok(dns) => dns,
+            Err(err) => {
+                let msg = format!(
+                    "❌ DNS Server không hợp lệ (nhập các IP cách nhau bởi dấu phẩy, vd 10.2.0.1, 1.1.1.1): {err}"
+                );
+                self.settings_status_msg = Some(StatusNotice {
+                    text: msg.clone(),
+                    level: NoticeLevel::Error,
+                });
+                self.info_toast = Some(StatusNotice {
+                    text: msg,
+                    level: NoticeLevel::Error,
+                });
+                return;
+            }
         };
-        let port = self.settings_draft.port.trim();
-        cfg.port = if port.is_empty() {
-            DEFAULT_WG_PORT.to_owned()
-        } else {
-            port.to_owned()
+
+        cfg.port = match validate_port_str(self.settings_draft.port.trim()) {
+            Ok(port) => port.to_string(),
+            Err(err) => {
+                let msg = format!("❌ Port WireGuard không hợp lệ (cần số từ 1 đến 65535): {err}");
+                self.settings_status_msg = Some(StatusNotice {
+                    text: msg.clone(),
+                    level: NoticeLevel::Error,
+                });
+                self.info_toast = Some(StatusNotice {
+                    text: msg,
+                    level: NoticeLevel::Error,
+                });
+                return;
+            }
         };
+
         cfg.animations_enabled = self.settings_draft.animations_enabled;
         cfg.auto_check_update = self.settings_draft.auto_check_update;
         cfg.debug_mode = self.client_config.debug_mode;
 
+        self.startup_before_save = Some(self.startup_enabled);
         self.startup_enabled = self.settings_draft.startup_enabled;
         self.save_client_config(cfg);
         self.pending_commands.push(UiCommand::SetStartupEnabled {
             enabled: self.settings_draft.startup_enabled,
         });
         self.settings_middle_hold.on_release();
+        self.settings_status_msg = None;
         self.return_dialog = None;
         self.active_dialog = ActiveDialog::None;
         self.info_toast = Some(StatusNotice {
@@ -1954,18 +2019,26 @@ impl AppState {
                 self.active_dialog = ActiveDialog::ErrorDetail;
             }
             WorkerEvent::StartupStatusLoaded { enabled } => {
-                self.startup_enabled = enabled;
-                if !self.settings_draft.startup_dirty {
-                    self.settings_draft.startup_enabled = enabled;
+                if self.startup_before_save.is_none() {
+                    self.startup_enabled = enabled;
+                    if !self.settings_draft.startup_dirty {
+                        self.settings_draft.startup_enabled = enabled;
+                    }
                 }
             }
             WorkerEvent::StartupSaveResult { enabled, error } => {
                 if let Some(err) = error {
+                    let reverted = self.startup_before_save.take().unwrap_or(!enabled);
+                    self.startup_enabled = reverted;
+                    self.settings_draft.startup_enabled = reverted;
+                    self.settings_draft.startup_dirty = false;
+                    self.pending_commands.push(UiCommand::RefreshStartupStatus);
                     self.info_toast = Some(StatusNotice {
                         text: format!("Không thể cập nhật khởi động cùng Windows: {err}"),
                         level: NoticeLevel::Warning,
                     });
                 } else {
+                    self.startup_before_save = None;
                     self.startup_enabled = enabled;
                 }
             }
@@ -3537,20 +3610,17 @@ fn default_update_download_dir() -> PathBuf {
     std::env::temp_dir().join("FreetonVPN_Update")
 }
 
-fn cleanup_partial_updates(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| name.ends_with(".part"))
-        {
-            let _ = std::fs::remove_file(path);
-        }
+fn cleanup_targeted_partial_file(run_dir: &Path, download_url: &str) {
+    let part_path = run_dir.join(expected_part_filename(download_url));
+    if part_path.exists() {
+        let _ = std::fs::remove_file(&part_path);
     }
+    let _ = std::fs::remove_dir(run_dir);
+}
+
+enum UpdateSelectOutcome {
+    Cancelled,
+    Finished(Result<UpdateAction, UpdateError>),
 }
 
 async fn handle_start_update_download(
@@ -3576,46 +3646,56 @@ async fn handle_start_update_download(
         return;
     };
 
-    let dest_dir = deps
+    let base_dir = deps
         .update_download_dir
         .clone()
         .unwrap_or_else(default_update_download_dir);
+    let run_dir = base_dir.join(format!("gen-{generation}"));
     let last_emit = StdMutex::new(Instant::now() - Duration::from_secs(1));
 
-    let download_fut = download_and_verify_update(
-        &info,
-        &dest_dir,
-        |downloaded_bytes, total_bytes, percent| {
-            let mut guard = last_emit.lock().expect("progress mutex");
-            if percent >= 99.9 || guard.elapsed() >= Duration::from_millis(50) {
-                *guard = Instant::now();
-                emit(
-                    tx,
-                    wake,
-                    WorkerEvent::UpdateDownloadProgress {
-                        generation,
-                        downloaded_bytes,
-                        total_bytes,
-                        percent,
-                    },
-                );
-            }
-        },
-    );
+    let outcome = {
+        let download_fut = download_and_verify_update(
+            &info,
+            &run_dir,
+            |downloaded_bytes, total_bytes, percent| {
+                let mut guard = last_emit.lock().expect("progress mutex");
+                if percent >= 99.9 || guard.elapsed() >= Duration::from_millis(50) {
+                    *guard = Instant::now();
+                    emit(
+                        tx,
+                        wake,
+                        WorkerEvent::UpdateDownloadProgress {
+                            generation,
+                            downloaded_bytes,
+                            total_bytes,
+                            percent,
+                        },
+                    );
+                }
+            },
+        );
 
-    tokio::select! {
-        biased;
-        _ = cancel_rx.wait_for(|&cancelled| cancelled) => {
-            cleanup_partial_updates(&dest_dir);
-            if let Ok(mut guard) = deps.update_cancel.lock() {
-                guard.clear(generation);
-            }
-            emit(tx, wake, WorkerEvent::UpdateDownloadCancelled { generation });
+        tokio::select! {
+            biased;
+            _ = cancel_rx.wait_for(|&cancelled| cancelled) => UpdateSelectOutcome::Cancelled,
+            res = download_fut => UpdateSelectOutcome::Finished(res),
         }
-        res = download_fut => {
-            if let Ok(mut guard) = deps.update_cancel.lock() {
-                guard.clear(generation);
-            }
+    };
+
+    if let Ok(mut guard) = deps.update_cancel.lock() {
+        guard.clear(generation);
+    }
+
+    match outcome {
+        UpdateSelectOutcome::Cancelled => {
+            cleanup_targeted_partial_file(&run_dir, &info.download_url);
+            emit(
+                tx,
+                wake,
+                WorkerEvent::UpdateDownloadCancelled { generation },
+            );
+        }
+        UpdateSelectOutcome::Finished(res) => {
             emit(
                 tx,
                 wake,
@@ -5102,9 +5182,97 @@ mod tests {
         }
         assert!(saw_cancel);
         assert!(
-            !temp_dir.join("FreetonVPN-Setup-x64.exe.part").exists(),
-            ".part file must be removed after cancel"
+            !temp_dir
+                .join("gen-9")
+                .join("FreetonVPN-Setup-x64.exe.part")
+                .exists(),
+            "targeted .part file must be removed cleanly after download_fut drops"
+        );
+
+        // Immediate retry (gen-10) uses isolated generation dir and is untouched by gen-9 cancel.
+        let retry_dir = temp_dir.join("gen-10");
+        std::fs::create_dir_all(&retry_dir).expect("create retry dir");
+        let retry_part = retry_dir.join("FreetonVPN-Setup-x64.exe.part");
+        std::fs::write(&retry_part, b"IN-PROGRESS-RETRY").expect("write retry part");
+        cleanup_targeted_partial_file(
+            &temp_dir.join("gen-9"),
+            "https://example.com/FreetonVPN-Setup-x64.exe",
+        );
+        assert!(
+            retry_part.exists(),
+            "cancelling gen-9 must never delete retry gen-10 .part file"
         );
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_startup_save_failure_reverts_startup_enabled_and_re_queries() {
+        struct FailingStartupController {
+            actual_enabled: bool,
+        }
+        impl StartupController for FailingStartupController {
+            fn is_enabled(&self) -> bool {
+                self.actual_enabled
+            }
+            fn set_enabled(&self, _enable: bool) -> Result<(), StorageError> {
+                Err(StorageError::Registry("HKCU write denied".to_owned()))
+            }
+        }
+
+        let mut state = AppState::new(
+            true,
+            Some("user@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            Vec::new(),
+        );
+        assert!(!state.startup_enabled);
+        let _ = state.drain_commands();
+
+        state.open_settings_dialog();
+        let _ = state.drain_commands();
+        state.settings_draft.startup_enabled = true;
+        state.settings_draft.startup_dirty = true;
+        state.save_settings_dialog();
+        let cmds = state.drain_commands();
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::SetStartupEnabled { enabled: true })));
+
+        let store = Arc::new(MockCredentialStore::default());
+        let mut deps = make_test_deps(
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
+            Arc::new(ProtonClient::new(store)),
+            Arc::new(MockPipeTransport::ok(ServiceResponse::Ok)),
+        );
+        deps.startup = Arc::new(FailingStartupController {
+            actual_enabled: false,
+        });
+        let deps = Arc::new(deps);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_ui_command(
+            Arc::clone(&deps),
+            UiCommand::SetStartupEnabled { enabled: true },
+            &tx,
+            &|| {},
+        )
+        .await;
+        let save_ev = rx.recv().await.expect("StartupSaveResult");
+        state.apply_event(save_ev);
+
+        assert!(
+            !state.startup_enabled,
+            "state.startup_enabled must revert to pre-save value on registry error"
+        );
+        assert!(
+            !state.settings_draft.startup_enabled,
+            "settings_draft.startup_enabled must revert on registry error"
+        );
+        assert!(state.info_toast.is_some());
+        let follow_up_cmds = state.drain_commands();
+        assert!(follow_up_cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::RefreshStartupStatus)));
     }
 }

@@ -6,6 +6,7 @@ use egui::{
     ScrollArea, Sense, TextEdit, TextStyle, Ui, Vec2,
 };
 use freeton_core::storage::{ClientConfig, CredentialStore, DEFAULT_WG_ADDRESS};
+use freeton_core::wg::{validate_address_list, validate_dns_list, validate_wg_key};
 use freeton_core::{APP_NAME, APP_VERSION};
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
@@ -75,7 +76,8 @@ pub fn parse_wireguard_conf(content: &str) -> Result<ParsedWireGuardConf, String
     }
 
     let stripped = content.strip_prefix('\u{FEFF}').unwrap_or(content);
-    let mut in_interface = true;
+    let mut seen_interface = false;
+    let mut in_interface = false;
     let mut private_key: Option<String> = None;
     let mut address: Option<String> = None;
     let mut dns: Option<String> = None;
@@ -88,6 +90,9 @@ pub fn parse_wireguard_conf(content: &str) -> Result<ParsedWireGuardConf, String
         if line.starts_with('[') && line.ends_with(']') {
             let section = line[1..line.len() - 1].trim();
             in_interface = section.eq_ignore_ascii_case("Interface");
+            if in_interface {
+                seen_interface = true;
+            }
             continue;
         }
         if !in_interface {
@@ -105,17 +110,19 @@ pub fn parse_wireguard_conf(content: &str) -> Result<ParsedWireGuardConf, String
         }
 
         if key.eq_ignore_ascii_case("PrivateKey") {
-            if val.is_empty() || val.chars().any(char::is_whitespace) {
-                return Err("PrivateKey trong file .conf không hợp lệ.".to_owned());
-            }
-            private_key = Some(val.to_owned());
+            let validated = validate_wg_key("PrivateKey", val).map_err(|e| e.to_string())?;
+            private_key = Some(validated);
         } else if key.eq_ignore_ascii_case("Address") {
-            if !val.is_empty() {
-                address = Some(val.to_owned());
-            }
-        } else if key.eq_ignore_ascii_case("DNS") && !val.is_empty() {
-            dns = Some(val.to_owned());
+            let validated = validate_address_list(val).map_err(|e| e.to_string())?;
+            address = Some(validated);
+        } else if key.eq_ignore_ascii_case("DNS") {
+            let validated = validate_dns_list(val).map_err(|e| e.to_string())?;
+            dns = Some(validated);
         }
+    }
+
+    if !seen_interface {
+        return Err("File .conf thiếu mục [Interface] hợp lệ.".to_owned());
     }
 
     let Some(private_key) = private_key else {
@@ -1173,7 +1180,8 @@ fn render_service_repair_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut Ap
     ui.add_space(12.0);
     let busy = state.service_repair_phase == ServiceRepairPhase::LaunchingAndWaiting;
     ui.horizontal(|ui| {
-        if !busy && pill_button(ui, "Đóng", Some(82.0), PillStyle::secondary(32.0)).clicked() {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        if !busy && pill_button(ui, "Đóng", Some(74.0), PillStyle::secondary(32.0)).clicked() {
             state.close_dialog();
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1199,21 +1207,20 @@ fn render_service_repair_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut Ap
                 );
             } else {
                 let repair_style = PillStyle {
-                    font_size: 11.5,
-                    pad_x: 8.0,
+                    font_size: 11.0,
+                    pad_x: 6.0,
                     ..PillStyle::accent(32.0)
                 };
-                if pill_button(ui, "🔧 Sửa dịch vụ (UAC)", Some(146.0), repair_style).clicked()
+                if pill_button(ui, "🔧 Sửa dịch vụ (UAC)", Some(142.0), repair_style).clicked()
                 {
                     state.start_service_repair();
                 }
-                ui.add_space(6.0);
                 let recheck_style = PillStyle {
                     font_size: 11.0,
                     pad_x: 6.0,
                     ..PillStyle::secondary(32.0)
                 };
-                if pill_button(ui, "↻ Kiểm tra", Some(84.0), recheck_style).clicked() {
+                if pill_button(ui, "↻ Kiểm tra", Some(82.0), recheck_style).clicked() {
                     state.request_status_refresh();
                 }
             }
@@ -1404,8 +1411,21 @@ mod tests {
         assert_eq!(cfg.dns, "10.2.0.1, 9.9.9.9");
         assert_eq!(cfg.expiration, 0);
 
-        // Missing PrivateKey or control characters are rejected.
+        // Missing [Interface], missing PrivateKey, invalid key/CIDR/DNS, or control characters are rejected.
+        assert!(parse_wireguard_conf(
+            "PrivateKey = c2FtcGxlLXByaXZhdGUta2V5LTAxMjM0NTY3ODkwMTI=\n"
+        )
+        .is_err());
         assert!(parse_wireguard_conf("[Interface]\nAddress = 10.2.0.2/32\n").is_err());
+        assert!(parse_wireguard_conf("[Interface]\nPrivateKey = not-base64-32-bytes\n").is_err());
+        assert!(parse_wireguard_conf(
+            "[Interface]\nPrivateKey = c2FtcGxlLXByaXZhdGUta2V5LTAxMjM0NTY3ODkwMTI=\nAddress = 10.2.0.2/99\n"
+        )
+        .is_err());
+        assert!(parse_wireguard_conf(
+            "[Interface]\nPrivateKey = c2FtcGxlLXByaXZhdGUta2V5LTAxMjM0NTY3ODkwMTI=\nDNS = bad-dns\n"
+        )
+        .is_err());
         assert!(parse_wireguard_conf("[Interface]\nPrivateKey = abc\nDNS = 1.1.1.1\n\0").is_err());
     }
 
@@ -1424,8 +1444,9 @@ mod tests {
 
     #[test]
     fn test_settings_save_persists_config_and_startup_and_cancel_discards_draft() {
+        let valid_priv = "c2FtcGxlLXByaXZhdGUta2V5LTAxMjM0NTY3ODkwMTI=".to_owned();
         let initial = ClientConfig {
-            private_key: "initial-priv".to_owned(),
+            private_key: valid_priv.clone(),
             public_key: "initial-pub".to_owned(),
             expiration: 1_900_000_000,
             ..ClientConfig::default()
@@ -1469,6 +1490,7 @@ mod tests {
         assert!(!state.client_config.animations_enabled);
         assert!(!state.client_config.auto_check_update);
         assert!(state.startup_enabled);
+        assert_eq!(state.client_config.private_key, valid_priv);
         assert_eq!(state.client_config.dns, "9.9.9.9");
         assert_eq!(state.client_config.port, "443");
         assert_eq!(state.client_config.expiration, 1_900_000_000);
@@ -1480,6 +1502,71 @@ mod tests {
         assert!(cmds
             .iter()
             .any(|c| matches!(c, UiCommand::SetStartupEnabled { enabled: true })));
+    }
+
+    #[test]
+    fn test_settings_save_validates_inputs_and_clears_empty_private_key() {
+        let valid_priv = "c2FtcGxlLXByaXZhdGUta2V5LTAxMjM0NTY3ODkwMTI=".to_owned();
+        let initial = ClientConfig {
+            private_key: valid_priv.clone(),
+            public_key: "existing-pub".to_owned(),
+            expiration: 1_900_000_000,
+            ..ClientConfig::default()
+        };
+        let mut state = AppState::new(
+            true,
+            Some("u@proton.me".to_owned()),
+            initial,
+            None,
+            Vec::new(),
+        );
+        let _ = state.drain_commands();
+
+        // 1. Invalid Private Key keeps Settings open without persisting.
+        state.open_settings_dialog();
+        let _ = state.drain_commands();
+        state.settings_draft.private_key = "not-a-32-byte-wireguard-key".to_owned();
+        state.save_settings_dialog();
+        assert_eq!(state.active_dialog, ActiveDialog::Settings);
+        assert_eq!(state.client_config.private_key, valid_priv);
+        assert!(state.settings_status_msg.is_some());
+        assert!(state.drain_commands().is_empty());
+
+        // 2. Invalid DNS keeps Settings open without persisting.
+        state.settings_draft.private_key = valid_priv.clone();
+        state.settings_draft.dns = "bad-dns-host".to_owned();
+        state.save_settings_dialog();
+        assert_eq!(state.active_dialog, ActiveDialog::Settings);
+        assert_eq!(state.client_config.dns, "10.2.0.1, 1.1.1.1");
+        assert!(state.drain_commands().is_empty());
+
+        // 3. Invalid Port (0 or > 65535 or non-numeric) keeps Settings open without persisting.
+        for bad_port in ["0", "65536", "abc", ""] {
+            state.settings_draft.dns = "1.1.1.1".to_owned();
+            state.settings_draft.port = bad_port.to_owned();
+            state.save_settings_dialog();
+            assert_eq!(
+                state.active_dialog,
+                ActiveDialog::Settings,
+                "port {bad_port:?} must be rejected"
+            );
+            assert_eq!(state.client_config.port, "51820");
+            assert!(state.drain_commands().is_empty());
+        }
+
+        // 4. Clearing private_key (empty) clears private_key, public_key, and sets expiration = 0.
+        state.settings_draft.private_key = "   ".to_owned();
+        state.settings_draft.dns = "1.1.1.1, 9.9.9.9".to_owned();
+        state.settings_draft.port = "51820".to_owned();
+        state.save_settings_dialog();
+        assert_eq!(state.active_dialog, ActiveDialog::None);
+        assert!(state.client_config.private_key.is_empty());
+        assert!(state.client_config.public_key.is_empty());
+        assert_eq!(state.client_config.expiration, 0);
+        assert_eq!(state.client_config.dns, "1.1.1.1, 9.9.9.9");
+        assert!(state.drain_commands().iter().any(
+            |c| matches!(c, UiCommand::SaveClientConfig { config } if config.private_key.is_empty() && config.expiration == 0)
+        ));
     }
 
     #[test]
@@ -1777,5 +1864,34 @@ mod tests {
                 "dialog {dialog:?} overflowed flyout bounds: {card_rect:?}"
             );
         }
+
+        // Also cover non-healthy ServiceRepair 3-button bottom row inside a fresh context.
+        state.service_health = ServiceHealthStatus::Unavailable("pipe missing".to_owned());
+        state.service_repair_phase = ServiceRepairPhase::Idle;
+        state.active_dialog = ActiveDialog::ServiceRepair;
+        for _ in 0..2 {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(crate::ui::WINDOW_WIDTH, crate::ui::WINDOW_HEIGHT),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw_input, |ui| {
+                crate::ui::render_root(ui, &mut state, &store);
+            });
+            out.textures_delta.clear();
+        }
+        let repair_rect = ctx
+            .memory(|m| m.area_rect(egui::Id::unique("dialog_card")))
+            .expect("non-healthy ServiceRepair card rect");
+        assert!(
+            repair_rect.min.x >= 0.0
+                && repair_rect.min.y >= 0.0
+                && repair_rect.max.x <= crate::ui::WINDOW_WIDTH
+                && repair_rect.max.y <= crate::ui::WINDOW_HEIGHT
+                && repair_rect.width() <= 356.0,
+            "non-healthy ServiceRepair overflowed card bounds: {repair_rect:?}"
+        );
     }
 }
