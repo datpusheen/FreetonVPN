@@ -9,8 +9,8 @@
                       "🔄 Cập nhật tự động kiểm tra SHA-256 nghiêm ngặt trước khi chạy trình cài đặt"
                   ],
     "download_url":  "https://github.com/datpusheen/FreetonVPN/releases/download/v3.0.0/FreetonVPN-Setup-x64.exe",
-    "file_size_bytes":  8399342,
-    "sha256":  "0ef1124e3e59130b5c0366ba53cb9bc0000dbf53fb73ac62f0616f1558a707fc",
+    "file_size_bytes":  8397694,
+    "sha256":  "442c56499844a23c4959d38b46af1dabb0c84f635473b0abff0cfad965ee1b13",
     "mandatory":  false,
     "min_supported_version":  "3.0.0"
 }

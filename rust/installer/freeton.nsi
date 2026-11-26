@@ -22,7 +22,6 @@ Unicode true
 Name "${APP_NAME}"
 OutFile "..\..\dist\FreetonVPN-Setup-x64.exe"
 InstallDir "$PROGRAMFILES64\FreetonVPN"
-InstallDirRegKey HKLM "${APP_REG_KEY}" "InstallDir"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 ShowInstDetails show
@@ -58,105 +57,123 @@ VIAddVersionKey "LegalCopyright" "Copyright (c) 2026 ${APP_PUBLISHER}"
 
 !insertmacro MUI_LANGUAGE "English"
 
-; Checks whether FreetonVPN.exe is currently running ($0 = 1 if running, 0 if not).
-Function IsAppRunning
-  nsExec::ExecToStack '"$SYSDIR\cmd.exe" /C ""$SYSDIR\tasklist.exe" /FI "IMAGENAME eq ${APP_EXE}" /NH | "$SYSDIR\findstr.exe" /I "${APP_EXE}""'
-  Pop $0
-  Pop $1
-  ${If} $0 == 0
-    StrCpy $0 1
-  ${Else}
-    StrCpy $0 0
-  ${EndIf}
-FunctionEnd
-
-; Waits briefly for FreetonVPN.exe to exit gracefully (used during /S auto-updates),
-; then kills any remaining process cleanly before replacing binaries.
-Function StopRunningApp
-  ${If} ${Silent}
-    ${For} $R0 1 6
-      Call IsAppRunning
-      ${If} $0 == 0
-        ${Break}
-      ${EndIf}
-      Sleep 400
-    ${Next}
-  ${EndIf}
-
-  Call IsAppRunning
-  ${If} $0 == 1
-    DetailPrint "Closing running ${APP_EXE}..."
-    nsExec::ExecToStack '"$SYSDIR\taskkill.exe" /F /IM ${APP_EXE}'
+!macro DEFINE_PROCESS_HELPERS UN_PREFIX
+  ; Checks if process image name in $R6 is running; sets $0 = 1 (running) or 0 (not running).
+  Function ${UN_PREFIX}IsProcessRunning
+    nsExec::ExecToStack '"$SYSDIR\cmd.exe" /C ""$SYSDIR\tasklist.exe" /FI "IMAGENAME eq $R6" /FO CSV /NH | "$SYSDIR\findstr.exe" /I "$R6""'
     Pop $0
     Pop $1
-    ${For} $R0 1 10
-      Call IsAppRunning
-      ${If} $0 == 0
-        ${Break}
-      ${EndIf}
-      Sleep 300
-    ${Next}
-    Sleep 250
-  ${EndIf}
-FunctionEnd
+    ${If} $0 == 0
+      StrCpy $0 1
+    ${Else}
+      StrCpy $0 0
+    ${EndIf}
+  FunctionEnd
 
-; Clean helper: stops service in $R8 and sets $R9 = 0 (ok) or 1 (timeout).
-Function StopServiceInR8
-  nsExec::ExecToStack '"$SYSDIR\sc.exe" query "$R8"'
-  Pop $0
-  Pop $1
-  ${If} $0 != 0
-    StrCpy $R9 0
-    Return
-  ${EndIf}
+  ; Polls up to $R5 iterations of 250ms for process in $R6 to exit cleanly;
+  ; terminates with taskkill /F only if still alive after the grace period.
+  Function ${UN_PREFIX}WaitOrKillProcess
+    ${If} $R5 > 0
+      ${For} $R4 1 $R5
+        Call ${UN_PREFIX}IsProcessRunning
+        ${If} $0 == 0
+          ${Break}
+        ${EndIf}
+        Sleep 250
+      ${Next}
+    ${EndIf}
 
-  DetailPrint "Stopping service $R8..."
-  nsExec::ExecToStack '"$SYSDIR\sc.exe" stop "$R8"'
-  Pop $0
-  Pop $1
+    Call ${UN_PREFIX}IsProcessRunning
+    ${If} $0 == 1
+      DetailPrint "Closing running $R6..."
+      nsExec::ExecToStack '"$SYSDIR\taskkill.exe" /F /IM $R6'
+      Pop $0
+      Pop $1
+      ${For} $R4 1 12
+        Call ${UN_PREFIX}IsProcessRunning
+        ${If} $0 == 0
+          ${Break}
+        ${EndIf}
+        Sleep 250
+      ${Next}
+      Sleep 200
+    ${EndIf}
+  FunctionEnd
+!macroend
 
-  StrCpy $R9 1
-  ${For} $R7 1 30
+!macro DEFINE_SERVICE_HELPERS UN_PREFIX
+  ; Stops service named in $R8 and waits up to 15 seconds for STOPPED or absent ($R9 = 0 ok, 1 timeout).
+  Function ${UN_PREFIX}StopServiceInR8
     nsExec::ExecToStack '"$SYSDIR\sc.exe" query "$R8"'
     Pop $0
     Pop $1
     ${If} $0 != 0
       StrCpy $R9 0
-      ${Break}
+      Return
     ${EndIf}
 
-    nsExec::ExecToStack '"$SYSDIR\cmd.exe" /C ""$SYSDIR\sc.exe" query "$R8" | "$SYSDIR\findstr.exe" /C:"STOPPED""'
+    DetailPrint "Stopping service $R8..."
+    nsExec::ExecToStack '"$SYSDIR\sc.exe" stop "$R8"'
     Pop $0
     Pop $1
-    ${If} $0 == 0
-      StrCpy $R9 0
-      ${Break}
-    ${EndIf}
-    Sleep 500
-  ${Next}
-FunctionEnd
 
-Function DeleteTunnelServiceIfPresent
-  nsExec::ExecToStack '"$SYSDIR\sc.exe" query "${TUNNEL_SERVICE_NAME}"'
-  Pop $0
-  Pop $1
-  ${If} $0 != 0
-    Return
-  ${EndIf}
+    StrCpy $R9 1
+    ${For} $R7 1 30
+      nsExec::ExecToStack '"$SYSDIR\sc.exe" query "$R8"'
+      Pop $0
+      Pop $1
+      ${If} $0 != 0
+        StrCpy $R9 0
+        ${Break}
+      ${EndIf}
 
-  nsExec::ExecToStack '"$SYSDIR\sc.exe" delete "${TUNNEL_SERVICE_NAME}"'
-  Pop $0
-  Pop $1
-  ${For} $R7 1 10
-    nsExec::ExecToStack '"$SYSDIR\sc.exe" query "${TUNNEL_SERVICE_NAME}"'
+      nsExec::ExecToStack '"$SYSDIR\cmd.exe" /C ""$SYSDIR\sc.exe" query "$R8" | "$SYSDIR\findstr.exe" /C:"STOPPED""'
+      Pop $0
+      Pop $1
+      ${If} $0 == 0
+        StrCpy $R9 0
+        ${Break}
+      ${EndIf}
+      Sleep 500
+    ${Next}
+  FunctionEnd
+
+  ; Deletes service named in $R8 if present and waits up to 3 seconds for SCM removal.
+  Function ${UN_PREFIX}DeleteServiceInR8
+    nsExec::ExecToStack '"$SYSDIR\sc.exe" query "$R8"'
     Pop $0
     Pop $1
     ${If} $0 != 0
-      ${Break}
+      Return
     ${EndIf}
-    Sleep 300
-  ${Next}
-FunctionEnd
+
+    nsExec::ExecToStack '"$SYSDIR\sc.exe" delete "$R8"'
+    Pop $0
+    Pop $1
+    ${For} $R7 1 10
+      nsExec::ExecToStack '"$SYSDIR\sc.exe" query "$R8"'
+      Pop $0
+      Pop $1
+      ${If} $0 != 0
+        ${Break}
+      ${EndIf}
+      Sleep 300
+    ${Next}
+  FunctionEnd
+
+  ; Waits up to 5 seconds for FreetonVPNService.exe to release its process lock after SERVICE_STOPPED,
+  ; falling back to taskkill /F only if the process does not exit in time.
+  Function ${UN_PREFIX}WaitServiceProcessesStopped
+    StrCpy $R6 "${SERVICE_EXE}"
+    StrCpy $R5 20
+    Call ${UN_PREFIX}WaitOrKillProcess
+  FunctionEnd
+!macroend
+
+!insertmacro DEFINE_PROCESS_HELPERS ""
+!insertmacro DEFINE_SERVICE_HELPERS ""
+!insertmacro DEFINE_PROCESS_HELPERS "un."
+!insertmacro DEFINE_SERVICE_HELPERS "un."
 
 ; Launches FreetonVPN.exe via explorer.exe so it inherits the interactive user's medium-integrity token.
 Function LaunchAppUnelevated
@@ -172,6 +189,13 @@ Function .onInit
   ${EndIf}
   SetRegView 64
   SetShellVarContext all
+
+  ; Read 64-bit InstallDir explicitly after SetRegView 64 (preserving explicit /D= overrides).
+  ReadRegStr $0 HKLM "${APP_REG_KEY}" "InstallDir"
+  ${If} $0 != ""
+  ${AndIf} $INSTDIR == "$PROGRAMFILES64\FreetonVPN"
+    StrCpy $INSTDIR "$0"
+  ${EndIf}
 FunctionEnd
 
 Function .onInstSuccess
@@ -180,27 +204,22 @@ Function .onInstSuccess
   ${EndIf}
 FunctionEnd
 
-Function un.IsAppRunning
-  nsExec::ExecToStack '"$SYSDIR\cmd.exe" /C ""$SYSDIR\tasklist.exe" /FI "IMAGENAME eq ${APP_EXE}" /NH | "$SYSDIR\findstr.exe" /I "${APP_EXE}""'
-  Pop $0
-  Pop $1
-  ${If} $0 == 0
-    StrCpy $0 1
-  ${Else}
-    StrCpy $0 0
-  ${EndIf}
-FunctionEnd
-
 Function un.onInit
   SetRegView 64
   SetShellVarContext all
+  ${If} $INSTDIR == ""
+    ReadRegStr $0 HKLM "${APP_REG_KEY}" "InstallDir"
+    ${If} $0 != ""
+      StrCpy $INSTDIR "$0"
+    ${EndIf}
+  ${EndIf}
 FunctionEnd
 
 Section "Install" SEC_MAIN
   SetRegView 64
   SetShellVarContext all
 
-  ; 1. Stop active WireGuard tunnel, broker service, and GUI process cleanly before overwriting files.
+  ; 1. Stop active WireGuard tunnel, broker service, service processes, and GUI process cleanly before overwriting files.
   StrCpy $R8 "${TUNNEL_SERVICE_NAME}"
   Call StopServiceInR8
   ${If} $R9 != 0
@@ -210,7 +229,7 @@ Section "Install" SEC_MAIN
     SetErrorLevel 1
     Abort
   ${EndIf}
-  Call DeleteTunnelServiceIfPresent
+  Call DeleteServiceInR8
 
   StrCpy $R8 "${BROKER_SERVICE_NAME}"
   Call StopServiceInR8
@@ -222,9 +241,17 @@ Section "Install" SEC_MAIN
     Abort
   ${EndIf}
 
-  Call StopRunningApp
+  Call WaitServiceProcessesStopped
 
-  ; 2. Install binaries, staged WireGuard DLLs, and icon into 64-bit Program Files.
+  StrCpy $R6 "${APP_EXE}"
+  ${If} ${Silent}
+    StrCpy $R5 10
+  ${Else}
+    StrCpy $R5 0
+  ${EndIf}
+  Call WaitOrKillProcess
+
+  ; 2. Install binaries, staged WireGuard DLLs, and icon into 64-bit install directory.
   SetOutPath "$INSTDIR"
   File "..\..\rust\target\release\${APP_EXE}"
   File "..\..\rust\target\release\${SERVICE_EXE}"
@@ -273,43 +300,30 @@ Section "Uninstall"
   SetShellVarContext all
 
   ; 1. Terminate running GUI process so executables can be removed cleanly.
-  Call un.IsAppRunning
-  ${If} $0 == 1
-    nsExec::ExecToStack '"$SYSDIR\taskkill.exe" /F /IM ${APP_EXE}'
-    Pop $0
-    Pop $1
-    ${For} $R0 1 10
-      Call un.IsAppRunning
-      ${If} $0 == 0
-        ${Break}
-      ${EndIf}
-      Sleep 300
-    ${Next}
-    Sleep 250
-  ${EndIf}
+  StrCpy $R6 "${APP_EXE}"
+  StrCpy $R5 0
+  Call un.WaitOrKillProcess
 
   ; 2. Uninstall FreetonVPNService, any active WireGuardTunnel$FreetonVPN, and %ProgramData%\FreetonVPN\tunnels.
-  IfFileExists "$INSTDIR\${SERVICE_EXE}" 0 fallback_sc
+  ${If} ${FileExists} "$INSTDIR\${SERVICE_EXE}"
     DetailPrint "Uninstalling ${BROKER_SERVICE_NAME}..."
     nsExec::ExecToStack '"$INSTDIR\${SERVICE_EXE}" --uninstall'
     Pop $0
     Pop $1
-    Sleep 300
+  ${Else}
+    StrCpy $0 1
+  ${EndIf}
 
-  fallback_sc:
-  nsExec::ExecToStack '"$SYSDIR\sc.exe" stop "${BROKER_SERVICE_NAME}"'
-  Pop $0
-  Pop $1
-  nsExec::ExecToStack '"$SYSDIR\sc.exe" delete "${BROKER_SERVICE_NAME}"'
-  Pop $0
-  Pop $1
-  nsExec::ExecToStack '"$SYSDIR\sc.exe" stop "${TUNNEL_SERVICE_NAME}"'
-  Pop $0
-  Pop $1
-  nsExec::ExecToStack '"$SYSDIR\sc.exe" delete "${TUNNEL_SERVICE_NAME}"'
-  Pop $0
-  Pop $1
-  Sleep 300
+  ${If} $0 != 0
+    StrCpy $R8 "${BROKER_SERVICE_NAME}"
+    Call un.StopServiceInR8
+    Call un.DeleteServiceInR8
+    StrCpy $R8 "${TUNNEL_SERVICE_NAME}"
+    Call un.StopServiceInR8
+    Call un.DeleteServiceInR8
+  ${EndIf}
+
+  Call un.WaitServiceProcessesStopped
 
   ; 3. Remove installed binaries, Start Menu shortcuts, and runtime caches/tunnels.
   Delete "$INSTDIR\${APP_EXE}"
