@@ -9,9 +9,9 @@ use freeton_core::storage::CredentialStore;
 
 use crate::state::{AppState, ServiceHealthStatus};
 use crate::ui::{
-    lerp_color, pill_button, rounded_card, PillStyle, C_ACCENT, C_BG, C_BORDER, C_CARD,
-    C_CARD_HIGH, C_DANGER, C_SUCCESS, C_TEXT, C_TEXT_DIM, C_TEXT_MUTED, C_TOGGLE_CONNECTING,
-    C_TOGGLE_OFF, C_TOGGLE_ON, C_WARNING,
+    lerp_color, load_status_color, pill_button, ping_status_color, rounded_card, PillStyle,
+    C_ACCENT, C_BG, C_BORDER, C_CARD, C_CARD_HIGH, C_DANGER, C_SUCCESS, C_TEXT, C_TEXT_DIM,
+    C_TEXT_MUTED, C_TOGGLE_CONNECTING, C_TOGGLE_OFF, C_TOGGLE_ON, C_WARNING,
 };
 
 pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn CredentialStore) {
@@ -301,22 +301,28 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
                 });
             });
 
-            let (title, ping_text, ping_color, load_text) =
+            let (title, ping_text, ping_color, load_text, load_color) =
                 if let Some(srv) = &state.selected_server {
                     let c_disp = get_country_display(&srv.country);
                     let title = format!("{c_disp} ({})", srv.name);
-                    let (pt, pc) = match srv.ping_ms {
-                        Some(ms) => (format!("Ping: {ms:.0} ms"), C_SUCCESS),
-                        None => ("Ping: -- ms".to_owned(), C_TEXT_MUTED),
+                    let pt = match srv.ping_ms {
+                        Some(ms) => format!("Ping: {ms:.0} ms"),
+                        None => "Ping: -- ms".to_owned(),
                     };
-                    let lt = format!("Tải: {:.0}%", srv.load.unwrap_or(0.0));
-                    (title, pt, pc, lt)
+                    let pc = ping_status_color(srv.ping_ms);
+                    let lt = match srv.load {
+                        Some(pct) => format!("Tải: {pct:.0}%"),
+                        None => "Tải: --%".to_owned(),
+                    };
+                    let lc = load_status_color(srv.load);
+                    (title, pt, pc, lt, lc)
                 } else {
                     (
                         "Đang tìm node tốt nhất...".to_owned(),
                         "Ping: -- ms".to_owned(),
                         C_TEXT_MUTED,
                         "Tải: --%".to_owned(),
+                        C_TEXT_MUTED,
                     )
                 };
 
@@ -345,15 +351,15 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
 
                 let load_pill = PillStyle {
                     bg: C_CARD_HIGH,
-                    fg: C_TEXT_MUTED,
+                    fg: load_color,
                     border: C_BORDER,
                     hover_bg: C_CARD_HIGH,
-                    hover_fg: C_TEXT_MUTED,
+                    hover_fg: load_color,
                     hover_border: C_ACCENT,
                     radius: 7,
                     height: 25.0,
                     font_size: 11.0,
-                    bold: false,
+                    bold: true,
                     pad_x: 10.0,
                 };
                 if pill_button(ui, &load_text, None, load_pill).clicked() {

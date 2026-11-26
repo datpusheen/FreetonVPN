@@ -7,8 +7,9 @@ use freeton_core::ping::{get_country_display, SortMode};
 
 use crate::state::AppState;
 use crate::ui::{
-    lerp_color, pill_button, rounded_card, PillStyle, C_ACCENT, C_ACCENT_HOVER, C_BORDER, C_CARD,
-    C_CARD_HIGH, C_SUCCESS, C_SUCCESS_BG, C_TEXT, C_TEXT_DIM, C_TEXT_MUTED,
+    lerp_color, load_status_color, pill_button, ping_status_color, rounded_card, PillStyle,
+    C_ACCENT, C_ACCENT_HOVER, C_BORDER, C_CARD, C_CARD_HIGH, C_SUCCESS_BG, C_TEXT, C_TEXT_DIM,
+    C_TEXT_MUTED,
 };
 
 const QUICK_PILLS: &[(&str, Option<&str>)] = &[
@@ -405,11 +406,11 @@ fn render_server_row(
         );
 
         let meta_y = text_y + 20.0;
-        let (ping_txt, ping_col) = match server.ping_ms {
-            Some(ms) if ms < 80.0 => (format!("Ping  {ms:.0} ms"), C_SUCCESS),
-            Some(ms) => (format!("Ping  {ms:.0} ms"), C_TEXT_MUTED),
-            None => ("Ping  —".to_owned(), C_TEXT_MUTED),
+        let ping_txt = match server.ping_ms {
+            Some(ms) => format!("Ping  {ms:.0} ms"),
+            None => "Ping  —".to_owned(),
         };
+        let ping_col = ping_status_color(server.ping_ms);
         p.text(
             egui::Pos2::new(rect.left() + 12.0, meta_y),
             egui::Align2::LEFT_TOP,
@@ -417,12 +418,17 @@ fn render_server_row(
             egui::FontId::proportional(11.0),
             ping_col,
         );
+        let load_txt = match server.load {
+            Some(pct) => format!("Tải  {pct:.0}%"),
+            None => "Tải  —".to_owned(),
+        };
+        let load_col = load_status_color(server.load);
         p.text(
             egui::Pos2::new(rect.left() + 122.0, meta_y),
             egui::Align2::LEFT_TOP,
-            format!("Tải  {:.0}%", server.load.unwrap_or(0.0)),
+            load_txt,
             egui::FontId::proportional(11.0),
-            C_TEXT_MUTED,
+            load_col,
         );
 
         if debug_mode {

@@ -38,6 +38,41 @@ pub const C_TOGGLE_OFF: Color32 = Color32::from_rgb(0x30, 0x3a, 0x46);
 pub const C_TOGGLE_CONNECTING: Color32 = Color32::from_rgb(0xf5, 0x9e, 0x0b);
 pub const C_TOGGLE_ON: Color32 = Color32::from_rgb(0x79, 0xcb, 0xbb);
 
+// Semantic traffic-light colors for server ping and load badges.
+pub const C_METRIC_GREEN: Color32 = Color32::from_rgb(0x4a, 0xde, 0x80);
+pub const C_METRIC_YELLOW: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
+pub const C_METRIC_RED: Color32 = Color32::from_rgb(0xf8, 0x71, 0x71);
+
+pub fn ping_status_color(ping_ms: Option<f64>) -> Color32 {
+    match ping_ms {
+        Some(ms) if ms.is_finite() && ms >= 0.0 => {
+            if ms < 80.0 {
+                C_METRIC_GREEN
+            } else if ms < 180.0 {
+                C_METRIC_YELLOW
+            } else {
+                C_METRIC_RED
+            }
+        }
+        _ => C_TEXT_MUTED,
+    }
+}
+
+pub fn load_status_color(load_pct: Option<f64>) -> Color32 {
+    match load_pct {
+        Some(pct) if pct.is_finite() && pct >= 0.0 => {
+            if pct < 50.0 {
+                C_METRIC_GREEN
+            } else if pct < 80.0 {
+                C_METRIC_YELLOW
+            } else {
+                C_METRIC_RED
+            }
+        }
+        _ => C_TEXT_MUTED,
+    }
+}
+
 pub const WINDOW_WIDTH: f32 = 390.0;
 pub const WINDOW_HEIGHT: f32 = 610.0;
 
@@ -783,5 +818,32 @@ mod tests {
         let finished_text = collect_all_text(&finished.shapes);
         assert!(!finished_text.contains("TUYÊN BỐ PHÁP LÝ"));
         assert!(!finished_text.contains("Thông báo thử nghiệm animation"));
+    }
+
+    #[test]
+    fn test_ping_and_load_status_colors_thresholds() {
+        assert_eq!(super::ping_status_color(None), super::C_TEXT_MUTED);
+        assert_eq!(super::ping_status_color(Some(-5.0)), super::C_TEXT_MUTED);
+        assert_eq!(
+            super::ping_status_color(Some(f64::NAN)),
+            super::C_TEXT_MUTED
+        );
+        assert_eq!(super::ping_status_color(Some(54.0)), super::C_METRIC_GREEN);
+        assert_eq!(super::ping_status_color(Some(79.9)), super::C_METRIC_GREEN);
+        assert_eq!(super::ping_status_color(Some(80.0)), super::C_METRIC_YELLOW);
+        assert_eq!(
+            super::ping_status_color(Some(179.9)),
+            super::C_METRIC_YELLOW
+        );
+        assert_eq!(super::ping_status_color(Some(180.0)), super::C_METRIC_RED);
+
+        assert_eq!(super::load_status_color(None), super::C_TEXT_MUTED);
+        assert_eq!(super::load_status_color(Some(-1.0)), super::C_TEXT_MUTED);
+        assert_eq!(super::load_status_color(Some(25.0)), super::C_METRIC_GREEN);
+        assert_eq!(super::load_status_color(Some(49.9)), super::C_METRIC_GREEN);
+        assert_eq!(super::load_status_color(Some(50.0)), super::C_METRIC_YELLOW);
+        assert_eq!(super::load_status_color(Some(79.9)), super::C_METRIC_YELLOW);
+        assert_eq!(super::load_status_color(Some(80.0)), super::C_METRIC_RED);
+        assert_eq!(super::load_status_color(Some(98.0)), super::C_METRIC_RED);
     }
 }
