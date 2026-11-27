@@ -1,5 +1,6 @@
 pub mod dialogs;
 pub mod drawer;
+pub mod globe_data;
 pub mod home;
 pub mod login;
 
