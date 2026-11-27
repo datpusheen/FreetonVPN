@@ -1,15 +1,18 @@
 {
-    "version":  "3.0.1",
-    "release_date":  "2026-11-26",
-    "title":  "Freeton VPN Desktop Client v3.0.1",
+    "version":  "3.0.2",
+    "release_date":  "2026-11-27",
+    "title":  "Freeton VPN Desktop Client v3.0.2",
     "changelog":  [
-                      "🖱️ Kéo cửa sổ trực tiếp bằng Win32 (GetCursorPos + SetWindowPos), hết khựng khi di chuyển app",
-                      "📐 Căn chỉnh bố cục đối xứng trên Top Bar, Home, Login/SRP, Drawer và các hộp thoại",
-                      "🛠️ Bổ sung ô nhập Update Manifest URL ẩn trong Dev Mode để kiểm thử cập nhật cục bộ"
+                      "▸ Tự động cập nhật trực tiếp trong app",
+                      "Nhánh master chuẩn: Trỏ version-rust.json mặc định về refs/heads/master.",
+                      "Xác thực SHA-256 tức thì: Đọc thẳng asset digest từ GitHub Releases API (fallback .sha256 tăng timeout lên 15s), tải và cài đặt ngay trong app.",
+                      "▸ Hiển thị Changelog gọn đẹp",
+                      "Lọc Markdown thô: Tự động bỏ tiêu đề #, trích dẫn \u003e, bảng và phần phụ lục kỹ thuật khi lấy từ GitHub Release.",
+                      "Render phân nhóm: Tiêu đề nhóm nổi bật, bullet căn lề và tự xuống dòng chuẩn trong popup."
                   ],
-    "download_url":  "https://github.com/datpusheen/FreetonVPN/releases/download/v3.0.1/FreetonVPN-Setup-x64.exe",
-    "file_size_bytes":  8445772,
-    "sha256":  "eaebc63a54dd3fa55ea9ec6dca34d4297ab634b8cb9efcc136f28254a59abda5",
+    "download_url":  "https://github.com/datpusheen/FreetonVPN/releases/download/v3.0.2/FreetonVPN-Setup-x64.exe",
+    "file_size_bytes":  8451352,
+    "sha256":  "b243104c82d7c6b080e9aae596f3fb8c3e503949be19ff38eb64451b9597f3be",
     "mandatory":  false,
     "min_supported_version":  "3.0.0"
 }

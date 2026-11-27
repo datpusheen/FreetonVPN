@@ -18,7 +18,7 @@ pub const DEFAULT_GITHUB_REPO: &str = "datpusheen/FreetonVPN";
 
 /// Dedicated Rust desktop release manifest URL (isolated from legacy v2.4.3 `version.json`).
 pub const DEFAULT_RUST_VERSION_JSON_URL: &str =
-    "https://raw.githubusercontent.com/datpusheen/FreetonVPN/refs/heads/main/version-rust.json";
+    "https://raw.githubusercontent.com/datpusheen/FreetonVPN/refs/heads/master/version-rust.json";
 
 /// Default GitHub REST API origin.
 pub const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
@@ -50,7 +50,10 @@ impl UpdateInfo {
             .iter()
             .map(|item| {
                 let trimmed = item.trim();
-                if trimmed.starts_with('•') || trimmed.starts_with('-') || trimmed.starts_with('*')
+                if trimmed.starts_with('•')
+                    || trimmed.starts_with('-')
+                    || trimmed.starts_with('*')
+                    || trimmed.starts_with('▸')
                 {
                     item.clone()
                 } else {
@@ -222,10 +225,160 @@ pub fn parse_json_update_info(data: &Value) -> Result<UpdateInfo, UpdateError> {
     })
 }
 
+fn strip_inline_markdown(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Convert Markdown links `[label](url)` -> `label`.
+        if chars[i] == '[' {
+            if let Some(close_bracket) = chars[i + 1..].iter().position(|&c| c == ']') {
+                let close_idx = i + 1 + close_bracket;
+                if close_idx + 1 < chars.len() && chars[close_idx + 1] == '(' {
+                    if let Some(close_paren) = chars[close_idx + 2..].iter().position(|&c| c == ')')
+                    {
+                        let label: String = chars[i + 1..close_idx].iter().collect();
+                        cleaned.push_str(&label);
+                        i = close_idx + 2 + close_paren + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Strip `**`, `__`, and backticks `` ` ``.
+        if i + 1 < chars.len()
+            && ((chars[i] == '*' && chars[i + 1] == '*')
+                || (chars[i] == '_' && chars[i + 1] == '_'))
+        {
+            i += 2;
+            continue;
+        }
+        if chars[i] == '`' {
+            i += 1;
+            continue;
+        }
+
+        cleaned.push(chars[i]);
+        i += 1;
+    }
+
+    cleaned.trim().to_owned()
+}
+
+fn is_trailing_release_section_heading(heading_lower: &str) -> bool {
+    [
+        "kiểm tra an toàn",
+        "bảo mật",
+        "checksum",
+        "hướng dẫn cài đặt",
+        "security",
+        "sha-256",
+        "verification",
+        "miễn trừ",
+        "disclaimer",
+    ]
+    .iter()
+    .any(|kw| heading_lower.contains(kw))
+}
+
+fn is_generic_changelog_heading(heading_lower: &str) -> bool {
+    [
+        "cải tiến & sửa lỗi",
+        "improvements & bug fixes",
+        "improvements",
+        "những điểm mới",
+        "what's changed",
+        "changelog",
+    ]
+    .iter()
+    .any(|kw| heading_lower.contains(kw))
+}
+
+/// Extracts clean display-ready changelog lines from GitHub Release Markdown.
+pub fn extract_release_changelog_lines(body: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut in_code_block = false;
+
+    for raw_line in body.lines() {
+        let trimmed_start = raw_line.trim_start();
+        let trimmed = raw_line.trim();
+        let was_indented = trimmed_start.len() < raw_line.len();
+
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block || trimmed.is_empty() {
+            continue;
+        }
+
+        // Skip horizontal rules, blockquotes, Markdown tables, and HTML wrapper tags.
+        let is_rule = (trimmed.starts_with("---")
+            || trimmed.starts_with("***")
+            || trimmed.starts_with("___"))
+            && trimmed
+                .chars()
+                .all(|c| c == '-' || c == '*' || c == '_' || c.is_whitespace());
+        if is_rule
+            || trimmed.starts_with('>')
+            || trimmed.starts_with('|')
+            || (trimmed.starts_with('<') && trimmed.ends_with('>'))
+        {
+            continue;
+        }
+
+        // Handle headings: drop `#`/`##` release title lines, stop at trailing boilerplate sections,
+        // skip generic "Improvements & Bug Fixes" wrappers, and surface other `###` subheadings.
+        if trimmed.starts_with('#') {
+            let hash_count = trimmed.chars().take_while(|&c| c == '#').count();
+            let heading = strip_inline_markdown(trimmed[hash_count..].trim());
+            let lower = heading.to_lowercase();
+            if is_trailing_release_section_heading(&lower) {
+                break;
+            }
+            if hash_count <= 2 || heading.is_empty() || is_generic_changelog_heading(&lower) {
+                continue;
+            }
+            lines.push(format!("▸ {heading}"));
+            continue;
+        }
+
+        let bullet_rest = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("• "));
+        if let Some(rest) = bullet_rest {
+            let cleaned = strip_inline_markdown(rest);
+            if cleaned.is_empty() {
+                continue;
+            }
+            if !was_indented && cleaned.ends_with(':') {
+                let header = cleaned.trim_end_matches(':').trim();
+                if !header.is_empty() {
+                    lines.push(format!("▸ {header}"));
+                }
+            } else {
+                lines.push(cleaned);
+            }
+            continue;
+        }
+
+        let cleaned = strip_inline_markdown(trimmed);
+        if !cleaned.is_empty() {
+            lines.push(cleaned);
+        }
+    }
+
+    lines
+}
+
 /// Parses a GitHub Releases API JSON response into `(UpdateInfo, Option<companion_sha256_url>)`.
 ///
-/// Prefers `FreetonVPN-Setup-x64.exe` (falling back to the first `.exe` asset) and locates a
-/// companion `<installer_name>.sha256` (or first `*.sha256`) release asset URL when present.
+/// Prefers `FreetonVPN-Setup-x64.exe` (falling back to the first `.exe` asset), extracts an
+/// inline `asset["digest"]` SHA-256 when provided, and locates a companion
+/// `<installer_name>.sha256` (or first `*.sha256`) release asset URL when present.
 pub fn parse_github_release_info(
     data: &Value,
 ) -> Result<(UpdateInfo, Option<String>), UpdateError> {
@@ -259,13 +412,7 @@ pub fn parse_github_release_info(
     let changelog = data
         .get("body")
         .and_then(Value::as_str)
-        .map(|body| {
-            body.lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
+        .map(extract_release_changelog_lines)
         .unwrap_or_default();
 
     let assets = data
@@ -291,25 +438,40 @@ pub fn parse_github_release_info(
             })
         });
 
-    let (installer_name, download_url, file_size_bytes) = if let Some(asset) = chosen_exe {
-        (
-            asset
-                .get("name")
+    let (installer_name, download_url, file_size_bytes, asset_sha256) =
+        if let Some(asset) = chosen_exe {
+            let digest = asset
+                .get("digest")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .unwrap_or("")
-                .to_owned(),
-            asset
-                .get("browser_download_url")
-                .and_then(Value::as_str)
+                .and_then(|raw| {
+                    raw.strip_prefix("sha256:")
+                        .or_else(|| raw.strip_prefix("SHA256:"))
+                        .or(Some(raw))
+                })
                 .map(str::trim)
-                .unwrap_or("")
-                .to_owned(),
-            asset.get("size").and_then(Value::as_u64).unwrap_or(0),
-        )
-    } else {
-        (String::new(), String::new(), 0)
-    };
+                .filter(|hex| is_valid_sha256_hex(hex))
+                .map(|hex| hex.to_ascii_lowercase())
+                .unwrap_or_default();
+            (
+                asset
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .to_owned(),
+                asset
+                    .get("browser_download_url")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .to_owned(),
+                asset.get("size").and_then(Value::as_u64).unwrap_or(0),
+                digest,
+            )
+        } else {
+            (String::new(), String::new(), 0, String::new())
+        };
 
     let sha_asset_url = if !installer_name.is_empty() && !download_url.is_empty() {
         let expected_sha_name = format!("{installer_name}.sha256");
@@ -347,7 +509,7 @@ pub fn parse_github_release_info(
             changelog,
             download_url,
             file_size_bytes,
-            sha256: String::new(),
+            sha256: asset_sha256,
             mandatory: false,
             min_supported_version: String::new(),
         },
@@ -684,7 +846,7 @@ pub async fn fetch_update_info_with_base(
     let gh_json: Value = gh_resp.json().await?;
     let (mut info, sha_asset_url) = parse_github_release_info(&gh_json)?;
 
-    if !info.download_url.is_empty() {
+    if !info.download_url.is_empty() && info.sha256.is_empty() {
         if let Some(asset_url) = sha_asset_url {
             if let Ok(validated_sha_url) = validate_download_url(&asset_url) {
                 let expected_name = Url::parse(&info.download_url)
@@ -692,7 +854,11 @@ pub async fn fetch_update_info_with_base(
                     .map(|u| sanitize_installer_filename(&u));
                 if let Ok(sha_resp) = client
                     .get(validated_sha_url)
-                    .timeout(Duration::from_secs(8))
+                    .timeout(Duration::from_secs(15))
+                    .header(
+                        USER_AGENT,
+                        format!("FreetonVPN-Desktop-Updater/{APP_VERSION}"),
+                    )
                     .send()
                     .await
                 {
@@ -1593,5 +1759,105 @@ mod tests {
         assert!(matches!(err, UpdateError::InvalidManifest(_)));
 
         server_task.abort();
+    }
+
+    #[test]
+    fn test_default_manifest_url_targets_master_and_github_asset_digest_populates_sha256() {
+        assert!(
+            DEFAULT_RUST_VERSION_JSON_URL.ends_with("/refs/heads/master/version-rust.json"),
+            "DEFAULT_RUST_VERSION_JSON_URL must point to master branch: {DEFAULT_RUST_VERSION_JSON_URL}"
+        );
+
+        let expected_sha = "EAebc63a54dd3fa55ea9ec6dca34d4297ab634b8cb9efcc136f28254a59abda5";
+        let release = serde_json::json!({
+            "tag_name": "v3.0.1",
+            "name": "FreetonVPN v3.0.1",
+            "published_at": "2026-11-26T12:00:00Z",
+            "body": "### Improvements\n* Smooth drag",
+            "assets": [{
+                "name": "FreetonVPN-Setup-x64.exe",
+                "browser_download_url": "https://github.com/datpusheen/FreetonVPN/releases/download/v3.0.1/FreetonVPN-Setup-x64.exe",
+                "size": 8445772,
+                "digest": format!("sha256:{expected_sha}")
+            }]
+        });
+
+        let (info, sha_asset) =
+            parse_github_release_info(&release).expect("parse GitHub release with digest");
+        assert!(sha_asset.is_none());
+        assert_eq!(info.sha256, expected_sha.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn test_extract_release_changelog_lines_strips_markdown_and_trailing_sections() {
+        let body = "\
+# ⚡ Freeton VPN v3.0.1 - Smooth Drag, UI Alignment & Dev Update URL\n\
+> Bản cập nhật nhỏ **v3.0.1** tối ưu trải nghiệm kéo thả cửa sổ.\n\
+---\n\
+### 🛠️ Cải Tiến & Sửa Lỗi (Improvements & Bug Fixes)\n\
+* **Kéo thả cửa sổ mượt mà hơn**:\n\
+  * Chuyển cơ chế kéo sang Win32 trực tiếp (`GetCursorPos` + `SetCapture`).\n\
+* **Đồng bộ UI**: Căn giữa các biểu tượng [tài liệu](https://example.com).\n\
+### 🛡️ Kiểm Tra An Toàn & Bảo Mật\n\
+| Hạng mục | Trạng thái |\n\
+| --- | --- |\n\
+| VirusTotal | 0/72 |\n\
+### 📦 Hướng Dẫn Cài Đặt\n\
+```powershell\n\
+Get-FileHash FreetonVPN-Setup-x64.exe\n\
+```\n\
+<sub>Phát hành bởi pishun</sub>\n";
+
+        let lines = extract_release_changelog_lines(body);
+        assert!(
+            !lines.is_empty(),
+            "expected structured changelog lines, got empty"
+        );
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("▸ Kéo thả cửa sổ mượt mà hơn"),
+            "expected clean group header, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("Chuyển cơ chế kéo sang Win32 trực tiếp (GetCursorPos + SetCapture)."),
+            "expected cleaned child bullet, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("Đồng bộ UI: Căn giữa các biểu tượng tài liệu."),
+            "expected stripped markdown link and bold, got:\n{joined}"
+        );
+        for forbidden in [
+            "# ",
+            "###",
+            "**",
+            "`",
+            "---",
+            "VirusTotal",
+            "Get-FileHash",
+            "<sub>",
+            "https://example.com",
+        ] {
+            assert!(
+                !joined.contains(forbidden),
+                "unexpected raw markdown or trailing section `{forbidden}` in:\n{joined}"
+            );
+        }
+
+        let info = UpdateInfo {
+            version: "3.0.1".to_owned(),
+            release_date: "2026-11-26".to_owned(),
+            title: "v3.0.1".to_owned(),
+            changelog: lines,
+            download_url: String::new(),
+            file_size_bytes: 0,
+            sha256: String::new(),
+            mandatory: false,
+            min_supported_version: String::new(),
+        };
+        let formatted = info.formatted_changelog();
+        assert!(
+            !formatted.contains("• ▸"),
+            "group header must not get extra bullet prefix:\n{formatted}"
+        );
     }
 }

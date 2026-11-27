@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use egui::{
-    Align, Color32, CornerRadius, CursorIcon, Key, Layout, Margin, PointerButton, Rect, RichText,
-    ScrollArea, Sense, TextEdit, TextStyle, Ui, Vec2,
+    Align, Color32, CornerRadius, CursorIcon, Key, Layout, Margin, Rect, RichText, ScrollArea,
+    Sense, TextEdit, TextStyle, Ui, Vec2,
 };
 use freeton_core::storage::{ClientConfig, CredentialStore, DEFAULT_WG_ADDRESS};
 use freeton_core::wg::{validate_address_list, validate_dns_list, validate_wg_key};
@@ -21,44 +21,43 @@ use crate::ui::{
     C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT_DIM, C_TEXT_MUTED, C_WARNING,
 };
 
-pub const DEV_MODE_HOLD_DURATION: Duration = Duration::from_millis(750);
+pub const DEV_MODE_TAP_COUNT: u8 = 10;
+pub const DEV_MODE_TAP_WINDOW: Duration = Duration::from_secs(3);
 
 const UNIX_EPOCH_IN_WINDOWS_TICKS: u64 = 116_444_736_000_000_000;
 const WINDOWS_TICKS_PER_SECOND: u64 = 10_000_000;
 
 #[derive(Debug, Clone, Default)]
-pub struct MiddleHoldTracker {
-    pressed_at: Option<Instant>,
-    triggered: bool,
+pub struct DevModeTapTracker {
+    count: u8,
+    last_tap_at: Option<Instant>,
 }
 
-impl MiddleHoldTracker {
-    pub fn on_press(&mut self, now: Instant) {
-        self.pressed_at = Some(now);
-        self.triggered = false;
+impl DevModeTapTracker {
+    pub fn reset(&mut self) {
+        self.count = 0;
+        self.last_tap_at = None;
     }
 
-    pub fn on_release(&mut self) {
-        self.pressed_at = None;
-        self.triggered = false;
-    }
-
-    pub fn poll(&mut self, now: Instant) -> bool {
-        let Some(started) = self.pressed_at else {
-            return false;
-        };
-        if self.triggered {
-            return false;
+    pub fn register_tap(&mut self, now: Instant) -> bool {
+        let within_window = self
+            .last_tap_at
+            .is_some_and(|prev| now.saturating_duration_since(prev) <= DEV_MODE_TAP_WINDOW);
+        if within_window {
+            self.count = self.count.saturating_add(1);
+        } else {
+            self.count = 1;
         }
-        if now.saturating_duration_since(started) >= DEV_MODE_HOLD_DURATION {
-            self.triggered = true;
+        self.last_tap_at = Some(now);
+        if self.count >= DEV_MODE_TAP_COUNT {
+            self.reset();
             return true;
         }
         false
     }
 
-    pub fn is_holding(&self) -> bool {
-        self.pressed_at.is_some() && !self.triggered
+    pub fn tap_count(&self) -> u8 {
+        self.count
     }
 }
 
@@ -303,7 +302,7 @@ pub fn render_dialog_overlay(
                 .rect_filled(screen_rect, 0.0, Color32::from_black_alpha(backdrop_alpha));
         });
 
-    let card_resp = egui::Area::new(egui::Id::unique("dialog_card"))
+    egui::Area::new(egui::Id::unique("dialog_card"))
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_CENTER, Vec2::new(0.0, slide_y))
         .show(ctx, |ui| {
@@ -326,33 +325,6 @@ pub fn render_dialog_overlay(
                 }
             })
         });
-
-    if state.active_dialog == ActiveDialog::Settings {
-        handle_settings_middle_mouse_hold(ctx, state, card_resp.response.rect);
-    }
-}
-
-fn handle_settings_middle_mouse_hold(ctx: &egui::Context, state: &mut AppState, card_rect: Rect) {
-    let (pressed, down, released, pos) = ctx.input(|i| {
-        (
-            i.pointer.button_pressed(PointerButton::Middle),
-            i.pointer.button_down(PointerButton::Middle),
-            i.pointer.button_released(PointerButton::Middle),
-            i.pointer.interact_pos(),
-        )
-    });
-    let now = Instant::now();
-    if pressed && pos.is_some_and(|p| card_rect.contains(p)) {
-        state.settings_middle_hold.on_press(now);
-    }
-    if released || !down {
-        state.settings_middle_hold.on_release();
-    } else if state.settings_middle_hold.poll(now) {
-        state.toggle_dev_mode();
-    }
-    if state.settings_middle_hold.is_holding() {
-        ctx.request_repaint_after(Duration::from_millis(40));
-    }
 }
 
 fn render_logout_confirm_dialog(ui: &mut Ui, state: &mut AppState, store: &dyn CredentialStore) {
@@ -391,12 +363,17 @@ fn render_about_dialog(ui: &mut Ui, state: &mut AppState) {
         crate::ui::render_brand_logo(ui, 42.0);
         ui.add_space(4.0);
         ui.label(RichText::new(APP_NAME).size(17.0).strong().color(C_TEXT));
-        ui.label(
-            RichText::new(format!("by pishun • v{APP_VERSION}"))
-                .size(11.5)
-                .italics()
-                .color(C_ACCENT),
-        );
+        let ver_resp = ui
+            .label(
+                RichText::new(format!("by pishun • v{APP_VERSION}"))
+                    .size(11.5)
+                    .italics()
+                    .color(C_ACCENT),
+            )
+            .interact(Sense::click());
+        if ver_resp.clicked() && state.settings_dev_taps.register_tap(Instant::now()) {
+            state.toggle_dev_mode();
+        }
     });
     ui.add_space(8.0);
     ui.label(
@@ -465,12 +442,17 @@ fn render_about_dialog(ui: &mut Ui, state: &mut AppState) {
 
 fn render_settings_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("⚙️ Cài Đặt Hệ Thống")
-                .size(15.0)
-                .strong()
-                .color(C_TEXT),
-        );
+        let title_resp = ui
+            .label(
+                RichText::new("⚙️ Cài Đặt Hệ Thống")
+                    .size(15.0)
+                    .strong()
+                    .color(C_TEXT),
+            )
+            .interact(Sense::click());
+        if title_resp.clicked() && state.settings_dev_taps.register_tap(Instant::now()) {
+            state.toggle_dev_mode();
+        }
         if state.client_config.debug_mode {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let badge_style = PillStyle {
@@ -480,7 +462,7 @@ fn render_settings_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState
                     ..PillStyle::accent(22.0)
                 };
                 if pill_button(ui, "🛠️ DEV MODE", Some(88.0), badge_style)
-                    .on_hover_text("Nhấn hoặc giữ chuột giữa 750ms để tắt Dev Mode")
+                    .on_hover_text("Nhấn để tắt Dev Mode (hoặc bấm 10 lần vào tiêu đề để bật/tắt)")
                     .clicked()
                 {
                     state.toggle_dev_mode();
@@ -951,6 +933,111 @@ fn render_settings_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState
     });
 }
 
+fn append_wrapped_label(ui: &mut Ui, job: egui::text::LayoutJob, max_w: f32) {
+    ui.vertical(|ui| {
+        ui.set_width(max_w);
+        ui.set_max_width(max_w);
+        ui.add(egui::Label::new(job).wrap());
+    });
+}
+
+fn render_changelog_items(ui: &mut Ui, entries: &[String], content_w: f32) {
+    let max_w = content_w.clamp(120.0, 308.0);
+    ui.set_max_width(max_w);
+
+    if entries.is_empty() {
+        ui.label(
+            RichText::new("Không có thông tin thay đổi.")
+                .size(11.0)
+                .color(C_TEXT_DIM),
+        );
+        return;
+    }
+
+    let mut rendered_any = false;
+    for raw in entries {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed.starts_with('▸') {
+            if rendered_any {
+                ui.add_space(4.0);
+            }
+            let mut hdr_job = egui::text::LayoutJob::default();
+            hdr_job.append(
+                trimmed,
+                0.0,
+                egui::TextFormat::simple(egui::FontId::proportional(11.0), C_ACCENT),
+            );
+            hdr_job.wrap.max_width = max_w;
+            append_wrapped_label(ui, hdr_job, max_w);
+            ui.add_space(2.0);
+            rendered_any = true;
+            continue;
+        }
+
+        let bullet_text = trimmed
+            .strip_prefix("• ")
+            .or_else(|| trimmed.strip_prefix("- "))
+            .or_else(|| trimmed.strip_prefix("* "))
+            .unwrap_or(trimmed)
+            .trim();
+        if bullet_text.is_empty() {
+            continue;
+        }
+
+        ui.horizontal_top(|ui| {
+            ui.set_max_width(max_w);
+            ui.add_space(2.0);
+            ui.label(RichText::new("•").size(11.0).strong().color(C_ACCENT));
+            ui.add_space(4.0);
+
+            let text_w = (max_w - 22.0).max(80.0);
+            let mut job = egui::text::LayoutJob::default();
+            if let Some((prefix, desc)) = bullet_text.split_once(": ") {
+                if !prefix.is_empty() && prefix.chars().count() <= 36 && !prefix.contains("://") {
+                    job.append(
+                        &format!("{prefix}:"),
+                        0.0,
+                        egui::TextFormat::simple(egui::FontId::proportional(11.0), C_TEXT),
+                    );
+                    job.append(
+                        &format!(" {desc}"),
+                        0.0,
+                        egui::TextFormat::simple(egui::FontId::proportional(11.0), C_TEXT_DIM),
+                    );
+                } else {
+                    job.append(
+                        bullet_text,
+                        0.0,
+                        egui::TextFormat::simple(egui::FontId::proportional(11.0), C_TEXT),
+                    );
+                }
+            } else {
+                job.append(
+                    bullet_text,
+                    0.0,
+                    egui::TextFormat::simple(egui::FontId::proportional(11.0), C_TEXT),
+                );
+            }
+            job.wrap.max_width = text_w;
+            append_wrapped_label(ui, job, text_w);
+        });
+        ui.add_space(2.5);
+        rendered_any = true;
+    }
+
+    if !rendered_any {
+        ui.label(
+            RichText::new("Không có thông tin thay đổi.")
+                .size(11.0)
+                .color(C_TEXT_DIM),
+        );
+    }
+}
+
 fn render_update_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("🚀").size(18.0).color(C_ACCENT));
@@ -1014,17 +1101,14 @@ fn render_update_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) 
     );
     ui.add_space(3.0);
     rounded_card(ui, C_BG, C_BORDER, 8, Margin::same(8), |ui| {
-        ui.set_width(ui.available_width());
+        let card_inner_w = ui.available_width().min(308.0);
+        ui.set_width(card_inner_w);
         ScrollArea::vertical()
             .id_salt("update_changelog_scroll")
             .max_height(155.0)
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                ui.label(
-                    RichText::new(info.formatted_changelog())
-                        .size(11.0)
-                        .color(C_TEXT),
-                );
+                render_changelog_items(ui, &info.changelog, card_inner_w - 8.0);
             });
     });
 
@@ -1455,41 +1539,135 @@ mod tests {
     use freeton_core::updater::{UpdateAction, UpdateInfo};
 
     #[test]
-    fn test_middle_mouse_hold_750ms_toggles_dev_mode_and_persists() {
-        let mut tracker = MiddleHoldTracker::default();
+    fn test_ten_consecutive_taps_toggle_dev_mode_and_persists() {
+        let mut tracker = DevModeTapTracker::default();
         let t0 = Instant::now();
 
-        tracker.on_press(t0);
-        assert!(!tracker.poll(t0 + Duration::from_millis(500)));
-        assert!(!tracker.poll(t0 + Duration::from_millis(749)));
-        tracker.on_release();
+        for i in 0..9 {
+            assert!(
+                !tracker.register_tap(t0 + Duration::from_millis(i * 150)),
+                "must not trigger before 10th tap (tap {})",
+                i + 1
+            );
+        }
+        assert!(
+            tracker.register_tap(t0 + Duration::from_millis(9 * 150)),
+            "10th consecutive tap within window must trigger"
+        );
+        assert_eq!(tracker.tap_count(), 0);
 
-        // Re-press and hold past 750ms: fires exactly once per press.
-        let t1 = t0 + Duration::from_secs(1);
-        tracker.on_press(t1);
-        assert!(!tracker.poll(t1 + Duration::from_millis(749)));
-        assert!(tracker.poll(t1 + Duration::from_millis(750)));
-        assert!(!tracker.poll(t1 + Duration::from_millis(1500)));
-        tracker.on_release();
+        // Stale gap resets counter so 9 + delayed 1 does not trigger, then 9 more do.
+        for i in 0..9 {
+            assert!(!tracker.register_tap(t0 + Duration::from_secs(10) + Duration::from_millis(i * 100)));
+        }
+        let after_gap = t0 + Duration::from_secs(20);
+        assert!(!tracker.register_tap(after_gap));
+        assert_eq!(tracker.tap_count(), 1);
+        for i in 1..9 {
+            assert!(!tracker.register_tap(after_gap + Duration::from_millis(i * 100)));
+        }
+        assert!(tracker.register_tap(after_gap + Duration::from_millis(9 * 100)));
 
-        let mut state = AppState::new(false, None, ClientConfig::default(), None, Vec::new());
+        // Verify clicking Settings header 10 times in egui UI toggles Dev Mode & persists.
+        struct NoopStore;
+        impl freeton_core::storage::CredentialStore for NoopStore {
+            fn get_password(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<Option<String>, freeton_core::storage::StorageError> {
+                Ok(None)
+            }
+            fn set_password(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), freeton_core::storage::StorageError> {
+                Ok(())
+            }
+            fn delete_password(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), freeton_core::storage::StorageError> {
+                Ok(())
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let store = NoopStore;
+        let mut state = AppState::new(
+            true,
+            Some("user@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            Vec::new(),
+        );
         let _ = state.drain_commands();
+        state.open_settings_dialog();
+
+        let mut title_pos = None;
+        for _ in 0..2 {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(crate::ui::WINDOW_WIDTH, crate::ui::WINDOW_HEIGHT),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw_input, |ui| {
+                crate::ui::render_root(ui, &mut state, &store);
+            });
+            out.textures_delta.clear();
+            for clipped in &out.shapes {
+                if let egui::epaint::Shape::Text(t) = &clipped.shape {
+                    if t.galley.text().contains("Cài Đặt Hệ Thống") {
+                        title_pos = Some(t.pos + t.galley.size() * 0.5);
+                    }
+                }
+            }
+        }
+        let click_pos = title_pos.expect("Settings title position");
         assert!(!state.client_config.debug_mode);
 
-        state.toggle_dev_mode();
+        for tap in 0..10 {
+            for pressed in [true, false] {
+                let raw_input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(crate::ui::WINDOW_WIDTH, crate::ui::WINDOW_HEIGHT),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(click_pos),
+                        egui::Event::PointerButton {
+                            pos: click_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(raw_input, |ui| {
+                    crate::ui::render_root(ui, &mut state, &store);
+                });
+                out.textures_delta.clear();
+            }
+            if tap < 9 {
+                assert!(
+                    !state.client_config.debug_mode,
+                    "Dev Mode toggled early at tap {}",
+                    tap + 1
+                );
+            }
+        }
+
         assert!(state.client_config.debug_mode);
         let cmds = state.drain_commands();
         assert!(cmds.iter().any(|c| matches!(
             c,
             UiCommand::SaveClientConfig { config } if config.debug_mode
-        )));
-
-        state.toggle_dev_mode();
-        assert!(!state.client_config.debug_mode);
-        let cmds2 = state.drain_commands();
-        assert!(cmds2.iter().any(|c| matches!(
-            c,
-            UiCommand::SaveClientConfig { config } if !config.debug_mode
         )));
     }
 
@@ -2145,6 +2323,93 @@ mod tests {
         assert!(
             dev_text.contains("UPDATE MANIFEST URL"),
             "Dev Mode Settings must show Update Manifest URL: {dev_text}"
+        );
+    }
+
+    #[test]
+    fn test_update_dialog_renders_structured_changelog_without_markdown_noise() {
+        use freeton_core::storage::{CredentialStore, StorageError};
+
+        struct NoopStore;
+        impl CredentialStore for NoopStore {
+            fn get_password(&self, _: &str, _: &str) -> Result<Option<String>, StorageError> {
+                Ok(None)
+            }
+            fn set_password(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+            fn delete_password(&self, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let store = NoopStore;
+        let mut state = AppState::new(true, Some("user@proton.me".to_owned()), ClientConfig::default(), None, Vec::new());
+        state.available_update = Some(UpdateInfo {
+            version: "3.0.1".to_owned(),
+            release_date: "2026-11-26".to_owned(),
+            title: "FreetonVPN v3.0.1".to_owned(),
+            changelog: vec![
+                "▸ Kéo thả cửa sổ mượt mà hơn".to_owned(),
+                "Chuyển cơ chế kéo sang Win32 trực tiếp (GetCursorPos + SetCapture).".to_owned(),
+                "Đồng bộ UI: Căn giữa các biểu tượng.".to_owned(),
+            ],
+            download_url: "https://github.com/datpusheen/FreetonVPN/releases/download/v3.0.1/FreetonVPN-Setup-x64.exe".to_owned(),
+            file_size_bytes: 8_445_772,
+            sha256: "a".repeat(64),
+            mandatory: false,
+            min_supported_version: "3.0.0".to_owned(),
+        });
+        state.active_dialog = ActiveDialog::Update;
+
+        let mut last_out = None;
+        for _ in 0..2 {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(crate::ui::WINDOW_WIDTH, crate::ui::WINDOW_HEIGHT),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw_input, |ui| {
+                crate::ui::render_root(ui, &mut state, &store);
+            });
+            out.textures_delta.clear();
+            last_out = Some(out);
+        }
+
+        let card_rect = ctx
+            .memory(|m| m.area_rect(egui::Id::unique("dialog_card")))
+            .expect("Update dialog_card rect");
+        assert!(
+            card_rect.min.x >= 0.0
+                && card_rect.min.y >= 0.0
+                && card_rect.max.x <= crate::ui::WINDOW_WIDTH
+                && card_rect.max.y <= crate::ui::WINDOW_HEIGHT
+                && card_rect.width() <= 356.0,
+            "Update dialog overflowed flyout bounds: {card_rect:?}"
+        );
+
+        let out = last_out.expect("frame output");
+        let mut rendered = String::new();
+        for clipped in &out.shapes {
+            if let egui::epaint::Shape::Text(t) = &clipped.shape {
+                rendered.push_str(t.galley.text());
+                rendered.push('\n');
+            }
+        }
+        assert!(
+            rendered.contains("Kéo thả cửa sổ mượt mà hơn"),
+            "missing structured header in rendered UpdateDialog:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Đồng bộ UI: Căn giữa các biểu tượng."),
+            "missing bullet text in rendered UpdateDialog:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("• #") && !rendered.contains("• ▸"),
+            "rendered UpdateDialog must not show raw `• #` or `• ▸` prefixes:\n{rendered}"
         );
     }
 }

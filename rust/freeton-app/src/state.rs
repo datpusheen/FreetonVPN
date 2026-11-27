@@ -41,7 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::captcha::{solve_challenge_blocking, CaptchaError};
 use crate::ui::dialogs::{
-    parse_wireguard_conf, sibling_service_exe_path, validate_https_browser_url, MiddleHoldTracker,
+    parse_wireguard_conf, sibling_service_exe_path, validate_https_browser_url, DevModeTapTracker,
     ParsedWireGuardConf,
 };
 
@@ -892,7 +892,7 @@ pub struct AppState {
     pub settings_key_fetching: bool,
     pub settings_conf_importing: bool,
     pub settings_status_msg: Option<StatusNotice>,
-    pub settings_middle_hold: MiddleHoldTracker,
+    pub settings_dev_taps: DevModeTapTracker,
     pub window_visible: bool,
     pub window_drag_active: bool,
     pub user_has_custom_dragged: bool,
@@ -996,7 +996,7 @@ impl AppState {
             settings_key_fetching: false,
             settings_conf_importing: false,
             settings_status_msg: None,
-            settings_middle_hold: MiddleHoldTracker::default(),
+            settings_dev_taps: DevModeTapTracker::default(),
             window_visible: true,
             window_drag_active: false,
             user_has_custom_dragged: false,
@@ -1122,7 +1122,7 @@ impl AppState {
     pub fn open_settings_dialog(&mut self) {
         self.settings_draft = SettingsDraft::from_config(&self.client_config, self.startup_enabled);
         self.settings_status_msg = None;
-        self.settings_middle_hold.on_release();
+        self.settings_dev_taps.reset();
         if self.service_repair_phase != ServiceRepairPhase::LaunchingAndWaiting {
             self.service_repair_phase = ServiceRepairPhase::Idle;
             self.service_repair_detail = None;
@@ -1135,6 +1135,7 @@ impl AppState {
     }
 
     pub fn open_about_dialog(&mut self) {
+        self.settings_dev_taps.reset();
         self.return_dialog = None;
         self.active_dialog = ActiveDialog::About;
         self.window_visible = true;
@@ -1170,8 +1171,8 @@ impl AppState {
             self.service_repair_phase = ServiceRepairPhase::Idle;
             self.service_repair_detail = None;
         }
-        if self.active_dialog == ActiveDialog::Settings {
-            self.settings_middle_hold.on_release();
+        if matches!(self.active_dialog, ActiveDialog::Settings | ActiveDialog::About) {
+            self.settings_dev_taps.reset();
         }
         self.return_dialog = None;
         self.active_dialog = ActiveDialog::None;
@@ -1302,7 +1303,7 @@ impl AppState {
         self.pending_commands.push(UiCommand::SetStartupEnabled {
             enabled: self.settings_draft.startup_enabled,
         });
-        self.settings_middle_hold.on_release();
+        self.settings_dev_taps.reset();
         self.settings_status_msg = None;
         self.return_dialog = None;
         self.active_dialog = ActiveDialog::None;

@@ -1,3 +1,9 @@
+# 3.0.2 — sửa cập nhật trực tiếp trong app & render changelog gọn đẹp (2026-11-27)
+
+- Chuyển URL `version-rust.json` mặc định trên ứng dụng và website từ nhánh `main` sang `master`.
+- Đọc trực tiếp `asset["digest"]` (`sha256:...`) từ GitHub Releases API trong `parse_github_release_info` và chỉ tải file `.sha256` dự phòng khi `digest` trống (kèm tăng timeout lên 15s và `USER_AGENT`), giúp nút cập nhật tải trực tiếp trong app thay vì đẩy ra trình duyệt.
+- Thêm bộ lọc Markdown (`extract_release_changelog_lines`) và nâng cấp UI `render_changelog_items` trong `UpdateDialog` để nhóm tiêu đề, bỏ ký tự Markdown thô/phụ lục và xuống dòng gọn trong popup.
+
 # 3.0.1 — mượt kéo cửa sổ, đối xứng UI và Dev Update URL (2026-11-26)
 
 - Chuyển cơ chế kéo cửa sổ trên thanh tiêu đề sang Win32 trực tiếp (`GetCursorPos` + `SetCapture` + `SetWindowPos`), loại bỏ độ trễ modal loop gây khựng khi di chuyển app.
