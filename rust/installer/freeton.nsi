@@ -4,7 +4,7 @@
 Unicode true
 
 !ifndef APP_VERSION
-  !define APP_VERSION "3.0.2"
+  !define APP_VERSION "3.0.3"
 !endif
 !ifndef APP_VI_VERSION
   !define APP_VI_VERSION "${APP_VERSION}.0"

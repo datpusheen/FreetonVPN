@@ -1,18 +1,21 @@
 {
-    "version":  "3.0.2",
+    "version":  "3.0.3",
     "release_date":  "2026-11-27",
-    "title":  "Freeton VPN Desktop Client v3.0.2",
+    "title":  "Freeton VPN Desktop Client v3.0.3",
     "changelog":  [
-                      "▸ Tự động cập nhật trực tiếp trong app",
-                      "Nhánh master chuẩn: Trỏ version-rust.json mặc định về refs/heads/master.",
-                      "Xác thực SHA-256 tức thì: Đọc thẳng asset digest từ GitHub Releases API (fallback .sha256 tăng timeout lên 15s), tải và cài đặt ngay trong app.",
-                      "▸ Hiển thị Changelog gọn đẹp",
-                      "Lọc Markdown thô: Tự động bỏ tiêu đề #, trích dẫn \u003e, bảng và phần phụ lục kỹ thuật khi lấy từ GitHub Release.",
-                      "Render phân nhóm: Tiêu đề nhóm nổi bật, bullet căn lề và tự xuống dòng chuẩn trong popup."
+                      "▸ Tối ưu RAM \u0026 hiệu năng",
+                      "OpenGL mặc định \u0026 tinh gọn crate: Giảm đáng kể RAM/thread, loại bỏ driver DX12 nặng khi chạy trên GPU rời.",
+                      "Thu dọn bộ nhớ thông minh: Tự động cắt working set sau khởi tạo và khi ẩn khay, giãn nhịp vẽ lại lúc nhàn rỗi.",
+                      "▸ Khởi chạy đa máy, VM \u0026 hiển thị",
+                      "CRT tĩnh (+crt-static): Chạy trực tiếp trên Windows mới cài mà không cần cài thêm Visual C++ Redistributable.",
+                      "Dự phòng đồ họa 3 tầng \u0026 WARP cho VM/RDP: Tự động ưu tiên render phần mềm WARP trong máy ảo để tránh đen màn hình.",
+                      "Chữ sắc nét \u0026 Emoji đủ màu: Bật font hinting rõ nét và khôi phục rasterize emoji màu (epaint color_fonts).",
+                      "▸ Ổn định kết nối WireGuard",
+                      "Kiểm tra \u0026 đồng bộ sẵn DLL: Tự động stage tunnel.dll / wireguard.dll khi build và báo lỗi rõ ràng nếu thiếu DLL dịch vụ."
                   ],
-    "download_url":  "https://github.com/datpusheen/FreetonVPN/releases/download/v3.0.2/FreetonVPN-Setup-x64.exe",
-    "file_size_bytes":  8265957,
-    "sha256":  "794a86fc090b979b655686549e0fc9387c8b8aeb176a3f0977b3292608028377",
+    "download_url":  "https://github.com/datpusheen/FreetonVPN/releases/download/v3.0.3/FreetonVPN-Setup-x64.exe",
+    "file_size_bytes":  8267484,
+    "sha256":  "c5ee87ee03dbf8b6ad0eece86ac2ad7b3e0f7149acaa46c4938d3ea5dbf558b5",
     "mandatory":  false,
     "min_supported_version":  "3.0.0"
 }

@@ -1500,7 +1500,7 @@ dependencies = [
 
 [[package]]
 name = "freeton-app"
-version = "3.0.2"
+version = "3.0.3"
 dependencies = [
  "eframe",
  "egui",
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "freeton-core"
-version = "3.0.2"
+version = "3.0.3"
 dependencies = [
  "base64 0.23.1",
  "bcrypt",
@@ -1547,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "freeton-service"
-version = "3.0.2"
+version = "3.0.3"
 dependencies = [
  "freeton-core",
  "serde_json",
