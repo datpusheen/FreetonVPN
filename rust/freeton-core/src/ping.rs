@@ -276,6 +276,7 @@ pub async fn ping_servers_with<P, Fut, F>(
         return;
     }
 
+    let ping_started = std::time::Instant::now();
     let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
     let mut index_by_target: HashMap<String, usize> = HashMap::new();
     let mut empty_indices: Vec<usize> = Vec::new();
@@ -304,6 +305,13 @@ pub async fn ping_servers_with<P, Fut, F>(
         on_progress(completed, total);
         return;
     }
+    tracing::info!(
+        servers = total,
+        unique_targets = groups.len(),
+        timeout_ms,
+        max_workers = max_workers.max(1),
+        "Starting ICMP ping scan"
+    );
     if completed > 0 {
         on_progress(completed, total);
     }
@@ -348,6 +356,21 @@ pub async fn ping_servers_with<P, Fut, F>(
             on_progress(completed, total);
         }
     }
+
+    let mut pings: Vec<f64> = servers.iter().filter_map(|s| s.ping_ms).collect();
+    pings.sort_by(f64::total_cmp);
+    let min_ms = pings.first().copied().map(|v| v.round() as u64);
+    let median_ms = (!pings.is_empty()).then(|| pings[pings.len() / 2].round() as u64);
+    let max_ms = pings.last().copied().map(|v| v.round() as u64);
+    tracing::info!(
+        reachable = pings.len(),
+        total,
+        elapsed_ms = ping_started.elapsed().as_millis() as u64,
+        min_ms = ?min_ms,
+        median_ms = ?median_ms,
+        max_ms = ?max_ms,
+        "Completed ICMP ping scan"
+    );
 }
 
 #[cfg(test)]

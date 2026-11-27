@@ -77,6 +77,14 @@ pub enum ApiError {
         api_code: i64,
         message: String,
     },
+    #[error(
+        "Phiên đăng nhập Proton đã hết hạn hoặc bị thu hồi (HTTP {http_status}, Code {api_code}): {message}"
+    )]
+    SessionExpired {
+        http_status: u16,
+        api_code: i64,
+        message: String,
+    },
     #[error("Proton API trả về lỗi (HTTP {http_status}, Code {api_code}): {message}")]
     Proton {
         http_status: u16,
@@ -89,9 +97,9 @@ impl ApiError {
     /// Returns the HTTP status code associated with this error, if any.
     pub fn http_status(&self) -> Option<u16> {
         match self {
-            Self::Unauthorized { http_status, .. } | Self::Proton { http_status, .. } => {
-                Some(*http_status)
-            }
+            Self::Unauthorized { http_status, .. }
+            | Self::SessionExpired { http_status, .. }
+            | Self::Proton { http_status, .. } => Some(*http_status),
             Self::Network(err) => err.status().map(|s| s.as_u16()),
             _ => None,
         }
@@ -100,9 +108,16 @@ impl ApiError {
     /// Returns the Proton JSON `Code` field associated with this error, if any.
     pub fn api_code(&self) -> Option<i64> {
         match self {
-            Self::Unauthorized { api_code, .. } | Self::Proton { api_code, .. } => Some(*api_code),
+            Self::Unauthorized { api_code, .. }
+            | Self::SessionExpired { api_code, .. }
+            | Self::Proton { api_code, .. } => Some(*api_code),
             _ => None,
         }
+    }
+
+    /// Returns true when the Proton refresh token itself was definitively rejected (400/401/422).
+    pub fn is_session_expired(&self) -> bool {
+        matches!(self, Self::SessionExpired { .. })
     }
 }
 
@@ -688,6 +703,7 @@ impl ProtonClient {
             let mut need_refresh = false;
 
             for base in &self.vpn_base_urls {
+                tracing::debug!(method = %method, path, base, attempt, "Proton API request");
                 match self
                     .send_proton_request(
                         base,
@@ -700,6 +716,7 @@ impl ProtonClient {
                     .await
                 {
                     Ok(resp) if resp.status == StatusCode::UNAUTHORIZED => {
+                        tracing::warn!(method = %method, path, base, attempt, "Proton API returned 401 Unauthorized");
                         last_error = Some(Self::response_to_error(&resp));
                         if attempt == 0 {
                             need_refresh = true;
@@ -707,6 +724,7 @@ impl ProtonClient {
                         }
                     }
                     Ok(resp) if resp.status.is_success() && Self::is_success_code(resp.code) => {
+                        tracing::debug!(method = %method, path, base, http_status = resp.status.as_u16(), "Proton API request succeeded");
                         return Ok(resp.payload);
                     }
                     Ok(resp) => {
@@ -722,12 +740,15 @@ impl ProtonClient {
                         );
                         let err = Self::response_to_error(&resp);
                         if can_try_next {
+                            tracing::warn!(method = %method, path, base, http_status = resp.status.as_u16(), "Proton API host failed with retryable status; trying fallback");
                             last_error = Some(err);
                             continue;
                         }
+                        tracing::warn!(method = %method, path, base, error = %err, "Proton API returned error");
                         return Err(err);
                     }
                     Err(err) => {
+                        tracing::warn!(method = %method, path, base, error = %err, "Proton API transport error; trying fallback");
                         last_error = Some(err);
                     }
                 }
@@ -788,6 +809,7 @@ impl ProtonClient {
             }
         }
 
+        tracing::info!("Refreshing Proton access token via auth/v4/refresh");
         for base in refresh_bases {
             match self
                 .send_proton_request(
@@ -824,6 +846,7 @@ impl ProtonClient {
                     };
                     self.store.update_auth_session(&updated)?;
                     self.refresh_generation.fetch_add(1, Ordering::Release);
+                    tracing::info!(base, "Proton access token refreshed cleanly");
                     return Ok(updated);
                 }
                 Ok(resp) => {
@@ -840,7 +863,30 @@ impl ProtonClient {
                         last_error = Some(err);
                         continue;
                     }
-                    // Preserve existing stored credentials even on 401/400/422; only explicit logout clears keyring.
+                    if matches!(
+                        resp.status,
+                        StatusCode::BAD_REQUEST
+                            | StatusCode::UNAUTHORIZED
+                            | StatusCode::UNPROCESSABLE_ENTITY
+                    ) {
+                        let message = if resp.error_message.is_empty() {
+                            format!("HTTP {}", resp.status.as_u16())
+                        } else {
+                            resp.error_message.clone()
+                        };
+                        tracing::warn!(
+                            base,
+                            http_status = resp.status.as_u16(),
+                            api_code = resp.code,
+                            %message,
+                            "Proton rejected refresh token; marking session expired"
+                        );
+                        return Err(ApiError::SessionExpired {
+                            http_status: resp.status.as_u16(),
+                            api_code: resp.code,
+                            message,
+                        });
+                    }
                     return Err(err);
                 }
                 Err(err) => {
@@ -879,9 +925,11 @@ impl ProtonClient {
         let _guard = self.wg_key_mutex.lock().await;
         let current = self.store.load_client_config()?;
         if !force && !current.needs_key_refresh(WG_KEY_REFRESH_WINDOW_SECS) {
+            tracing::debug!(expiration = current.expiration, "Existing WireGuard key still usable");
             return Ok(current);
         }
 
+        tracing::info!(force, "Requesting WireGuard keypair and certificate from Proton API");
         let ec_res = self
             .api_request("vpn/v1/certificate/key/EC", Method::GET, None)
             .await?;
@@ -907,6 +955,7 @@ impl ProtonClient {
         updated.public_key = pub_pem;
         updated.expiration = expiration;
         self.store.save_client_config(&updated)?;
+        tracing::info!(expiration, "Saved updated WireGuard keypair and certificate");
         Ok(updated)
     }
 
@@ -926,7 +975,9 @@ impl ProtonClient {
             )));
         }
         let body: Value = resp.json().await?;
-        Self::require_non_empty_str(&body, "ip")
+        let ip = Self::require_non_empty_str(&body, "ip")?;
+        tracing::info!(%ip, "Resolved public exit IP");
+        Ok(ip)
     }
 
     async fn send_proton_request(
@@ -1760,5 +1811,78 @@ mod tests {
             client.submit_2fa(&pending, "   ").await,
             Err(ApiError::InvalidInput(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_token_rejection_returns_session_expired_while_5xx_does_not() {
+        let session = StoredAuthSession {
+            uid: "uid-exp".to_owned(),
+            access_token: "acc-old".to_owned(),
+            refresh_token: "ref-bad".to_owned(),
+            scopes: vec!["full".to_owned()],
+        };
+
+        let run_case = |refresh_status: &'static str, refresh_body: &'static str| {
+            let sess = session.clone();
+            async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                let task = tokio::spawn(async move {
+                    loop {
+                        let Ok((mut socket, _)) = listener.accept().await else {
+                            break;
+                        };
+                        tokio::spawn(async move {
+                            let req = read_http_request(&mut socket).await;
+                            let first_line = req.lines().next().unwrap_or("");
+                            let (status, body) = if first_line.starts_with("POST /auth/v4/refresh")
+                            {
+                                (refresh_status, refresh_body)
+                            } else {
+                                (
+                                    "401 Unauthorized",
+                                    r#"{"Code":401,"Error":"Invalid access token"}"#,
+                                )
+                            };
+                            let resp = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = socket.write_all(resp.as_bytes()).await;
+                        });
+                    }
+                });
+                let store = Arc::new(MockCredentialStore::with_session("u@proton.me", &sess));
+                let base = format!("http://{addr}");
+                let client = ProtonClient::with_endpoints(
+                    store,
+                    base.clone(),
+                    vec![base.clone()],
+                    base,
+                );
+                let err = client
+                    .fetch_logicals()
+                    .await
+                    .expect_err("refresh failure must return error");
+                task.abort();
+                err
+            }
+        };
+
+        let expired = run_case(
+            "400 Bad Request",
+            r#"{"Code":10013,"Error":"Invalid refresh token"}"#,
+        )
+        .await;
+        assert!(expired.is_session_expired());
+        assert_eq!(expired.http_status(), Some(400));
+        assert_eq!(expired.api_code(), Some(10013));
+
+        let transient = run_case("503 Service Unavailable", r#"{"Code":503,"Error":"Busy"}"#).await;
+        assert!(
+            !transient.is_session_expired(),
+            "5xx outage must NOT mark session expired: {transient:?}"
+        );
     }
 }

@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::io;
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,6 +11,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use freeton_core::api::{
     ApiError, HumanVerificationChallenge, HumanVerificationToken, LoginOutcome, ProtonClient,
     ServerNode,
+};
+use freeton_core::logging::{
+    app_log_dir, build_realtime_log_viewer_script, clean_display_path,
+    encode_powershell_encoded_command, service_log_dir, APP_LOG_FILE_NAME, SERVICE_LOG_FILE_NAME,
+    TUNNEL_LOG_FILE_NAME,
 };
 use freeton_core::ping::{ping_servers, score_server, sort_and_filter_servers, SortMode};
 use freeton_core::storage::{
@@ -352,6 +358,13 @@ pub trait ShellLauncher: Send + Sync {
         working_dir: Option<&Path>,
     ) -> Result<(), String>;
     fn open_https_url(&self, url: &str) -> Result<(), String>;
+    fn open_directory(&self, dir: &Path) -> Result<(), String>;
+    fn open_realtime_log_cli(
+        &self,
+        app_log: &Path,
+        service_log: &Path,
+        tunnel_log: &Path,
+    ) -> Result<(), String>;
 }
 
 struct ComStaGuard(bool);
@@ -452,6 +465,61 @@ impl ShellLauncher for WindowsShellLauncher {
 
     fn open_https_url(&self, url: &str) -> Result<(), String> {
         Self::open_https_url_direct(url)
+    }
+
+    fn open_directory(&self, dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("Không thể tạo thư mục {}: {e}", dir.display()))?;
+        let _com = ComStaGuard::enter();
+        let display = clean_display_path(dir);
+        let dir_w: Vec<u16> = display.encode_utf16().chain(Some(0)).collect();
+        let hinst = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(dir_w.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        let code = hinst.0 as isize;
+        if code > 32 {
+            Ok(())
+        } else {
+            let err = io::Error::last_os_error();
+            Err(format!("Không thể mở thư mục log (mã {code}: {err})."))
+        }
+    }
+
+    fn open_realtime_log_cli(
+        &self,
+        app_log: &Path,
+        service_log: &Path,
+        tunnel_log: &Path,
+    ) -> Result<(), String> {
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        if let Some(parent) = app_log.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let sys_root = std::env::var_os("SystemRoot")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let ps_exe = sys_root
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+
+        let script = build_realtime_log_viewer_script(app_log, service_log, tunnel_log);
+        let encoded = encode_powershell_encoded_command(&script);
+        std::process::Command::new(&ps_exe)
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .args(["-NoLogo", "-NoExit", "-EncodedCommand", &encoded])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("Không thể mở cửa sổ CLI realtime log: {e}"))
     }
 }
 
@@ -639,6 +707,8 @@ pub enum UiCommand {
     OpenExternalUrl {
         url: String,
     },
+    OpenLogFolder,
+    OpenRealtimeLogCli,
     RepairService,
     ExportConf {
         auth_generation: u64,
@@ -687,6 +757,10 @@ pub enum WorkerEvent {
     },
     ScanNeedsLogin {
         auth_generation: u64,
+    },
+    SessionExpired {
+        auth_generation: u64,
+        detail: String,
     },
     WgKeyRefreshed {
         auth_generation: u64,
@@ -1115,11 +1189,13 @@ impl AppState {
             self.show_login_view();
             return;
         }
+        debug!(server_count = self.all_free_servers.len(), "Opened server list drawer");
         self.drawer_scroll_to_top = true;
         self.switch_view(AppView::Drawer, ViewDirection::Forward);
     }
 
     pub fn open_settings_dialog(&mut self) {
+        info!("Opened Settings dialog");
         self.settings_draft = SettingsDraft::from_config(&self.client_config, self.startup_enabled);
         self.settings_status_msg = None;
         self.settings_dev_taps.reset();
@@ -1135,6 +1211,7 @@ impl AppState {
     }
 
     pub fn open_about_dialog(&mut self) {
+        info!("Opened About dialog");
         self.settings_dev_taps.reset();
         self.return_dialog = None;
         self.active_dialog = ActiveDialog::About;
@@ -1142,6 +1219,7 @@ impl AppState {
     }
 
     pub fn open_service_repair_dialog(&mut self) {
+        info!("Opened Service Repair dialog");
         if self.service_repair_phase != ServiceRepairPhase::LaunchingAndWaiting {
             self.service_repair_phase = ServiceRepairPhase::Idle;
             self.service_repair_detail = None;
@@ -1311,6 +1389,15 @@ impl AppState {
             text: "Đã lưu và áp dụng cài đặt thành công!".to_owned(),
             level: NoticeLevel::Success,
         });
+        info!(
+            startup = self.settings_draft.startup_enabled,
+            animations = self.client_config.animations_enabled,
+            auto_check_update = self.client_config.auto_check_update,
+            port = %self.client_config.port,
+            dns = %self.client_config.dns,
+            dev_mode = self.client_config.debug_mode,
+            "Settings saved"
+        );
     }
 
     pub fn toggle_dev_mode(&mut self) {
@@ -1414,6 +1501,26 @@ impl AppState {
         self.pending_commands.push(UiCommand::RepairService);
     }
 
+    pub fn open_log_folder(&mut self) {
+        if self.closing {
+            return;
+        }
+        info!("Opening log directory");
+        self.pending_commands.push(UiCommand::OpenLogFolder);
+    }
+
+    pub fn open_realtime_log_cli(&mut self) {
+        if self.closing {
+            return;
+        }
+        info!(
+            app_log = %app_log_dir().join(APP_LOG_FILE_NAME).display(),
+            service_log = %service_log_dir().join(SERVICE_LOG_FILE_NAME).display(),
+            "Opening Dev Mode realtime CLI log viewer"
+        );
+        self.pending_commands.push(UiCommand::OpenRealtimeLogCli);
+    }
+
     pub fn tick(&mut self, now: Instant) {
         if self.loading.visible {
             if let Some(hide_at) = self.loading.hide_at {
@@ -1489,6 +1596,7 @@ impl AppState {
             return;
         }
         self.is_scanning = true;
+        info!(auth_generation = self.auth_generation, "Starting server scan");
         self.show_loading_status("● Đang kết nối Proton API & lấy danh sách máy chủ...", 0.1);
         self.pending_commands.push(UiCommand::StartScan {
             auth_generation: self.auth_generation,
@@ -1548,6 +1656,14 @@ impl AppState {
         self.tunnel_verified = false;
         self.tunnel_unverified_reason = None;
         self.selected_server = Some(server.clone());
+        info!(
+            generation,
+            auth_generation = self.auth_generation,
+            server = %server.name,
+            country = %server.country,
+            entry_ip = %server.entry_ip,
+            "Initiating WireGuard VPN connection"
+        );
 
         self.show_loading_status("● [1/4] 🔑 Kiểm tra WireGuard Key & Chứng chỉ...", 0.25);
         self.pending_commands.push(UiCommand::Connect {
@@ -1565,6 +1681,7 @@ impl AppState {
         self.is_disconnecting_vpn = true;
         self.connection_generation = self.connection_generation.saturating_add(1);
         let generation = self.connection_generation;
+        info!(generation, "Initiating WireGuard VPN disconnect");
         self.show_loading_status(
             "● Đang ngắt WireGuard Tunnel & hoàn trả cấu hình mạng...",
             0.4,
@@ -1581,6 +1698,40 @@ impl AppState {
         let generation = self.connection_generation;
         self.pending_commands
             .push(UiCommand::RefreshTunnelStatus { generation });
+    }
+
+    fn reset_to_logged_out_view(
+        &mut self,
+        client_config: Option<ClientConfig>,
+        srp_notice: Option<StatusNotice>,
+        toast: StatusNotice,
+    ) {
+        self.bump_auth_generation();
+        self.connection_generation = self.connection_generation.saturating_add(1);
+        self.is_scanning = false;
+        self.settings_key_fetching = false;
+        self.settings_conf_importing = false;
+        self.settings_status_msg = None;
+        if let Some(cfg) = client_config {
+            self.client_config = cfg;
+        }
+        self.all_free_servers.clear();
+        self.raw_payload = None;
+        self.selected_server = None;
+        self.connected_server = None;
+        self.server_selection_manual = false;
+        self.pending_srp_account = None;
+        self.pending_srp_session = None;
+        self.srp_password.clear();
+        self.srp_2fa.clear();
+        self.srp_status = srp_notice;
+        self.is_logged_in = false;
+        self.active_account = None;
+        self.live_public_ip = None;
+        self.vpn_connect_time_unix = None;
+        self.active_dialog = ActiveDialog::None;
+        self.info_toast = Some(toast);
+        self.show_login_view();
     }
 
     pub fn request_logout(&mut self, store: &dyn CredentialStore) {
@@ -1609,33 +1760,14 @@ impl AppState {
         }
         let _ = store.clear_all_sessions();
         let _ = ServerCacheManager::clear(&ServerCacheManager::default_cache_path());
-        self.bump_auth_generation();
-        self.connection_generation = self.connection_generation.saturating_add(1);
-        self.is_scanning = false;
-        self.settings_key_fetching = false;
-        self.settings_conf_importing = false;
-        self.settings_status_msg = None;
-        self.client_config = store.load_client_config().unwrap_or_default();
-        self.all_free_servers.clear();
-        self.raw_payload = None;
-        self.selected_server = None;
-        self.connected_server = None;
-        self.server_selection_manual = false;
-        self.pending_srp_account = None;
-        self.pending_srp_session = None;
-        self.srp_password.clear();
-        self.srp_2fa.clear();
-        self.srp_status = None;
-        self.is_logged_in = false;
-        self.active_account = None;
-        self.live_public_ip = None;
-        self.vpn_connect_time_unix = None;
-        self.active_dialog = ActiveDialog::None;
-        self.info_toast = Some(StatusNotice {
-            text: "Đã xóa phiên đăng nhập trên máy.".to_owned(),
-            level: NoticeLevel::Info,
-        });
-        self.show_login_view();
+        self.reset_to_logged_out_view(
+            Some(store.load_client_config().unwrap_or_default()),
+            None,
+            StatusNotice {
+                text: "Đã xóa phiên đăng nhập trên máy.".to_owned(),
+                level: NoticeLevel::Info,
+            },
+        );
     }
 
     pub fn request_quit(&mut self) {
@@ -1983,6 +2115,50 @@ impl AppState {
                     self.hide_loading_with_delay("● Cần đăng nhập Proton.");
                     self.show_login_view();
                 }
+            }
+            WorkerEvent::SessionExpired {
+                auth_generation,
+                detail,
+            } => {
+                if auth_generation != self.auth_generation || !self.is_logged_in || self.closing {
+                    return;
+                }
+                debug!(%detail, "Proton refresh token expired/revoked; auto-logging out");
+                self.is_connecting_vpn = false;
+                self.is_scanning = false;
+                self.settings_key_fetching = false;
+                self.settings_conf_importing = false;
+                self.loading.visible = false;
+                self.loading.hide_at = None;
+                self.window_visible = true;
+
+                if self.tunnel_running || self.is_disconnecting_vpn {
+                    self.logout_after_disconnect = true;
+                    if !self.is_disconnecting_vpn {
+                        self.disconnect_vpn();
+                    }
+                    self.info_toast = Some(StatusNotice {
+                        text: "Phiên đăng nhập đã hết hạn, đang ngắt VPN để đăng nhập lại."
+                            .to_owned(),
+                        level: NoticeLevel::Warning,
+                    });
+                    return;
+                }
+
+                let expired_msg =
+                    "⚠ Phiên đăng nhập đã hết hạn hoặc bị thu hồi. Vui lòng đăng nhập lại."
+                        .to_owned();
+                self.reset_to_logged_out_view(
+                    None,
+                    Some(StatusNotice {
+                        text: expired_msg,
+                        level: NoticeLevel::Warning,
+                    }),
+                    StatusNotice {
+                        text: "Phiên đăng nhập đã hết hạn — vui lòng đăng nhập lại.".to_owned(),
+                        level: NoticeLevel::Warning,
+                    },
+                );
             }
             WorkerEvent::WgKeyRefreshed {
                 auth_generation,
@@ -2697,6 +2873,9 @@ pub async fn handle_ui_command(
                         key: WgKeySnapshot::from_config(&cfg),
                     },
                 ),
+                Err(err) if err.is_session_expired() => {
+                    handle_session_expired(&deps, auth_generation, err.to_string(), tx, wake);
+                }
                 Err(err) => debug!(error = %err, "background WireGuard key check failed"),
             }
         }
@@ -2785,6 +2964,44 @@ pub async fn handle_ui_command(
         UiCommand::OpenExternalUrl { url } => {
             let shell = Arc::clone(&deps.shell);
             let res = tokio::task::spawn_blocking(move || shell.open_https_url(&url)).await;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => emit(tx, wake, WorkerEvent::ExternalUrlError { message }),
+                Err(err) => emit(
+                    tx,
+                    wake,
+                    WorkerEvent::ExternalUrlError {
+                        message: err.to_string(),
+                    },
+                ),
+            }
+        }
+        UiCommand::OpenLogFolder => {
+            let shell = Arc::clone(&deps.shell);
+            let dir = app_log_dir();
+            let res = tokio::task::spawn_blocking(move || shell.open_directory(&dir)).await;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => emit(tx, wake, WorkerEvent::ExternalUrlError { message }),
+                Err(err) => emit(
+                    tx,
+                    wake,
+                    WorkerEvent::ExternalUrlError {
+                        message: err.to_string(),
+                    },
+                ),
+            }
+        }
+        UiCommand::OpenRealtimeLogCli => {
+            let shell = Arc::clone(&deps.shell);
+            let app_log = app_log_dir().join(APP_LOG_FILE_NAME);
+            let svc_dir = service_log_dir();
+            let svc_log = svc_dir.join(SERVICE_LOG_FILE_NAME);
+            let tun_log = svc_dir.join(TUNNEL_LOG_FILE_NAME);
+            let res = tokio::task::spawn_blocking(move || {
+                shell.open_realtime_log_cli(&app_log, &svc_log, &tun_log)
+            })
+            .await;
             match res {
                 Ok(Ok(())) => {}
                 Ok(Err(message)) => emit(tx, wake, WorkerEvent::ExternalUrlError { message }),
@@ -3018,6 +3235,7 @@ fn emit_login_error(
         format!("Lỗi: {short}")
     };
 
+    warn!(error = %err, title = %friendly_title, "SRP login failed");
     emit(
         tx,
         wake,
@@ -3026,6 +3244,28 @@ fn emit_login_error(
             friendly_msg,
             detail: err.to_owned(),
             inline_msg,
+        },
+    );
+}
+
+fn handle_session_expired(
+    deps: &WorkerDeps,
+    auth_generation: u64,
+    detail: String,
+    tx: &mpsc::UnboundedSender<WorkerEvent>,
+    wake: &(dyn Fn() + Send + Sync),
+) {
+    if !deps.is_auth_current(auth_generation) {
+        return;
+    }
+    let _ = deps.store.clear_all_sessions();
+    let _ = ServerCacheManager::clear(&deps.cache_path);
+    emit(
+        tx,
+        wake,
+        WorkerEvent::SessionExpired {
+            auth_generation,
+            detail,
         },
     );
 }
@@ -3057,7 +3297,12 @@ async fn handle_scan(
             }
             return;
         }
+        Err(err) if err.is_session_expired() => {
+            handle_session_expired(deps, auth_generation, err.to_string(), tx, wake);
+            return;
+        }
         Err(err) => {
+            warn!(error = %err, "fetch_logicals_raw failed");
             if deps.is_auth_current(auth_generation) {
                 emit(
                     tx,
@@ -3072,6 +3317,7 @@ async fn handle_scan(
             return;
         }
     };
+    info!(server_count = servers.len(), "Fetched logical server list");
 
     if !deps.is_auth_current(auth_generation) {
         return;
@@ -3177,6 +3423,10 @@ async fn handle_connect(
                 refreshed_key = Some(WgKeySnapshot::from_config(&updated));
                 config = updated;
             }
+            Err(err) if err.is_session_expired() => {
+                handle_session_expired(deps, auth_generation, err.to_string(), tx, wake);
+                return;
+            }
             Err(err) => {
                 emit(
                     tx,
@@ -3256,6 +3506,15 @@ async fn handle_connect(
         },
     );
 
+    info!(
+        generation,
+        server = %spec.server_name,
+        entry_ip = %spec.entry_ip,
+        port = spec.port,
+        dns = %spec.dns,
+        refreshed_key = refreshed_key.is_some(),
+        "Sending Connect request to FreetonVPNService"
+    );
     let req = ServiceRequest::Connect(spec.clone());
     match deps.pipe.send_request(&req, PIPE_CONNECT_TIMEOUT).await {
         Ok(ServiceResponse::Ok) => {
@@ -3512,6 +3771,10 @@ async fn handle_export_conf(
                     },
                 );
             }
+            Err(err) if err.is_session_expired() => {
+                handle_session_expired(deps, auth_generation, err.to_string(), tx, wake);
+                return;
+            }
             Err(err) => {
                 emit(
                     tx,
@@ -3619,6 +3882,9 @@ async fn handle_fetch_wg_key_manual(
                 key: WgKeySnapshot::from_config(&cfg),
             },
         ),
+        Err(err) if err.is_session_expired() => {
+            handle_session_expired(deps, auth_generation, err.to_string(), tx, wake);
+        }
         Err(err) => emit(
             tx,
             wake,
@@ -4003,23 +4269,23 @@ mod tests {
     struct MockShellLauncher {
         elevated_calls: Mutex<Vec<(PathBuf, String)>>,
         opened_urls: Mutex<Vec<String>>,
+        opened_dirs: Mutex<Vec<PathBuf>>,
+        realtime_log_calls: Mutex<Vec<(PathBuf, PathBuf, PathBuf)>>,
         elevated_result: Mutex<Option<Result<(), String>>>,
     }
 
     impl MockShellLauncher {
         fn ok() -> Self {
             Self {
-                elevated_calls: Mutex::new(Vec::new()),
-                opened_urls: Mutex::new(Vec::new()),
                 elevated_result: Mutex::new(Some(Ok(()))),
+                ..Default::default()
             }
         }
 
         fn elevated_err(msg: &str) -> Self {
             Self {
-                elevated_calls: Mutex::new(Vec::new()),
-                opened_urls: Mutex::new(Vec::new()),
                 elevated_result: Mutex::new(Some(Err(msg.to_owned()))),
+                ..Default::default()
             }
         }
     }
@@ -4045,6 +4311,31 @@ mod tests {
         fn open_https_url(&self, url: &str) -> Result<(), String> {
             let safe = validate_https_browser_url(url)?;
             self.opened_urls.lock().expect("url lock").push(safe);
+            Ok(())
+        }
+
+        fn open_directory(&self, dir: &Path) -> Result<(), String> {
+            self.opened_dirs
+                .lock()
+                .expect("dir lock")
+                .push(dir.to_path_buf());
+            Ok(())
+        }
+
+        fn open_realtime_log_cli(
+            &self,
+            app_log: &Path,
+            service_log: &Path,
+            tunnel_log: &Path,
+        ) -> Result<(), String> {
+            self.realtime_log_calls
+                .lock()
+                .expect("realtime log lock")
+                .push((
+                    app_log.to_path_buf(),
+                    service_log.to_path_buf(),
+                    tunnel_log.to_path_buf(),
+                ));
             Ok(())
         }
     }
@@ -5421,5 +5712,158 @@ mod tests {
             elapsed < Duration::from_millis(350),
             "ping runtime blocking pool serialized DEFAULT_PING_WORKERS ({DEFAULT_PING_WORKERS}) probes: elapsed {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_refresh_token_during_scan_auto_logs_out_and_clears_session() {
+        let store = Arc::new(MockCredentialStore::default());
+        let session = StoredAuthSession {
+            uid: "uid-expired".to_owned(),
+            access_token: "acc-expired".to_owned(),
+            refresh_token: "revoked-ref".to_owned(),
+            scopes: vec!["full".to_owned()],
+        };
+        store
+            .save_auth_session("user@proton.me", &session)
+            .expect("seed auth session");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = socket.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        raw.extend_from_slice(&buf[..n]);
+                        if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&raw);
+                    let first_line = req.lines().next().unwrap_or("");
+                    let (status, body) = if first_line.starts_with("POST /auth/v4/refresh") {
+                        (
+                            "400 Bad Request",
+                            r#"{"Code":10013,"Error":"Invalid refresh token"}"#,
+                        )
+                    } else {
+                        (
+                            "401 Unauthorized",
+                            r#"{"Code":401,"Error":"Invalid access token"}"#,
+                        )
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let proton = Arc::new(ProtonClient::with_endpoints(
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
+            base.clone(),
+            vec![base.clone()],
+            base,
+        ));
+        let deps = Arc::new(make_test_deps(
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
+            proton,
+            Arc::new(MockPipeTransport::ok(ServiceResponse::Ok)),
+        ));
+        let auth_gen = deps.auth_generation.load(Ordering::Acquire);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_scan(&deps, auth_gen, &tx, &|| {}).await;
+        server_task.abort();
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        let mut app = AppState::new(
+            true,
+            Some("user@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            Vec::new(),
+        );
+        app.auth_generation = auth_gen;
+
+        for ev in events {
+            assert!(
+                !matches!(ev, WorkerEvent::ScanError { .. }),
+                "invalid refresh token must auto-logout instead of showing generic ScanError: {ev:?}"
+            );
+            app.apply_event(ev);
+        }
+
+        assert!(
+            store.load_auth_session().expect("load").is_none(),
+            "revoked refresh token must clear stored session from keyring"
+        );
+        assert!(
+            !app.is_logged_in,
+            "app must auto-logout to Login screen after invalid refresh token"
+        );
+        assert_eq!(app.current_view, AppView::Login);
+        assert!(app.srp_status.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_dev_mode_realtime_log_cli_and_folder_commands() {
+        let store = Arc::new(MockCredentialStore::default());
+        let shell = Arc::new(MockShellLauncher::ok());
+        let mut state = AppState::new(false, None, ClientConfig::default(), None, Vec::new());
+        let _ = state.drain_commands();
+
+        state.open_realtime_log_cli();
+        state.open_log_folder();
+        let cmds = state.drain_commands();
+        assert_eq!(cmds.len(), 2);
+        assert!(matches!(cmds[0], UiCommand::OpenRealtimeLogCli));
+        assert!(matches!(cmds[1], UiCommand::OpenLogFolder));
+
+        let dead_base = "http://127.0.0.1:1".to_owned();
+        let proton = Arc::new(ProtonClient::with_endpoints(
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
+            dead_base.clone(),
+            vec![dead_base.clone()],
+            dead_base,
+        ));
+        let mut deps = make_test_deps(
+            store,
+            proton,
+            Arc::new(MockPipeTransport::ok(ServiceResponse::Ok)),
+        );
+        deps.shell = Arc::clone(&shell) as Arc<dyn ShellLauncher>;
+        let deps = Arc::new(deps);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        for cmd in cmds {
+            handle_ui_command(deps.clone(), cmd, &tx, &|| {}).await;
+        }
+
+        let cli_calls = shell.realtime_log_calls.lock().expect("cli calls");
+        assert_eq!(cli_calls.len(), 1);
+        assert!(cli_calls[0].0.ends_with(APP_LOG_FILE_NAME));
+        assert!(cli_calls[0].1.ends_with(SERVICE_LOG_FILE_NAME));
+        assert!(cli_calls[0].2.ends_with(TUNNEL_LOG_FILE_NAME));
+
+        let dir_calls = shell.opened_dirs.lock().expect("dir calls");
+        assert_eq!(dir_calls.len(), 1);
+        assert_eq!(dir_calls[0], app_log_dir());
     }
 }

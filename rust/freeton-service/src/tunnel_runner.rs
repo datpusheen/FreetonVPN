@@ -11,6 +11,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::ClientOptions;
+use tracing::{info, warn};
 use windows::core::{s, PCWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA,
@@ -46,6 +47,8 @@ pub const TUNNEL_SERVICE_PREFIX: &str = "WireGuardTunnel$";
 pub const TUNNEL_SERVICE_DISPLAY_PREFIX: &str = "WireGuard Tunnel: ";
 pub const WIREGUARD_UAPI_PIPE_PREFIX: &str = r"\\.\pipe\ProtectedPrefix\Administrators\WireGuard\";
 pub const RESTRICTED_TUNNEL_DIR_SDDL: &str = "O:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
+pub const READABLE_LOG_DIR_SDDL: &str =
+    "O:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGX;;;BU)(A;OICI;GRGX;;;IU)";
 
 const UAPI_PIPE_TIMEOUT: Duration = Duration::from_secs(2);
 const DELETE_ACCESS: u32 = 0x0001_0000;
@@ -420,7 +423,11 @@ pub fn apply_restricted_dacl(path: &Path, sddl: &str) -> Result<(), TunnelError>
     Ok(())
 }
 
-fn ensure_single_restricted_dir(dir: &Path, enforce_acl: bool) -> Result<(), TunnelError> {
+fn ensure_single_dir_with_sddl(
+    dir: &Path,
+    enforce_acl: bool,
+    sddl: &str,
+) -> Result<(), TunnelError> {
     match fs::symlink_metadata(dir) {
         Ok(meta) => {
             if is_reparse_or_symlink(&meta) || !meta.is_dir() {
@@ -448,7 +455,7 @@ fn ensure_single_restricted_dir(dir: &Path, enforce_acl: bool) -> Result<(), Tun
     }
 
     if enforce_acl {
-        apply_restricted_dacl(dir, RESTRICTED_TUNNEL_DIR_SDDL)?;
+        apply_restricted_dacl(dir, sddl)?;
     }
     Ok(())
 }
@@ -466,9 +473,27 @@ pub fn ensure_restricted_tunnels_dir(
                 fs::create_dir_all(grandparent)?;
             }
         }
-        ensure_single_restricted_dir(parent, enforce_acl)?;
+        ensure_single_dir_with_sddl(parent, enforce_acl, RESTRICTED_TUNNEL_DIR_SDDL)?;
     }
-    ensure_single_restricted_dir(tunnels_dir, enforce_acl)?;
+    ensure_single_dir_with_sddl(tunnels_dir, enforce_acl, RESTRICTED_TUNNEL_DIR_SDDL)?;
+    Ok(())
+}
+
+/// Ensures `%ProgramData%\FreetonVPN\logs` is a real non-reparse directory writable by SYSTEM/Admins
+/// and readable by non-admin interactive users for diagnostics and the Dev Mode CLI viewer.
+pub fn ensure_service_log_dir(log_dir: &Path, enforce_acl: bool) -> Result<(), TunnelError> {
+    if let Some(parent) = log_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty() && p.parent().is_some())
+    {
+        if let Some(grandparent) = parent.parent().filter(|gp| !gp.as_os_str().is_empty()) {
+            if !grandparent.exists() {
+                fs::create_dir_all(grandparent)?;
+            }
+        }
+        ensure_single_dir_with_sddl(parent, enforce_acl, RESTRICTED_TUNNEL_DIR_SDDL)?;
+    }
+    ensure_single_dir_with_sddl(log_dir, enforce_acl, READABLE_LOG_DIR_SDDL)?;
     Ok(())
 }
 
@@ -511,6 +536,7 @@ pub fn remove_tunnel_conf(tunnels_dir: &Path, tunnel_name: &str) -> Result<(), T
 pub(crate) fn ensure_tunnel_runtime_dlls(exe_dir: &Path) -> Result<(PathBuf, PathBuf), TunnelError> {
     let wireguard_dll = exe_dir.join("wireguard.dll");
     if !wireguard_dll.is_file() {
+        warn!(path = %wireguard_dll.display(), "Missing sibling wireguard.dll");
         return Err(TunnelError::MissingDependency(format!(
             "missing required sibling DLL {} (copy tunnel.dll and wireguard.dll alongside FreetonVPNService.exe or reinstall Freeton VPN)",
             wireguard_dll.display()
@@ -518,6 +544,7 @@ pub(crate) fn ensure_tunnel_runtime_dlls(exe_dir: &Path) -> Result<(PathBuf, Pat
     }
     let tunnel_dll = exe_dir.join("tunnel.dll");
     if !tunnel_dll.is_file() {
+        warn!(path = %tunnel_dll.display(), "Missing sibling tunnel.dll");
         return Err(TunnelError::MissingDependency(format!(
             "missing required sibling DLL {} (copy tunnel.dll and wireguard.dll alongside FreetonVPNService.exe or reinstall Freeton VPN)",
             tunnel_dll.display()
@@ -563,8 +590,10 @@ pub fn run_tunnel_service_from_cli(conf_path: &Path) -> Result<(), TunnelError> 
         })?;
     let tunnel_service_fn: WireGuardTunnelServiceFn = unsafe { core::mem::transmute(proc_ptr) };
 
+    info!(conf = %win32_conf.display(), tunnel_dll = %tunnel_dll.display(), "Invoking WireGuardTunnelService");
     let wide_conf = to_wide_null(win32_conf.as_os_str())?;
     let ok = unsafe { tunnel_service_fn(wide_conf.as_ptr()) };
+    info!(ok, "WireGuardTunnelService returned");
     if ok == 0 {
         return Err(TunnelError::TunnelEntryFailed);
     }
@@ -670,10 +699,12 @@ pub fn install_and_start_tunnel_service(
         })?;
     }
 
+    info!(%svc_name, exe = %service_exe.display(), "Creating and starting WireGuardTunnel Windows service");
     unsafe {
         StartServiceW(service_guard.0, None)
             .map_err(|e| TunnelError::Scm(format!("StartServiceW({svc_name}) failed: {e}")))?;
     }
+    info!(%svc_name, "StartServiceW succeeded");
 
     Ok(())
 }
@@ -1273,6 +1304,23 @@ mod tests {
             write_restricted_tunnel_conf(&clean_tunnels, "FreetonVPN", "[Interface]\n", false)
                 .expect("write_restricted_tunnel_conf succeeds");
         assert!(clean_conf.is_file());
+
+        // Verify READABLE_LOG_DIR_SDDL grants read/execute to Users while keeping BA Owner.
+        let wide_log_sddl = to_wide_null(READABLE_LOG_DIR_SDDL).expect("wide log sddl");
+        let mut log_sd = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(wide_log_sddl.as_ptr()),
+                SDDL_REVISION_1,
+                &mut log_sd,
+                None,
+            )
+            .expect("parse READABLE_LOG_DIR_SDDL");
+        }
+        let _log_sd_guard = LocalFreeGuard(log_sd.0);
+
+        let _log_dir_test = ensure_service_log_dir(&root.join("clean").join("FreetonVPN").join("logs"), false)
+            .expect("clean log dir succeeds");
 
         // Cleanup junctions cleanly before remove_dir_all so targets aren't confused.
         let _ = fs::remove_dir(&parent_junction);

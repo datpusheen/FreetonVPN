@@ -10,12 +10,14 @@
                       "CRT tĩnh (+crt-static): Chạy trực tiếp trên Windows mới cài mà không cần cài thêm Visual C++ Redistributable.",
                       "Dự phòng đồ họa 3 tầng \u0026 WARP cho VM/RDP: Tự động ưu tiên render phần mềm WARP trong máy ảo để tránh đen màn hình.",
                       "Chữ sắc nét \u0026 Emoji đủ màu: Bật font hinting rõ nét và khôi phục rasterize emoji màu (epaint color_fonts).",
-                      "▸ Ổn định kết nối WireGuard",
-                      "Kiểm tra \u0026 đồng bộ sẵn DLL: Tự động stage tunnel.dll / wireguard.dll khi build và báo lỗi rõ ràng nếu thiếu DLL dịch vụ."
+                      "▸ Tự động hóa, ổn định \u0026 chẩn đoán",
+                      "Tự logout khi RefreshToken hết hạn: Gặp Invalid refresh token sẽ xóa phiên cũ, ngắt tunnel (nếu đang bật) và đưa về màn hình Đăng nhập.",
+                      "Kiểm tra \u0026 đồng bộ sẵn DLL WireGuard: Tự động stage tunnel.dll / wireguard.dll và báo lỗi rõ nếu thiếu DLL dịch vụ.",
+                      "Ghi log xoay vòng \u0026 CLI Realtime (Dev Mode): Lưu file log có giới hạn dung lượng cho App \u0026 Service, kèm nút mở cửa sổ CLI xem log trực tiếp."
                   ],
     "download_url":  "https://github.com/datpusheen/FreetonVPN/releases/download/v3.0.3/FreetonVPN-Setup-x64.exe",
-    "file_size_bytes":  8267484,
-    "sha256":  "c5ee87ee03dbf8b6ad0eece86ac2ad7b3e0f7149acaa46c4938d3ea5dbf558b5",
+    "file_size_bytes":  8316894,
+    "sha256":  "da21b3f13e317e1a5d5f5471aaae9d1be240c372cf9d41d11f7dfaac520fbb51",
     "mandatory":  false,
     "min_supported_version":  "3.0.0"
 }

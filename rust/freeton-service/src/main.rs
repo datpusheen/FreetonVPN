@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use freeton_core::logging::{
+    service_log_dir, RollingFileWriter, DEFAULT_MAX_LOG_BACKUPS, DEFAULT_MAX_LOG_BYTES,
+    SERVICE_LOG_FILE_NAME, TUNNEL_LOG_FILE_NAME,
+};
 use freeton_core::wg::DEFAULT_TUNNEL_NAME;
 use tracing::{error, info};
 use windows::core::PCWSTR;
@@ -36,9 +40,10 @@ use broker::{
     BROKER_SERVICE_NAME,
 };
 use tunnel_runner::{
-    default_tunnels_dir, ensure_restricted_tunnels_dir, ensure_tunnel_runtime_dlls,
-    open_sc_manager, query_service_state, run_tunnel_service_from_cli, stop_and_delete_service,
-    to_wide_null, tunnel_service_name, win32_err_code, LocalFreeGuard, ScHandleGuard,
+    default_tunnels_dir, ensure_restricted_tunnels_dir, ensure_service_log_dir,
+    ensure_tunnel_runtime_dlls, open_sc_manager, query_service_state, run_tunnel_service_from_cli,
+    stop_and_delete_service, to_wide_null, tunnel_service_name, win32_err_code, LocalFreeGuard,
+    ScHandleGuard,
 };
 
 const READ_CONTROL_ACCESS: u32 = 0x0002_0000;
@@ -354,15 +359,57 @@ fn uninstall_broker_service() -> Result<(), String> {
     Ok(())
 }
 
-fn init_logging() {
+enum ServiceLogSink {
+    File(RollingFileWriter),
+    Stderr(std::io::Stderr),
+}
+
+impl std::io::Write for ServiceLogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if cfg!(debug_assertions) {
+            let _ = std::io::stderr().write_all(buf);
+        }
+        match self {
+            Self::File(file) => file.write(buf),
+            Self::Stderr(err) => err.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if cfg!(debug_assertions) {
+            let _ = std::io::stderr().flush();
+        }
+        match self {
+            Self::File(file) => file.flush(),
+            Self::Stderr(err) => err.flush(),
+        }
+    }
+}
+
+fn init_logging(mode: &CliMode) {
+    let log_dir = service_log_dir();
+    let _ = ensure_service_log_dir(&log_dir, true);
+    let file_name = match mode {
+        CliMode::Tunnel(_) => TUNNEL_LOG_FILE_NAME,
+        CliMode::Service | CliMode::Install | CliMode::Uninstall => SERVICE_LOG_FILE_NAME,
+    };
+    let file_writer = RollingFileWriter::open(
+        log_dir.join(file_name),
+        DEFAULT_MAX_LOG_BYTES,
+        DEFAULT_MAX_LOG_BACKUPS,
+    )
+    .ok();
+
     let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(move || match &file_writer {
+            Some(writer) => ServiceLogSink::File(writer.clone()),
+            None => ServiceLogSink::Stderr(std::io::stderr()),
+        })
         .with_ansi(false)
         .try_init();
 }
 
 fn main() -> ExitCode {
-    init_logging();
     let args: Vec<OsString> = std::env::args_os().collect();
     let mode = match parse_cli_args(&args) {
         Ok(m) => m,
@@ -371,6 +418,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    init_logging(&mode);
+    info!(?mode, "FreetonVPNService starting");
 
     let result = match mode {
         CliMode::Service => run_windows_service(),

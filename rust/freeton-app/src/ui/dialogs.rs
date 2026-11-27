@@ -553,6 +553,36 @@ fn render_settings_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState
                             state.check_for_updates_with_override(true, &draft_url);
                         }
                     });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let half_w = ((ui.available_width() - 6.0) * 0.5).max(100.0);
+                        let cli_style = PillStyle {
+                            fg: C_ACCENT,
+                            font_size: 11.0,
+                            pad_x: 6.0,
+                            ..PillStyle::secondary(28.0)
+                        };
+                        if pill_button(ui, "🖥️ Log Realtime (CLI)", Some(half_w), cli_style)
+                            .on_hover_text(
+                                "Mở cửa sổ PowerShell CLI theo dõi log app và service theo thời gian thực",
+                            )
+                            .clicked()
+                        {
+                            state.open_realtime_log_cli();
+                        }
+                        let folder_style = PillStyle {
+                            font_size: 11.0,
+                            pad_x: 6.0,
+                            ..PillStyle::secondary(28.0)
+                        };
+                        if pill_button(ui, "📂 Mở thư mục Log", Some(half_w), folder_style)
+                            .on_hover_text("Mở thư mục chứa file log trong File Explorer")
+                            .clicked()
+                        {
+                            state.open_log_folder();
+                        }
+                    });
                 });
                 ui.add_space(8.0);
             }
@@ -2319,10 +2349,22 @@ mod tests {
             !normal_text.contains("UPDATE MANIFEST URL"),
             "Standard Settings must hide Update Manifest URL: {normal_text}"
         );
+        assert!(
+            !normal_text.contains("Log Realtime (CLI)"),
+            "Standard Settings must hide Realtime CLI log button: {normal_text}"
+        );
         let dev_text = collect_dialog_text(true);
         assert!(
             dev_text.contains("UPDATE MANIFEST URL"),
             "Dev Mode Settings must show Update Manifest URL: {dev_text}"
+        );
+        assert!(
+            dev_text.contains("Log Realtime (CLI)"),
+            "Dev Mode Settings must show Realtime CLI log button: {dev_text}"
+        );
+        assert!(
+            dev_text.contains("Mở thư mục Log"),
+            "Dev Mode Settings must show Open Log Folder button: {dev_text}"
         );
     }
 

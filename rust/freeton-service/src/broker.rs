@@ -7,6 +7,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use freeton_core::logging::{
+    service_log_dir, RollingFileWriter, WireGuardRinglogMirror, DEFAULT_MAX_LOG_BACKUPS,
+    DEFAULT_MAX_LOG_BYTES, TUNNEL_LOG_FILE_NAME,
+};
 use freeton_core::wg::{
     dns_responds_through_tunnel, parse_uapi_latest_handshake, validate_tunnel_spec,
     ActiveTunnelInfo, ServiceRequest, ServiceResponse, TunnelHealthState, ValidatedTunnelSpec,
@@ -30,9 +34,9 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::tunnel_runner::{
-    default_tunnels_dir, install_and_start_tunnel_service, query_service_state, query_uapi_state,
-    remove_tunnel_conf, stop_and_delete_service, to_wide_null, tunnel_service_name,
-    write_restricted_tunnel_conf, LocalFreeGuard,
+    default_tunnels_dir, ensure_service_log_dir, install_and_start_tunnel_service,
+    query_service_state, query_uapi_state, remove_tunnel_conf, stop_and_delete_service,
+    to_wide_null, tunnel_service_name, write_restricted_tunnel_conf, LocalFreeGuard,
 };
 
 pub const BROKER_SERVICE_NAME: &str = "FreetonVPNService";
@@ -102,11 +106,13 @@ pub trait TunnelRuntime: Send + Sync + 'static {
         dns: &'a str,
         timeout: Duration,
     ) -> BoxFuture<'a, bool>;
+    fn pump_tunnel_logs(&self) {}
 }
 
 pub struct WindowsTunnelRuntime {
     tunnels_dir: PathBuf,
     service_exe: PathBuf,
+    ringlog_mirror: Mutex<Option<WireGuardRinglogMirror>>,
 }
 
 impl WindowsTunnelRuntime {
@@ -114,6 +120,33 @@ impl WindowsTunnelRuntime {
         Self {
             tunnels_dir,
             service_exe,
+            ringlog_mirror: Mutex::new(None),
+        }
+    }
+
+    fn with_ringlog_mirror<F>(&self, f: F)
+    where
+        F: FnOnce(&mut WireGuardRinglogMirror),
+    {
+        let Ok(mut guard) = self.ringlog_mirror.lock() else {
+            return;
+        };
+        if guard.is_none() {
+            let log_dir = service_log_dir();
+            let _ = ensure_service_log_dir(&log_dir, true);
+            if let Ok(writer) = RollingFileWriter::open(
+                log_dir.join(TUNNEL_LOG_FILE_NAME),
+                DEFAULT_MAX_LOG_BYTES,
+                DEFAULT_MAX_LOG_BACKUPS,
+            ) {
+                *guard = Some(WireGuardRinglogMirror::new(
+                    self.tunnels_dir.join("log.bin"),
+                    writer,
+                ));
+            }
+        }
+        if let Some(mirror) = guard.as_mut() {
+            f(mirror);
         }
     }
 }
@@ -170,6 +203,7 @@ impl TunnelRuntime for WindowsTunnelRuntime {
         tunnel_name: &'a str,
         conf_path: &'a Path,
     ) -> BoxFuture<'a, Result<(), String>> {
+        self.with_ringlog_mirror(WireGuardRinglogMirror::snap_cursor_to_tail);
         let name = tunnel_name.to_owned();
         let conf = conf_path.to_path_buf();
         let exe = self.service_exe.clone();
@@ -181,6 +215,12 @@ impl TunnelRuntime for WindowsTunnelRuntime {
             .map_err(|e| format!("install_and_start_tunnel task panicked: {e}"))?
             .map_err(|e| e.to_string())
         })
+    }
+
+    fn pump_tunnel_logs(&self) {
+        self.with_ringlog_mirror(|mirror| {
+            let _ = mirror.poll_and_mirror();
+        });
     }
 
     fn uninstall_tunnel<'a>(&'a self, tunnel_name: &'a str) -> BoxFuture<'a, Result<(), String>> {
@@ -456,6 +496,7 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
     ) -> Result<(), ServiceWaitError> {
         let deadline = Instant::now() + self.config.service_wait_timeout;
         loop {
+            self.runtime.pump_tunnel_logs();
             if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
                 return Err(ServiceWaitError::Cancelled);
             }
@@ -511,6 +552,7 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
     async fn disconnect_while_locked(&self) -> Result<(), String> {
         let state = self.runtime.service_state(&self.config.tunnel_name).await?;
         if state != 0 {
+            info!(tunnel = %self.config.tunnel_name, state, "Stopping and removing existing WireGuard tunnel service");
             self.runtime
                 .uninstall_tunnel(&self.config.tunnel_name)
                 .await?;
@@ -520,7 +562,9 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
                     ServiceWaitError::Cancelled => "cancelled".to_owned(),
                     ServiceWaitError::Other(msg) => msg,
                 })?;
+            info!(tunnel = %self.config.tunnel_name, "WireGuard tunnel service removed");
         }
+        self.runtime.pump_tunnel_logs();
         // Keep the .conf file if service uninstall failed above; only remove after absent.
         self.runtime.remove_conf(&self.config.tunnel_name).await?;
         Ok(())
@@ -679,6 +723,7 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
             .write_conf(&self.config.tunnel_name, conf_content)
             .await
             .map_err(|e| ("CONF_WRITE_FAILED", e))?;
+        info!(tunnel = %self.config.tunnel_name, server = %info.server_name, entry_ip = %info.entry_ip, "Wrote WireGuard tunnel config; installing tunnel service");
 
         if cancel.is_cancelled() {
             return Err((
@@ -691,6 +736,7 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
             .install_and_start_tunnel(&self.config.tunnel_name, &conf_path)
             .await
             .map_err(|e| ("INSTALL_FAILED", e))?;
+        info!(tunnel = %self.config.tunnel_name, "Waiting for WireGuardTunnel service to reach RUNNING state");
 
         self.wait_for_service_state(SERVICE_RUNNING_STATE, Some(cancel))
             .await
@@ -701,6 +747,7 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
                 ),
                 ServiceWaitError::Other(e) => ("SERVICE_START_TIMEOUT", e),
             })?;
+        info!(tunnel = %self.config.tunnel_name, "WireGuardTunnel service is RUNNING; waiting for handshake & DNS");
 
         self.wait_for_connection(info, cancel).await
     }
@@ -716,6 +763,7 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
         let mut last_uapi_err: Option<String> = None;
 
         while Instant::now() < deadline {
+            self.runtime.pump_tunnel_logs();
             if cancel.is_cancelled() {
                 return Err((
                     "CONNECT_CANCELLED",
@@ -767,6 +815,7 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
             };
 
             if handshaken {
+                info!(tunnel = %self.config.tunnel_name, dns = %info.dns, "WireGuard handshake verified; probing DNS through tunnel");
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 let dns_budget = self
                     .config
@@ -783,8 +832,10 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
                     ok = self.runtime.check_dns_through_tunnel(&info.address, &info.dns, dns_budget) => ok,
                 };
                 if dns_ok {
+                    info!(tunnel = %self.config.tunnel_name, server = %info.server_name, "WireGuard tunnel verified (handshake + DNS OK)");
                     return Ok(());
                 }
+                warn!(tunnel = %self.config.tunnel_name, dns = %info.dns, "DNS probe through WireGuard tunnel did not succeed yet");
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -838,6 +889,7 @@ impl<R: TunnelRuntime> TunnelBroker<R> {
             BrokerPhase::Verifying(info) => return TunnelHealthState::Verifying(info),
             BrokerPhase::Active(info) => (info, snapshot.last_dns_verified_unix),
         };
+        self.runtime.pump_tunnel_logs();
 
         match self.runtime.service_state(&self.config.tunnel_name).await {
             Ok(state) if state == SERVICE_RUNNING_STATE => {}
@@ -1386,6 +1438,30 @@ where
         return Err(err);
     }
 
+    let log_broker = Arc::clone(&broker);
+    let mut log_shutdown = shutdown_rx.clone();
+    let mut log_internal_stop = internal_stop_rx.clone();
+    let log_mirror_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut log_shutdown) => break,
+                _ = wait_for_shutdown(&mut log_internal_stop) => break,
+                _ = ticker.tick() => {
+                    let is_active = {
+                        let st = log_broker.state.lock().expect("broker state lock poisoned");
+                        !matches!(st.phase, BrokerPhase::Idle)
+                    };
+                    if is_active {
+                        log_broker.runtime.pump_tunnel_logs();
+                    }
+                }
+            }
+        }
+    });
+
     let mut lifecycle_result: Result<(), String> = Ok(());
     let mut pipe_finished = false;
     tokio::select! {
@@ -1415,6 +1491,7 @@ where
     );
 
     let _ = session_task.await;
+    let _ = log_mirror_task.await;
     if !pipe_finished {
         if let Ok(Err(err)) = pipe_task.await {
             warn!("pipe server stopped with error: {err}");

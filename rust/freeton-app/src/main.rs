@@ -5,12 +5,20 @@ pub mod state;
 pub mod tray;
 pub mod ui;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, ViewportBuilder, ViewportCommand};
 use eframe::{egui_wgpu, wgpu, Renderer};
+use freeton_core::logging::{
+    app_log_dir, RollingFileWriter, APP_LOG_FILE_NAME, DEFAULT_MAX_LOG_BACKUPS,
+    DEFAULT_MAX_LOG_BYTES,
+};
 use freeton_core::storage::{CredentialStore, WindowsCredentialStore};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
+use tracing_subscriber::Layer as _;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -193,20 +201,26 @@ struct FreetonDesktopApp {
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
     evt_rx: mpsc::UnboundedReceiver<WorkerEvent>,
     tray: Option<TrayController>,
+    log_level_ctrl: Option<LogLevelController>,
     dwm_initialized: bool,
     startup_trimmed: bool,
     started_at: Instant,
     last_window_visible: bool,
+    last_debug_mode: bool,
     active_drag: Option<ActiveWindowDrag>,
 }
 
 impl FreetonDesktopApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, log_level_ctrl: Option<LogLevelController>) -> Self {
         configure_fonts_and_style(&cc.egui_ctx);
 
         let store: Arc<dyn CredentialStore> = Arc::new(WindowsCredentialStore::new());
         let mut state = AppState::from_local_storage(store.as_ref());
         let last_window_visible = state.window_visible;
+        let last_debug_mode = state.client_config.debug_mode;
+        if let Some(ctrl) = &log_level_ctrl {
+            ctrl.set_debug(last_debug_mode);
+        }
 
         let wake_ctx = cc.egui_ctx.clone();
         let on_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -237,10 +251,12 @@ impl FreetonDesktopApp {
             cmd_tx,
             evt_rx,
             tray,
+            log_level_ctrl,
             dwm_initialized: false,
             startup_trimmed: false,
             started_at: Instant::now(),
             last_window_visible,
+            last_debug_mode,
             active_drag: None,
         }
     }
@@ -345,6 +361,7 @@ impl FreetonDesktopApp {
         let mut force_reveal = false;
         if let Some(tray) = &self.tray {
             for action in tray.drain_actions() {
+                info!(?action, "Tray action received");
                 match action {
                     TrayAction::OpenWindow => {
                         self.state.window_visible = true;
@@ -387,12 +404,21 @@ impl FreetonDesktopApp {
             self.state.window_visible,
             force_reveal,
         ) {
+            info!("Revealing main window");
             self.reveal_window(ctx, frame);
         }
         if self.last_window_visible && !self.state.window_visible {
+            info!("Window hidden to tray; trimming working set");
             trim_working_set();
         }
         self.last_window_visible = self.state.window_visible;
+        if self.state.client_config.debug_mode != self.last_debug_mode {
+            self.last_debug_mode = self.state.client_config.debug_mode;
+            if let Some(ctrl) = &self.log_level_ctrl {
+                ctrl.set_debug(self.last_debug_mode);
+            }
+            info!(dev_mode = self.last_debug_mode, "Dev Mode log level updated");
+        }
 
         for cmd in self.state.drain_commands() {
             let _ = self.cmd_tx.send(cmd);
@@ -412,6 +438,7 @@ impl FreetonDesktopApp {
         }
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.state.exit_ready {
+            info!("Window close intercepted; minimizing to tray");
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.state.window_visible = false;
             self.last_window_visible = false;
@@ -605,15 +632,122 @@ fn build_wgpu_configuration(force_software: bool) -> egui_wgpu::WgpuConfiguratio
     }
 }
 
-fn init_logging() {
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+#[derive(Clone)]
+struct AppLogFilter {
+    debug_enabled: Arc<AtomicBool>,
+}
+
+impl<S> tracing_subscriber::layer::Filter<S> for AppLogFilter {
+    fn enabled(
+        &self,
+        meta: &tracing::Metadata<'_>,
+        _ctx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        let level = *meta.level();
+        let target = meta.target();
+        if target.starts_with("freeton_") || target.starts_with("Freeton") {
+            if self.debug_enabled.load(Ordering::Relaxed) {
+                matches!(
+                    level,
+                    tracing::Level::ERROR
+                        | tracing::Level::WARN
+                        | tracing::Level::INFO
+                        | tracing::Level::DEBUG
+                )
+            } else {
+                matches!(
+                    level,
+                    tracing::Level::ERROR | tracing::Level::WARN | tracing::Level::INFO
+                )
+            }
+        } else {
+            matches!(level, tracing::Level::ERROR | tracing::Level::WARN)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LogLevelController {
+    debug_enabled: Arc<AtomicBool>,
+    reload_handle: tracing_subscriber::reload::Handle<AppLogFilter, tracing_subscriber::Registry>,
+}
+
+impl LogLevelController {
+    fn set_debug(&self, enabled: bool) {
+        self.debug_enabled.store(enabled, Ordering::Relaxed);
+        let _ = self.reload_handle.modify(|_| {});
+    }
+}
+
+enum AppLogSink {
+    File(RollingFileWriter),
+    Stderr(std::io::Stderr),
+}
+
+impl std::io::Write for AppLogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if cfg!(debug_assertions) {
+            let _ = std::io::stderr().write_all(buf);
+        }
+        match self {
+            Self::File(file) => file.write(buf),
+            Self::Stderr(err) => err.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if cfg!(debug_assertions) {
+            let _ = std::io::stderr().flush();
+        }
+        match self {
+            Self::File(file) => file.flush(),
+            Self::Stderr(err) => err.flush(),
+        }
+    }
+}
+
+fn init_logging(initial_debug: bool) -> (Option<LogLevelController>, std::path::PathBuf) {
+    let log_path = app_log_dir().join(APP_LOG_FILE_NAME);
+    let file_writer = RollingFileWriter::open(
+        &log_path,
+        DEFAULT_MAX_LOG_BYTES,
+        DEFAULT_MAX_LOG_BACKUPS,
+    )
+    .ok();
+
+    let debug_enabled = Arc::new(AtomicBool::new(initial_debug));
+    let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(AppLogFilter {
+        debug_enabled: Arc::clone(&debug_enabled),
+    });
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(move || match &file_writer {
+            Some(writer) => AppLogSink::File(writer.clone()),
+            None => AppLogSink::Stderr(std::io::stderr()),
+        })
         .with_ansi(false)
-        .try_init();
+        .with_filter(filter_layer);
+
+    let init_ok = tracing_subscriber::registry().with(fmt_layer).try_init().is_ok();
+    let ctrl = init_ok.then_some(LogLevelController {
+        debug_enabled,
+        reload_handle,
+    });
+    (ctrl, log_path)
 }
 
 fn main() {
-    init_logging();
+    let initial_debug = WindowsCredentialStore::new()
+        .load_client_config()
+        .map(|cfg| cfg.debug_mode)
+        .unwrap_or(false);
+    let (log_level_ctrl, log_path) = init_logging(initial_debug);
+    info!(
+        version = freeton_core::APP_VERSION,
+        dev_mode = initial_debug,
+        log_file = %log_path.display(),
+        "Freeton VPN starting"
+    );
 
     let Some(_single_instance) = acquire_single_instance() else {
         info!("Freeton VPN already running; activated existing window");
@@ -635,6 +769,7 @@ fn main() {
     }
 
     let prefer_software = is_vm_or_remote_graphics_session();
+    info!(prefer_software, "Graphics environment probed");
     let base_options = eframe::NativeOptions {
         viewport,
         persist_window: false,
@@ -647,20 +782,22 @@ fn main() {
             wgpu_options: build_wgpu_configuration(true),
             ..base_options.clone()
         };
+        let ctrl_vm = log_level_ctrl.clone();
         if let Err(wgpu_err) = eframe::run_native(
             WINDOW_TITLE,
             vm_wgpu_options,
-            Box::new(|cc| Ok(Box::new(FreetonDesktopApp::new(cc)))),
+            Box::new(move |cc| Ok(Box::new(FreetonDesktopApp::new(cc, ctrl_vm)))),
         ) {
             warn!(error = %wgpu_err, "VM WARP wgpu renderer failed; falling back to glow OpenGL");
             let glow_options = eframe::NativeOptions {
                 renderer: Renderer::Glow,
                 ..base_options
             };
+            let ctrl_glow = log_level_ctrl.clone();
             if let Err(glow_err) = eframe::run_native(
                 WINDOW_TITLE,
                 glow_options,
-                Box::new(|cc| Ok(Box::new(FreetonDesktopApp::new(cc)))),
+                Box::new(move |cc| Ok(Box::new(FreetonDesktopApp::new(cc, ctrl_glow)))),
             ) {
                 error!(wgpu = %wgpu_err, glow = %glow_err, "all graphics backends failed");
                 show_fatal_launch_error(&format!(
@@ -675,10 +812,11 @@ fn main() {
         renderer: Renderer::Glow,
         ..base_options.clone()
     };
+    let ctrl_primary = log_level_ctrl.clone();
     if let Err(glow_err) = eframe::run_native(
         WINDOW_TITLE,
         glow_options,
-        Box::new(|cc| Ok(Box::new(FreetonDesktopApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(FreetonDesktopApp::new(cc, ctrl_primary)))),
     ) {
         warn!(error = %glow_err, "glow OpenGL renderer failed; falling back to wgpu DX12");
         let wgpu_options = eframe::NativeOptions {
@@ -686,10 +824,11 @@ fn main() {
             wgpu_options: build_wgpu_configuration(false),
             ..base_options.clone()
         };
+        let ctrl_wgpu = log_level_ctrl.clone();
         if let Err(wgpu_err) = eframe::run_native(
             WINDOW_TITLE,
             wgpu_options,
-            Box::new(|cc| Ok(Box::new(FreetonDesktopApp::new(cc)))),
+            Box::new(move |cc| Ok(Box::new(FreetonDesktopApp::new(cc, ctrl_wgpu)))),
         ) {
             warn!(error = %wgpu_err, "wgpu DX12 hardware failed; falling back to DX12 WARP");
             let warp_options = eframe::NativeOptions {
@@ -700,7 +839,7 @@ fn main() {
             if let Err(warp_err) = eframe::run_native(
                 WINDOW_TITLE,
                 warp_options,
-                Box::new(|cc| Ok(Box::new(FreetonDesktopApp::new(cc)))),
+                Box::new(move |cc| Ok(Box::new(FreetonDesktopApp::new(cc, log_level_ctrl)))),
             ) {
                 error!(glow = %glow_err, wgpu = %wgpu_err, warp = %warp_err, "all graphics backends failed");
                 show_fatal_launch_error(&format!(

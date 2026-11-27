@@ -1,4 +1,5 @@
 pub mod api;
+pub mod logging;
 pub mod ping;
 pub mod srp;
 pub mod storage;
