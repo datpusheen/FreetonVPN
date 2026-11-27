@@ -36,9 +36,9 @@ use broker::{
     BROKER_SERVICE_NAME,
 };
 use tunnel_runner::{
-    default_tunnels_dir, ensure_restricted_tunnels_dir, open_sc_manager, query_service_state,
-    run_tunnel_service_from_cli, stop_and_delete_service, to_wide_null, tunnel_service_name,
-    win32_err_code, LocalFreeGuard, ScHandleGuard,
+    default_tunnels_dir, ensure_restricted_tunnels_dir, ensure_tunnel_runtime_dlls,
+    open_sc_manager, query_service_state, run_tunnel_service_from_cli, stop_and_delete_service,
+    to_wide_null, tunnel_service_name, win32_err_code, LocalFreeGuard, ScHandleGuard,
 };
 
 const READ_CONTROL_ACCESS: u32 = 0x0002_0000;
@@ -179,10 +179,15 @@ fn grant_interactive_user_service_rights(service_handle: &ScHandleGuard) -> Resu
 }
 
 fn install_broker_service() -> Result<(), String> {
+    let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_dir = exe_path
+        .parent()
+        .ok_or_else(|| "cannot resolve FreetonVPNService.exe directory".to_owned())?;
+    ensure_tunnel_runtime_dlls(exe_dir).map_err(|e| e.to_string())?;
+
     let tunnels_dir = default_tunnels_dir();
     ensure_restricted_tunnels_dir(&tunnels_dir, true).map_err(|e| e.to_string())?;
 
-    let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
     let launch_cmd = format!("\"{}\" --service", exe_path.display());
 
     let wide_name = to_wide_null(BROKER_SERVICE_NAME).map_err(|e| e.to_string())?;

@@ -11,8 +11,8 @@
                       "Render phân nhóm: Tiêu đề nhóm nổi bật, bullet căn lề và tự xuống dòng chuẩn trong popup."
                   ],
     "download_url":  "https://github.com/datpusheen/FreetonVPN/releases/download/v3.0.2/FreetonVPN-Setup-x64.exe",
-    "file_size_bytes":  8451352,
-    "sha256":  "b243104c82d7c6b080e9aae596f3fb8c3e503949be19ff38eb64451b9597f3be",
+    "file_size_bytes":  8265957,
+    "sha256":  "794a86fc090b979b655686549e0fc9387c8b8aeb176a3f0977b3292608028377",
     "mandatory":  false,
     "min_supported_version":  "3.0.0"
 }

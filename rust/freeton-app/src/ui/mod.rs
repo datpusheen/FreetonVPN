@@ -5,7 +5,9 @@ pub mod login;
 
 use std::sync::Arc;
 
-use egui::epaint::text::{FontData, FontDefinitions, FontFamily};
+use egui::epaint::text::{
+    FontData, FontDefinitions, FontFamily, FontTweak, HintingTarget, SmoothHinting,
+};
 use egui::{
     Align, Color32, CornerRadius, CursorIcon, Frame, Layout, Margin, Pos2, Rect, Response,
     RichText, Sense, Stroke, StrokeKind, Ui, Vec2, ViewportCommand,
@@ -128,19 +130,28 @@ fn resolve_windows_fonts_dir(
         .join("Fonts")
 }
 
-pub fn configure_fonts_and_style(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
+fn crisp_font_tweak() -> FontTweak {
+    FontTweak {
+        hinting: Some(true),
+        subpixel_binning: Some(false),
+        hinting_target: HintingTarget::Smooth(SmoothHinting {
+            light: false,
+            symmetric_rendering: false,
+            preserve_linear_metrics: false,
+        }),
+        ..Default::default()
+    }
+}
 
+fn apply_windows_fonts_to_definitions(fonts: &mut FontDefinitions, fonts_dir: &std::path::Path) {
     let mut prop_prefix = Vec::new();
     let mut mono_suffix = Vec::new();
-
-    let fonts_dir =
-        resolve_windows_fonts_dir(std::env::var_os("WINDIR"), std::env::var_os("SystemRoot"));
+    let crisp_tweak = crisp_font_tweak();
 
     if let Ok(segoe_bytes) = std::fs::read(fonts_dir.join("segoeui.ttf")) {
         fonts.font_data.insert(
             "segoe_ui".to_owned(),
-            Arc::new(FontData::from_owned(segoe_bytes)),
+            Arc::new(FontData::from_owned(segoe_bytes).tweak(crisp_tweak.clone())),
         );
         prop_prefix.push("segoe_ui".to_owned());
     }
@@ -157,7 +168,7 @@ pub fn configure_fonts_and_style(ctx: &egui::Context) {
     if let Ok(sym_bytes) = std::fs::read(fonts_dir.join("seguisym.ttf")) {
         fonts.font_data.insert(
             "segoe_ui_symbol".to_owned(),
-            Arc::new(FontData::from_owned(sym_bytes)),
+            Arc::new(FontData::from_owned(sym_bytes).tweak(crisp_tweak)),
         );
         prop_prefix.push("segoe_ui_symbol".to_owned());
         mono_suffix.push("segoe_ui_symbol".to_owned());
@@ -176,10 +187,19 @@ pub fn configure_fonts_and_style(ctx: &egui::Context) {
             mono_list.extend(mono_suffix);
         }
     }
+}
+
+pub fn configure_fonts_and_style(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    let fonts_dir =
+        resolve_windows_fonts_dir(std::env::var_os("WINDIR"), std::env::var_os("SystemRoot"));
+    apply_windows_fonts_to_definitions(&mut fonts, &fonts_dir);
 
     ctx.set_fonts(fonts);
 
     let mut visuals = egui::Visuals::dark();
+    visuals.text_options.font_hinting = true;
+    visuals.text_options.subpixel_binning = false;
     visuals.panel_fill = C_BG;
     visuals.window_fill = C_CARD;
     visuals.extreme_bg_color = C_BG;
@@ -1159,6 +1179,104 @@ mod tests {
         assert_eq!(
             simulate_drag_at(egui::Pos2::new(361.0, 33.0), egui::Vec2::new(6.0, 2.0)),
             (false, false)
+        );
+    }
+
+    #[test]
+    fn test_configured_fonts_apply_crisp_hinting_and_keep_color_emojis() {
+        let fonts_dir =
+            super::resolve_windows_fonts_dir(std::env::var_os("WINDIR"), std::env::var_os("SystemRoot"));
+        let mut fonts = egui::FontDefinitions::default();
+        super::apply_windows_fonts_to_definitions(&mut fonts, &fonts_dir);
+
+        if fonts_dir.join("segoeui.ttf").exists() {
+            let segoe = fonts.font_data.get("segoe_ui").expect("segoe_ui font loaded");
+            assert_eq!(segoe.tweak.hinting, Some(true));
+            assert_eq!(segoe.tweak.subpixel_binning, Some(false));
+            assert_eq!(
+                segoe.tweak.hinting_target,
+                super::HintingTarget::Smooth(super::SmoothHinting {
+                    light: false,
+                    symmetric_rendering: false,
+                    preserve_linear_metrics: false,
+                })
+            );
+        }
+        if fonts_dir.join("seguiemj.ttf").exists() {
+            assert!(
+                fonts.font_data.contains_key("segoe_ui_emoji"),
+                "seguiemj.ttf must remain enabled when present so UI emojis stay in full color"
+            );
+        }
+
+        let ctx = egui::Context::default();
+        super::configure_fonts_and_style(&ctx);
+        let mut missing = Vec::new();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let font_id = egui::FontId::proportional(13.0);
+            missing = ui.fonts_mut(|f| {
+                ['●', '▸', '✓', '✕', '↻', '⚙', '⚠', '⚡', 'Đ', 'ệ', 'ư', '🚀', '🛡', '🛠', '🔄', '❌', '📊', '🔤']
+                    .into_iter()
+                    .filter(|&ch| !f.has_glyph(&font_id, ch))
+                    .collect()
+            });
+        });
+        out.textures_delta.clear();
+        assert!(
+            missing.is_empty(),
+            "missing UI glyphs in configured font stack: {missing:?}"
+        );
+        let text_opts = ctx.global_style().visuals.text_options;
+        assert!(text_opts.font_hinting, "font hinting must stay enabled for crisp text");
+        assert!(
+            !text_opts.subpixel_binning,
+            "subpixel_binning must be disabled to prevent blurry text"
+        );
+    }
+
+    #[test]
+    fn test_color_emoji_renders_chromatic_pixels_in_font_atlas() {
+        let fonts_dir = super::resolve_windows_fonts_dir(
+            std::env::var_os("WINDIR"),
+            std::env::var_os("SystemRoot"),
+        );
+        if !fonts_dir.join("seguiemj.ttf").exists() {
+            return;
+        }
+
+        let ctx = egui::Context::default();
+        super::configure_fonts_and_style(&ctx);
+
+        // Warm up the atlas with plain monochrome ASCII first so any newly uploaded
+        // delta on the next frame comes from laying out the emoji glyphs.
+        let mut warmup = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.label("ASCII warmup");
+        });
+        warmup.textures_delta.clear();
+
+        let mut emoji_out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.label("🚀 ⚡ 📊");
+        });
+
+        let mut chromatic_pixel_count = 0usize;
+        for (id, deltas) in &emoji_out.textures_delta.set {
+            if *id != egui::TextureId::Managed(0) {
+                continue;
+            }
+            for delta in deltas {
+                let egui::ImageData::Color(image) = &delta.image;
+                chromatic_pixel_count += image
+                    .pixels
+                    .iter()
+                    .filter(|px| px.a() > 0 && (px.r() != px.g() || px.g() != px.b()))
+                    .count();
+            }
+        }
+        emoji_out.textures_delta.clear();
+
+        assert!(
+            chromatic_pixel_count > 10,
+            "expected color emoji rasterization in font atlas (epaint color_fonts), found only {chromatic_pixel_count} chromatic pixels"
         );
     }
 }

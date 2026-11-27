@@ -76,7 +76,6 @@ Thư mục giải nén và file ZIP được xuất ra `dist/browser-extension/`
 | `version.json` | Manifest legacy v2.4.3 (giữ lại cho người dùng v2.x cũ) |
 | `browser-extension/` | Mã nguồn chung và script build extension cho Chromium và Firefox |
 | `website/` | Trang web tĩnh giới thiệu dự án (tự deploy qua [`.github/workflows/static.yml`](.github/workflows/static.yml)) |
-| `CHANGELOG.md`, `RELEASE_NOTES_*.md` | Lịch sử thay đổi và ghi chú phát hành các phiên bản trước |
 | `docs/`, `archive/` | Tài liệu thiết kế/kế hoạch kỹ thuật và bản lưu trữ tham khảo cũ |
 | `dist/` | Thư mục chứa bộ cài, extension và checksum sau khi build (git-ignored) |
 

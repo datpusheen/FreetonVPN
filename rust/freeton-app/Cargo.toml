@@ -10,8 +10,10 @@ name = "FreetonVPN"
 path = "src/main.rs"
 
 [dependencies]
-eframe = "0.37"
-egui = "0.37"
+eframe = { version = "0.37", default-features = false, features = ["glow", "wgpu_no_default_features", "clipboard", "links", "default_fonts"] }
+egui = { version = "0.37", default-features = false, features = ["bytemuck", "default_fonts"] }
+egui-wgpu = { version = "0.37", default-features = false, features = ["winit", "capture"] }
+epaint = { version = "0.37", default-features = false, features = ["bytemuck", "default_fonts", "color_fonts"] }
 freeton-core = { path = "../freeton-core" }
 image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 raw-window-handle = "0.6"
@@ -24,6 +26,7 @@ tracing-subscriber = "0.3"
 tray-icon = { version = "0.27", default-features = false }
 url = "2.5"
 webview2-com = "0.39.1"
+wgpu = { version = "30.0", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",

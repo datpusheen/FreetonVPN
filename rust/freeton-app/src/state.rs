@@ -2613,7 +2613,9 @@ pub fn spawn_worker_runtime(
 ) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(4)
+        .worker_threads(2)
+        .max_blocking_threads(24)
+        .thread_keep_alive(Duration::from_secs(5))
         .build()
         .expect("failed creating Tokio runtime for freeton-app");
 
@@ -5395,5 +5397,29 @@ mod tests {
                 manifest_url_override: Some(url),
             } if url == "http://127.0.0.1:8080/version-rust.json"
         )));
+    }
+
+    #[test]
+    fn test_worker_runtime_supports_full_ping_blocking_concurrency() {
+        let (runtime, _cmd_tx, _evt_rx) = spawn_worker_runtime(
+            WorkerDeps::production_with_auth(Arc::new(AtomicU64::new(0))),
+            Arc::new(|| {}),
+        );
+
+        let started = Instant::now();
+        runtime.block_on(async {
+            let mut join_set = tokio::task::JoinSet::new();
+            for _ in 0..DEFAULT_PING_WORKERS {
+                join_set.spawn_blocking(|| {
+                    std::thread::sleep(Duration::from_millis(120));
+                });
+            }
+            while join_set.join_next().await.is_some() {}
+        });
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(350),
+            "ping runtime blocking pool serialized DEFAULT_PING_WORKERS ({DEFAULT_PING_WORKERS}) probes: elapsed {elapsed:?}"
+        );
     }
 }

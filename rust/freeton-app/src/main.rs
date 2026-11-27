@@ -6,9 +6,10 @@ pub mod tray;
 pub mod ui;
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, ViewportBuilder, ViewportCommand};
+use eframe::{egui_wgpu, wgpu, Renderer};
 use freeton_core::storage::{CredentialStore, WindowsCredentialStore};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tokio::sync::mpsc;
@@ -20,14 +21,18 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE,
 };
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
+use windows::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, ReleaseCapture, SetCapture, VK_LBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetCursorPos, GetWindowRect, IsIconic, SetForegroundWindow, SetWindowPos,
-    ShowWindow, SystemParametersInfoW, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_RESTORE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    FindWindowW, GetCursorPos, GetSystemMetrics, GetWindowRect, IsIconic, MessageBoxW,
+    SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW, MB_ICONERROR, MB_OK,
+    SM_REMOTESESSION, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
+    SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
 };
 
 use state::{spawn_worker_runtime, AppState, UiCommand, WorkerDeps, WorkerEvent};
@@ -189,6 +194,8 @@ struct FreetonDesktopApp {
     evt_rx: mpsc::UnboundedReceiver<WorkerEvent>,
     tray: Option<TrayController>,
     dwm_initialized: bool,
+    startup_trimmed: bool,
+    started_at: Instant,
     last_window_visible: bool,
     active_drag: Option<ActiveWindowDrag>,
 }
@@ -231,6 +238,8 @@ impl FreetonDesktopApp {
             evt_rx,
             tray,
             dwm_initialized: false,
+            startup_trimmed: false,
+            started_at: Instant::now(),
             last_window_visible,
             active_drag: None,
         }
@@ -328,6 +337,10 @@ impl FreetonDesktopApp {
                 self.dwm_initialized = true;
             }
         }
+        if !self.startup_trimmed && self.started_at.elapsed() >= Duration::from_secs(2) {
+            self.startup_trimmed = true;
+            trim_working_set();
+        }
 
         let mut force_reveal = false;
         if let Some(tray) = &self.tray {
@@ -376,6 +389,9 @@ impl FreetonDesktopApp {
         ) {
             self.reveal_window(ctx, frame);
         }
+        if self.last_window_visible && !self.state.window_visible {
+            trim_working_set();
+        }
         self.last_window_visible = self.state.window_visible;
 
         for cmd in self.state.drain_commands() {
@@ -400,6 +416,7 @@ impl FreetonDesktopApp {
             self.state.window_visible = false;
             self.last_window_visible = false;
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            trim_working_set();
         }
 
         if self.state.exit_ready {
@@ -412,7 +429,10 @@ impl eframe::App for FreetonDesktopApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.pump_events_and_commands(ctx, frame);
         self.sync_direct_window_drag(ctx, frame);
-        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        ctx.request_repaint_after(idle_repaint_interval(
+            self.state.window_visible,
+            self.state.tunnel_running,
+        ));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -423,6 +443,165 @@ impl eframe::App for FreetonDesktopApp {
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         ui::C_BG.to_normalized_gamma_f32()
+    }
+}
+
+pub(crate) fn idle_repaint_interval(window_visible: bool, tunnel_running: bool) -> Duration {
+    if !window_visible {
+        Duration::from_secs(30)
+    } else if tunnel_running {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(5)
+    }
+}
+
+pub(crate) fn is_virtual_gpu_adapter(
+    name: &str,
+    vendor: u32,
+    device_type: wgpu::DeviceType,
+) -> bool {
+    if matches!(device_type, wgpu::DeviceType::VirtualGpu) {
+        return true;
+    }
+    if matches!(vendor, 0x15ad | 0x80ee | 0x1af4 | 0x1234 | 0x1ab8) {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    [
+        "vmware",
+        "virtualbox",
+        "vbox",
+        "hyper-v",
+        "basic display",
+        "remote display",
+        "parallels",
+        "qemu",
+        "virtio",
+        "qxl",
+        "citrix",
+        "red hat",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+}
+
+pub(crate) fn adapter_selection_rank(
+    name: &str,
+    vendor: u32,
+    device_type: wgpu::DeviceType,
+    force_software: bool,
+) -> u8 {
+    let is_virtual = is_virtual_gpu_adapter(name, vendor, device_type);
+    if force_software {
+        return match device_type {
+            wgpu::DeviceType::Cpu => 0,
+            wgpu::DeviceType::IntegratedGpu if !is_virtual => 1,
+            wgpu::DeviceType::DiscreteGpu if !is_virtual => 2,
+            _ => 3,
+        };
+    }
+
+    if is_virtual {
+        return 3;
+    }
+
+    match device_type {
+        wgpu::DeviceType::IntegratedGpu => 0,
+        wgpu::DeviceType::DiscreteGpu => 1,
+        wgpu::DeviceType::Cpu => 2,
+        wgpu::DeviceType::Other | wgpu::DeviceType::VirtualGpu => 3,
+    }
+}
+
+fn is_vm_or_remote_graphics_session() -> bool {
+    if std::env::var_os("FREETON_SW_RENDER").is_some() {
+        return true;
+    }
+    if unsafe { GetSystemMetrics(SM_REMOTESESSION) } != 0 {
+        return true;
+    }
+    for dev_idx in 0..4 {
+        let mut dev = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { EnumDisplayDevicesW(None, dev_idx, &mut dev, 0) }.as_bool() {
+            break;
+        }
+        let end = dev
+            .DeviceString
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(dev.DeviceString.len());
+        let name = String::from_utf16_lossy(&dev.DeviceString[..end]);
+        if is_virtual_gpu_adapter(&name, 0, wgpu::DeviceType::Other) {
+            return true;
+        }
+    }
+    false
+}
+
+fn trim_working_set() {
+    unsafe {
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
+fn show_fatal_launch_error(message: &str) {
+    let title: Vec<u16> = "Freeton VPN - Lỗi khởi động"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let body: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+fn build_wgpu_configuration(force_software: bool) -> egui_wgpu::WgpuConfiguration {
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.instance_descriptor.backends = wgpu::Backends::DX12;
+    setup.power_preference = wgpu::PowerPreference::LowPower;
+    setup.device_descriptor = Arc::new(|adapter| {
+        let _ = adapter;
+        wgpu::DeviceDescriptor {
+            label: Some("freeton_wgpu_device"),
+            required_limits: wgpu::Limits {
+                max_texture_dimension_2d: 2048,
+                ..wgpu::Limits::downlevel_defaults()
+            },
+            ..Default::default()
+        }
+    });
+    setup.native_adapter_selector = Some(Arc::new(move |adapters, surface| {
+        let mut ranked: Vec<(&wgpu::Adapter, u8)> = adapters
+            .iter()
+            .filter(|a| surface.is_none_or(|s| a.is_surface_supported(s)))
+            .map(|a| {
+                let info = a.get_info();
+                (
+                    a,
+                    adapter_selection_rank(&info.name, info.vendor, info.device_type, force_software),
+                )
+            })
+            .collect();
+        ranked.sort_by_key(|(_, rank)| *rank);
+        ranked
+            .into_iter()
+            .next()
+            .map(|(a, _)| a.clone())
+            .ok_or_else(|| "No compatible DX12 graphics adapter found".to_owned())
+    }));
+
+    egui_wgpu::WgpuConfiguration {
+        wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(setup),
+        ..Default::default()
     }
 }
 
@@ -455,24 +634,90 @@ fn main() {
         viewport = viewport.with_icon(icon);
     }
 
-    let options = eframe::NativeOptions {
+    let prefer_software = is_vm_or_remote_graphics_session();
+    let base_options = eframe::NativeOptions {
         viewport,
         persist_window: false,
         ..Default::default()
     };
 
-    if let Err(err) = eframe::run_native(
+    if prefer_software {
+        let vm_wgpu_options = eframe::NativeOptions {
+            renderer: Renderer::Wgpu,
+            wgpu_options: build_wgpu_configuration(true),
+            ..base_options.clone()
+        };
+        if let Err(wgpu_err) = eframe::run_native(
+            WINDOW_TITLE,
+            vm_wgpu_options,
+            Box::new(|cc| Ok(Box::new(FreetonDesktopApp::new(cc)))),
+        ) {
+            warn!(error = %wgpu_err, "VM WARP wgpu renderer failed; falling back to glow OpenGL");
+            let glow_options = eframe::NativeOptions {
+                renderer: Renderer::Glow,
+                ..base_options
+            };
+            if let Err(glow_err) = eframe::run_native(
+                WINDOW_TITLE,
+                glow_options,
+                Box::new(|cc| Ok(Box::new(FreetonDesktopApp::new(cc)))),
+            ) {
+                error!(wgpu = %wgpu_err, glow = %glow_err, "all graphics backends failed");
+                show_fatal_launch_error(&format!(
+                    "Không thể khởi tạo giao diện đồ họa.\n\nDX12 WARP (wgpu): {wgpu_err}\nOpenGL (glow): {glow_err}"
+                ));
+            }
+        }
+        return;
+    }
+
+    let glow_options = eframe::NativeOptions {
+        renderer: Renderer::Glow,
+        ..base_options.clone()
+    };
+    if let Err(glow_err) = eframe::run_native(
         WINDOW_TITLE,
-        options,
+        glow_options,
         Box::new(|cc| Ok(Box::new(FreetonDesktopApp::new(cc)))),
     ) {
-        error!(error = %err, "eframe run_native failed");
+        warn!(error = %glow_err, "glow OpenGL renderer failed; falling back to wgpu DX12");
+        let wgpu_options = eframe::NativeOptions {
+            renderer: Renderer::Wgpu,
+            wgpu_options: build_wgpu_configuration(false),
+            ..base_options.clone()
+        };
+        if let Err(wgpu_err) = eframe::run_native(
+            WINDOW_TITLE,
+            wgpu_options,
+            Box::new(|cc| Ok(Box::new(FreetonDesktopApp::new(cc)))),
+        ) {
+            warn!(error = %wgpu_err, "wgpu DX12 hardware failed; falling back to DX12 WARP");
+            let warp_options = eframe::NativeOptions {
+                renderer: Renderer::Wgpu,
+                wgpu_options: build_wgpu_configuration(true),
+                ..base_options
+            };
+            if let Err(warp_err) = eframe::run_native(
+                WINDOW_TITLE,
+                warp_options,
+                Box::new(|cc| Ok(Box::new(FreetonDesktopApp::new(cc)))),
+            ) {
+                error!(glow = %glow_err, wgpu = %wgpu_err, warp = %warp_err, "all graphics backends failed");
+                show_fatal_launch_error(&format!(
+                    "Không thể khởi tạo giao diện đồ họa.\n\nOpenGL (glow): {glow_err}\nDX12 (wgpu): {wgpu_err}\nDX12 WARP: {warp_err}"
+                ));
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_window_drag_position, should_reveal_window};
+    use super::{
+        adapter_selection_rank, compute_window_drag_position, idle_repaint_interval,
+        is_virtual_gpu_adapter, should_reveal_window,
+    };
+    use eframe::wgpu;
 
     #[test]
     fn test_window_reveal_transition_handles_tray_and_background_events() {
@@ -488,5 +733,37 @@ mod tests {
             compute_window_drag_position(1200, 300, 1300, 320, 1250, 365),
             (1150, 345)
         );
+    }
+
+    #[test]
+    fn test_virtual_gpu_detection_and_adapter_priority_prefers_cpu_over_virtual() {
+        assert!(is_virtual_gpu_adapter("VMware SVGA 3D", 0x15ad, wgpu::DeviceType::VirtualGpu));
+        assert!(is_virtual_gpu_adapter("VirtualBox Graphics Adapter", 0x80ee, wgpu::DeviceType::Other));
+        assert!(is_virtual_gpu_adapter("Microsoft Basic Display Adapter", 0x1414, wgpu::DeviceType::Other));
+        assert!(is_virtual_gpu_adapter("Microsoft Hyper-V Video", 0x1414, wgpu::DeviceType::VirtualGpu));
+        assert!(is_virtual_gpu_adapter("Red Hat VirtIO GPU", 0x1af4, wgpu::DeviceType::VirtualGpu));
+        assert!(!is_virtual_gpu_adapter("Intel(R) UHD Graphics 770", 0x8086, wgpu::DeviceType::IntegratedGpu));
+        assert!(!is_virtual_gpu_adapter("NVIDIA GeForce RTX 3060", 0x10de, wgpu::DeviceType::DiscreteGpu));
+
+        let integrated_rank = adapter_selection_rank("Intel UHD", 0x8086, wgpu::DeviceType::IntegratedGpu, false);
+        let discrete_rank = adapter_selection_rank("NVIDIA RTX", 0x10de, wgpu::DeviceType::DiscreteGpu, false);
+        let cpu_rank = adapter_selection_rank("Microsoft Basic Render Driver", 0x1414, wgpu::DeviceType::Cpu, false);
+        let virtual_rank = adapter_selection_rank("VMware SVGA 3D", 0x15ad, wgpu::DeviceType::VirtualGpu, false);
+        assert!(integrated_rank < discrete_rank);
+        assert!(discrete_rank < cpu_rank);
+        assert!(cpu_rank < virtual_rank);
+
+        let sw_cpu_rank = adapter_selection_rank("Microsoft Basic Render Driver", 0x1414, wgpu::DeviceType::Cpu, true);
+        let sw_gpu_rank = adapter_selection_rank("Intel UHD", 0x8086, wgpu::DeviceType::IntegratedGpu, true);
+        assert!(sw_cpu_rank < sw_gpu_rank);
+    }
+
+    #[test]
+    fn test_idle_repaint_interval_scales_by_visibility_and_tunnel() {
+        use std::time::Duration;
+        assert!(idle_repaint_interval(false, false) >= Duration::from_secs(15));
+        assert!(idle_repaint_interval(false, true) >= Duration::from_secs(15));
+        assert!(idle_repaint_interval(true, false) >= Duration::from_secs(3));
+        assert_eq!(idle_repaint_interval(true, true), Duration::from_secs(1));
     }
 }

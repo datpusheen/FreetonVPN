@@ -508,6 +508,24 @@ pub fn remove_tunnel_conf(tunnels_dir: &Path, tunnel_name: &str) -> Result<(), T
     }
 }
 
+pub(crate) fn ensure_tunnel_runtime_dlls(exe_dir: &Path) -> Result<(PathBuf, PathBuf), TunnelError> {
+    let wireguard_dll = exe_dir.join("wireguard.dll");
+    if !wireguard_dll.is_file() {
+        return Err(TunnelError::MissingDependency(format!(
+            "missing required sibling DLL {} (copy tunnel.dll and wireguard.dll alongside FreetonVPNService.exe or reinstall Freeton VPN)",
+            wireguard_dll.display()
+        )));
+    }
+    let tunnel_dll = exe_dir.join("tunnel.dll");
+    if !tunnel_dll.is_file() {
+        return Err(TunnelError::MissingDependency(format!(
+            "missing required sibling DLL {} (copy tunnel.dll and wireguard.dll alongside FreetonVPNService.exe or reinstall Freeton VPN)",
+            tunnel_dll.display()
+        )));
+    }
+    Ok((wireguard_dll, tunnel_dll))
+}
+
 /// Executes `WireGuardTunnelService` exported from sibling `tunnel.dll` after validating that
 /// `conf_path` resolves strictly inside `%ProgramData%\FreetonVPN\tunnels\` and `wireguard.dll`
 /// sits alongside `tunnel.dll`.
@@ -521,20 +539,7 @@ pub fn run_tunnel_service_from_cli(conf_path: &Path) -> Result<(), TunnelError> 
         TunnelError::MissingDependency("cannot resolve FreetonVPNService.exe directory".to_owned())
     })?;
 
-    let wireguard_dll = exe_dir.join("wireguard.dll");
-    if !wireguard_dll.is_file() {
-        return Err(TunnelError::MissingDependency(format!(
-            "missing required sibling DLL {}",
-            wireguard_dll.display()
-        )));
-    }
-    let tunnel_dll = exe_dir.join("tunnel.dll");
-    if !tunnel_dll.is_file() {
-        return Err(TunnelError::MissingDependency(format!(
-            "missing required sibling DLL {}",
-            tunnel_dll.display()
-        )));
-    }
+    let (_wireguard_dll, tunnel_dll) = ensure_tunnel_runtime_dlls(exe_dir)?;
 
     unsafe {
         let _ = SetDefaultDllDirectories(
@@ -610,6 +615,10 @@ pub fn install_and_start_tunnel_service(
     service_exe: &Path,
 ) -> Result<(), TunnelError> {
     validate_tunnel_name(tunnel_name)?;
+    let exe_dir = service_exe.parent().ok_or_else(|| {
+        TunnelError::MissingDependency("cannot resolve FreetonVPNService.exe directory".to_owned())
+    })?;
+    ensure_tunnel_runtime_dlls(exe_dir)?;
     let svc_name = tunnel_service_name(tunnel_name);
     let display_name = format!("{TUNNEL_SERVICE_DISPLAY_PREFIX}{tunnel_name}");
     let clean_conf = to_win32_path_arg(conf_path);
@@ -1346,5 +1355,32 @@ mod tests {
                 .expect_err("nonexistent adapter must return Pipe error");
             assert!(matches!(err, TunnelError::Pipe(_)));
         }
+    }
+
+    #[test]
+    fn test_install_and_start_tunnel_service_requires_sibling_runtime_dlls() {
+        let unique = format!(
+            "freeton_missing_dll_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let fake_exe = temp_dir.join("FreetonVPNService.exe");
+        let fake_conf = temp_dir.join("FreetonVPN.conf");
+        fs::write(&fake_exe, b"stub").expect("write fake exe");
+        fs::write(&fake_conf, b"[Interface]\n").expect("write fake conf");
+
+        let err = install_and_start_tunnel_service("FreetonVPN", &fake_conf, &fake_exe)
+            .expect_err("must fail cleanly with MissingDependency instead of hitting SCM timeout");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        assert!(
+            matches!(err, TunnelError::MissingDependency(ref msg) if msg.contains("wireguard.dll")),
+            "expected MissingDependency(wireguard.dll), got {err:?}"
+        );
     }
 }
