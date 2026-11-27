@@ -84,6 +84,7 @@ pub struct GlobeState {
     pub was_active_tunnel: bool,
     pub drag_distance: f32,
     pub is_dragging: bool,
+    pub was_pointer_down: bool,
     pub last_frame_time: Option<f64>,
 }
 
@@ -102,6 +103,7 @@ impl Default for GlobeState {
             was_active_tunnel: false,
             drag_distance: 0.0,
             is_dragging: false,
+            was_pointer_down: false,
             last_frame_time: None,
         }
     }
@@ -371,9 +373,12 @@ pub fn sync_and_advance_globe(
             if let Some(flight) = &mut globe.flight {
                 flight.progress = 1.0;
                 flight.landing_pulse = 0.0;
-                let (ty, tp) = camera_angles_for_lat_lon(flight.target.0, flight.target.1);
-                globe.yaw = ty;
-                globe.pitch = tp;
+                if flight.camera_locked && !globe.is_dragging {
+                    let (ty, tp) = camera_angles_for_lat_lon(flight.target.0, flight.target.1);
+                    globe.yaw = ty;
+                    globe.pitch = tp;
+                    flight.camera_locked = false;
+                }
             }
         } else {
             globe.arc_alpha = (globe.arc_alpha + dt / 0.22).min(1.0);
@@ -446,7 +451,11 @@ fn target_coords_for_inputs(
     inputs: &GlobeRenderInputs<'_>,
     markers: &[GlobeCountryMarker],
 ) -> Option<(String, (f32, f32))> {
-    let srv = inputs.connected_server.or(inputs.selected_server)?;
+    let srv = if inputs.is_connecting && !inputs.is_disconnecting {
+        inputs.selected_server.or(inputs.connected_server)
+    } else {
+        inputs.connected_server.or(inputs.selected_server)
+    }?;
     let cc = srv.country.trim().to_ascii_uppercase();
     if cc.is_empty() {
         return None;
@@ -487,11 +496,35 @@ pub fn render_globe_widget(
     let is_active_or_connecting =
         (inputs.tunnel_running || inputs.is_connecting) && !inputs.is_disconnecting;
 
-    // Handle pointer drag first so user drag immediately overrides flight camera lock.
-    let pointer_pos = response.hover_pos().or_else(|| ui.ctx().pointer_latest_pos());
+    // Handle pointer drag & per-press travel first so user drag overrides flight camera lock
+    // and <6px micro-drags are cleanly tracked and reset between interactions.
+    let hover_pos = response.hover_pos().filter(|pos| {
+        ui.ctx()
+            .layer_id_at(*pos)
+            .is_none_or(|top| top == response.layer_id)
+    });
+    let is_down = response.is_pointer_button_down_on();
+    if is_down && !globe.was_pointer_down {
+        globe.drag_distance = 0.0;
+        if let (Some(origin), Some(cur)) = (
+            ui.ctx().input(|i| i.pointer.press_origin()),
+            hover_pos.or_else(|| response.interact_pointer_pos()),
+        ) {
+            globe.drag_distance = origin.distance(cur);
+        }
+    } else if globe.was_pointer_down && (is_down || response.dragged() || response.clicked()) {
+        let step_dist = ui.ctx().input(|i| i.pointer.delta().length());
+        globe.drag_distance += step_dist;
+        if let (Some(origin), Some(cur)) = (
+            ui.ctx().input(|i| i.pointer.press_origin()),
+            hover_pos.or_else(|| response.interact_pointer_pos()),
+        ) {
+            globe.drag_distance = globe.drag_distance.max(origin.distance(cur));
+        }
+    }
+
     if response.drag_started() {
         globe.is_dragging = true;
-        globe.drag_distance = 0.0;
         globe.vel_yaw = 0.0;
         globe.vel_pitch = 0.0;
         if let Some(flight) = &mut globe.flight {
@@ -500,7 +533,6 @@ pub fn render_globe_widget(
     }
     if response.dragged() {
         let delta = response.drag_delta();
-        globe.drag_distance += delta.length();
         let sens = (1.6 / base_radius.max(32.0)).clamp(0.008, 0.032);
         let dyaw = delta.x * sens;
         let dpitch = delta.y * sens;
@@ -526,7 +558,7 @@ pub fn render_globe_widget(
         })
         .collect();
 
-    let hovered_pre = pointer_pos
+    let hovered_pre = hover_pos
         .filter(|pos| rect.contains(*pos))
         .and_then(|pos| hit_test_marker(&projected_pre, pos, MARKER_HIT_RADIUS_PX));
 
@@ -558,7 +590,7 @@ pub fn render_globe_widget(
     let hovered_idx = if globe.is_dragging {
         None
     } else {
-        pointer_pos
+        hover_pos
             .filter(|pos| rect.contains(*pos))
             .and_then(|pos| hit_test_marker(&projected, pos, MARKER_HIT_RADIUS_PX))
     };
@@ -574,9 +606,21 @@ pub fn render_globe_widget(
     let mut action = GlobeAction::None;
     let is_clean_click = response.clicked() && globe.drag_distance < DRAG_CLICK_THRESHOLD_PX;
     if is_clean_click {
-        if let Some(idx) = hovered_idx {
+        let click_idx = hovered_idx.or_else(|| {
+            response
+                .interact_pointer_pos()
+                .filter(|pos| rect.contains(*pos))
+                .and_then(|pos| hit_test_marker(&projected, pos, MARKER_HIT_RADIUS_PX))
+        });
+        if let Some(idx) = click_idx {
             action = GlobeAction::ConnectCountry(markers[idx].best_server.clone());
         }
+    }
+
+    globe.was_pointer_down = is_down;
+    if !is_down && !response.dragged() {
+        globe.drag_distance = 0.0;
+        globe.is_dragging = false;
     }
 
     if ui.is_rect_visible(rect) {
@@ -1183,5 +1227,315 @@ mod tests {
         sync_and_advance_globe(&mut instant, Some(("SG", sg)), false, true, false, 0.40);
         assert!(instant.arc_alpha < 0.05);
         assert!(instant.zoom < 1.10);
+    }
+
+    fn run_globe_frame(
+        ctx: &egui::Context,
+        time: f64,
+        events: Vec<egui::Event>,
+        inputs: &GlobeRenderInputs<'_>,
+        globe: &mut GlobeState,
+    ) -> (GlobeAction, egui::FullOutput) {
+        let mut action = GlobeAction::None;
+        let raw_input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 260.0))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw_input, |ui| {
+            action = render_globe_widget(ui, inputs, globe, Vec2::new(360.0, 260.0));
+        });
+        out.textures_delta.clear();
+        (action, out)
+    }
+
+    #[test]
+    fn test_drag_distance_resets_and_distinguishes_drag_from_click() {
+        let sg_srv = mk_srv("SG-FREE#1", "SG", Some(30.0), Some(20.0), None, None);
+        let servers = vec![sg_srv];
+        let inputs = GlobeRenderInputs {
+            servers: &servers,
+            selected_server: None,
+            connected_server: None,
+            is_connecting: false,
+            is_disconnecting: false,
+            tunnel_running: false,
+            tunnel_verified: false,
+            animations_enabled: false,
+            window_visible: true,
+        };
+
+        let ctx = egui::Context::default();
+        let sg = fallback_country_coords("SG").unwrap();
+        let (yaw, pitch) = camera_angles_for_lat_lon(sg.0, sg.1);
+        let mut globe = GlobeState {
+            yaw,
+            pitch,
+            ..Default::default()
+        };
+        // Warm up frame
+        let _ = run_globe_frame(&ctx, 0.0, vec![], &inputs, &mut globe);
+
+        // 1. Drag 40px and release -> GlobeAction::None
+        let start = Pos2::new(180.0, 120.0);
+        let end = Pos2::new(220.0, 120.0);
+        let (a1, _) = run_globe_frame(
+            &ctx,
+            0.05,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &inputs,
+            &mut globe,
+        );
+        assert!(matches!(a1, GlobeAction::None));
+        let (a2, _) = run_globe_frame(
+            &ctx,
+            0.10,
+            vec![egui::Event::PointerMoved(end)],
+            &inputs,
+            &mut globe,
+        );
+        assert!(matches!(a2, GlobeAction::None));
+        let (a3, _) = run_globe_frame(
+            &ctx,
+            0.15,
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &inputs,
+            &mut globe,
+        );
+        assert!(matches!(a3, GlobeAction::None));
+
+        // 2. Re-center on SG and perform a clean click (0px drag) -> MUST emit ConnectCountry
+        let (cy, cp) = camera_angles_for_lat_lon(sg.0, sg.1);
+        globe.yaw = cy;
+        globe.pitch = cp;
+        let center = Pos2::new(180.0, 121.0);
+        let _ = run_globe_frame(
+            &ctx,
+            0.20,
+            vec![
+                egui::Event::PointerMoved(center),
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &inputs,
+            &mut globe,
+        );
+        let (click_action, _) = run_globe_frame(
+            &ctx,
+            0.25,
+            vec![egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &inputs,
+            &mut globe,
+        );
+        assert!(
+            matches!(click_action, GlobeAction::ConnectCountry(ref s) if s.name == "SG-FREE#1"),
+            "clean click after prior drag must still connect, got {click_action:?}"
+        );
+
+        // 3. Micro-drag of 5.5px (>= 5.0px threshold, < egui 6px click threshold) -> MUST NOT connect
+        let micro_end = Pos2::new(center.x + 5.5, center.y);
+        let _ = run_globe_frame(
+            &ctx,
+            0.30,
+            vec![
+                egui::Event::PointerMoved(center),
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &inputs,
+            &mut globe,
+        );
+        let _ = run_globe_frame(
+            &ctx,
+            0.35,
+            vec![egui::Event::PointerMoved(micro_end)],
+            &inputs,
+            &mut globe,
+        );
+        let (micro_action, _) = run_globe_frame(
+            &ctx,
+            0.40,
+            vec![egui::Event::PointerButton {
+                pos: micro_end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &inputs,
+            &mut globe,
+        );
+        assert!(
+            matches!(micro_action, GlobeAction::None),
+            "5.5px micro-drag must not fire ConnectCountry, got {micro_action:?}"
+        );
+    }
+
+    #[test]
+    fn test_server_switch_while_connected_launches_flight_immediately() {
+        let sg_srv = mk_srv("SG-FREE#1", "SG", Some(30.0), Some(20.0), None, None);
+        let jp_srv = mk_srv("JP-FREE#1", "JP", Some(45.0), Some(30.0), None, None);
+        let sg = fallback_country_coords("SG").unwrap();
+        let servers = vec![sg_srv.clone(), jp_srv.clone()];
+
+        let ctx = egui::Context::default();
+        let mut globe = GlobeState::default();
+        let connected_sg = GlobeRenderInputs {
+            servers: &servers,
+            selected_server: Some(&sg_srv),
+            connected_server: Some(&sg_srv),
+            is_connecting: false,
+            is_disconnecting: false,
+            tunnel_running: true,
+            tunnel_verified: true,
+            animations_enabled: true,
+            window_visible: true,
+        };
+        let _ = run_globe_frame(&ctx, 0.0, vec![], &connected_sg, &mut globe);
+
+        // User initiates switch to JP while connected_server is still SG
+        let switching_to_jp = GlobeRenderInputs {
+            servers: &servers,
+            selected_server: Some(&jp_srv),
+            connected_server: Some(&sg_srv),
+            is_connecting: true,
+            is_disconnecting: false,
+            tunnel_running: true,
+            tunnel_verified: false,
+            animations_enabled: true,
+            window_visible: true,
+        };
+        let _ = run_globe_frame(&ctx, 0.05, vec![], &switching_to_jp, &mut globe);
+
+        let flight = globe.flight.as_ref().expect("switch flight must start");
+        assert_eq!(flight.origin, sg);
+        assert_eq!(flight.target_country, "JP");
+    }
+
+    #[test]
+    fn test_modal_overlay_blocks_globe_hover_and_tooltip() {
+        let sg_srv = mk_srv("SG-FREE#1", "SG", Some(30.0), Some(20.0), None, None);
+        let servers = vec![sg_srv];
+        let inputs = GlobeRenderInputs {
+            servers: &servers,
+            selected_server: None,
+            connected_server: None,
+            is_connecting: false,
+            is_disconnecting: false,
+            tunnel_running: false,
+            tunnel_verified: false,
+            animations_enabled: true,
+            window_visible: true,
+        };
+
+        let ctx = egui::Context::default();
+        let sg = fallback_country_coords("SG").unwrap();
+        let (yaw, pitch) = camera_angles_for_lat_lon(sg.0, sg.1);
+        let mut globe = GlobeState {
+            yaw,
+            pitch,
+            ..Default::default()
+        };
+
+        let globe_origin = Pos2::new(14.0, 150.0);
+        let globe_size = Vec2::new(362.0, 240.0);
+        let marker_pos = Pos2::new(globe_origin.x + 181.0, globe_origin.y + 111.0);
+        let raw_input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(390.0, 610.0))),
+            time: Some(0.1),
+            events: vec![egui::Event::PointerMoved(marker_pos)],
+            ..Default::default()
+        };
+
+        // Run frames so Area settles its layer rect, then verify modal Area blocks hover/tooltip
+        for t in [0.0_f64, 0.2_f64, 0.4_f64] {
+            let mut input = raw_input.clone();
+            input.time = Some(t);
+            let mut out = ctx.run_ui(input, |ui| {
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(Rect::from_min_size(globe_origin, globe_size)),
+                    |ui| {
+                        let _ = render_globe_widget(ui, &inputs, &mut globe, globe_size);
+                    },
+                );
+                egui::Area::new(egui::Id::unique("modal_blocker"))
+                    .order(egui::Order::Middle)
+                    .fixed_pos(Pos2::ZERO)
+                    .show(ui.ctx(), |ui| {
+                        let _ = ui.allocate_response(Vec2::new(390.0, 610.0), egui::Sense::click());
+                    });
+            });
+            out.textures_delta.clear();
+
+            if t >= 0.4 {
+                let mut texts = String::new();
+                fn collect(s: &egui::epaint::Shape, out: &mut String) {
+                    match s {
+                        egui::epaint::Shape::Text(txt) => {
+                            out.push_str(txt.galley.text());
+                            out.push('\n');
+                        }
+                        egui::epaint::Shape::Vec(v) => {
+                            for item in v {
+                                collect(item, out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for c in &out.shapes {
+                    collect(&c.shape, &mut texts);
+                }
+                assert!(
+                    !texts.contains("Singapore"),
+                    "modal overlay must block globe hover tooltip, got: {texts}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_connected_static_globe_allows_user_drag_without_snapping_back() {
+        let mut globe = GlobeState::default();
+        let sg = fallback_country_coords("SG").unwrap();
+        let (target_yaw, _) = camera_angles_for_lat_lon(sg.0, sg.1);
+
+        sync_and_advance_globe(&mut globe, Some(("SG", sg)), true, false, false, 0.016);
+        assert!((globe.yaw - target_yaw).abs() < 1e-4);
+
+        // User rotates globe while connected with animations disabled
+        globe.yaw = normalize_angle(target_yaw + 0.55);
+        sync_and_advance_globe(&mut globe, Some(("SG", sg)), true, false, false, 0.016);
+        assert!(
+            (shortest_angle_delta(target_yaw, globe.yaw) - 0.55).abs() < 1e-3,
+            "connected static globe must not snap camera back after user rotation"
+        );
     }
 }
