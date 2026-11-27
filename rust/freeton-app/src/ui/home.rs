@@ -8,16 +8,31 @@ use freeton_core::ping::get_country_display;
 use freeton_core::storage::CredentialStore;
 
 use crate::state::{AppState, ServiceHealthStatus};
+use crate::ui::globe::{render_globe_widget, GlobeAction, GlobeRenderInputs};
 use crate::ui::{
     lerp_color, load_status_color, pill_button, ping_status_color, rounded_card, PillStyle,
     C_ACCENT, C_BG, C_BORDER, C_CARD, C_CARD_HIGH, C_DANGER, C_SUCCESS, C_TEXT, C_TEXT_DIM,
     C_TEXT_MUTED, C_TOGGLE_CONNECTING, C_TOGGLE_OFF, C_TOGGLE_ON, C_WARNING,
 };
 
+pub(crate) fn handle_globe_action(state: &mut AppState, action: GlobeAction) {
+    if let GlobeAction::ConnectCountry(server) = action {
+        if !state.is_logged_in {
+            state.show_login_view();
+        } else if !state.is_connecting_vpn && !state.closing {
+            state.select_and_connect_server(server);
+        }
+    }
+}
+
 pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn CredentialStore) {
     ui.add_space(4.0);
 
-    // 1. Top Protection Status Card
+    let initial_avail_h = ui.available_height().max(0.0);
+    let compact = initial_avail_h < 460.0
+        || matches!(state.service_health, ServiceHealthStatus::Unavailable(_));
+
+    // 1. Merged Top Protection Status + Toggle Card
     let (status_border, status_title, status_title_color, status_sub, status_sub_color) = if state
         .closing
     {
@@ -58,12 +73,9 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
             .unwrap_or("Proton Server");
         (
             C_WARNING,
-            "ĐANG THIẾT LẬP KẾT NỐI...",
+            "ĐANG KẾT NỐI...",
             C_WARNING,
-            format!(
-                "Server: {srv_name} • Endpoint: {entry_ip}:{port}\nInterface: {addr} • DNS: {}",
-                state.client_config.dns
-            ),
+            format!("{srv_name} • {entry_ip}:{port} • {addr}"),
             C_TEXT,
         )
     } else if state.is_disconnecting_vpn {
@@ -71,20 +83,16 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
             C_WARNING,
             "ĐANG NGẮT KẾT NỐI...",
             C_WARNING,
-            "Đang ngắt WireGuard Tunnel & hoàn trả cấu hình mạng...".to_owned(),
+            "Đang ngắt WireGuard Tunnel & hoàn trả mạng...".to_owned(),
             C_TEXT_MUTED,
         )
     } else if state.tunnel_running && state.tunnel_verified {
         let (country_code, entry_ip, addr, port) = state.effective_endpoint_and_interface();
         let country_disp = get_country_display(&country_code);
         let sub = if let Some(pub_ip) = &state.live_public_ip {
-            format!(
-                    "IP Public (Exit): {pub_ip} ({country_disp})\nEndpoint: {entry_ip}:{port} • IP Nội bộ: {addr}"
-                )
+            format!("Exit IP: {pub_ip} ({country_disp})\n{entry_ip}:{port} • {addr}")
         } else {
-            format!(
-                    "Đang mã hóa qua {country_disp} • Endpoint: {entry_ip}:{port}\nIP Nội bộ WireGuard: {addr}"
-                )
+            format!("Mã hóa qua {country_disp} • {entry_ip}:{port}\nIP Nội bộ: {addr}")
         };
         (C_SUCCESS, "ĐÃ KẾT NỐI", C_SUCCESS, sub, C_TEXT)
     } else if state.tunnel_running {
@@ -98,7 +106,7 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
             C_WARNING,
             "VPN CHƯA XÁC MINH",
             C_WARNING,
-            format!("{reason}\nBấm công tắc để ngắt hoặc thử máy chủ khác."),
+            format!("{reason}\nBấm công tắc để ngắt hoặc chọn nước khác."),
             C_WARNING,
         )
     } else {
@@ -106,40 +114,136 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
             C_BORDER,
             "CHƯA BẬT VPN",
             C_TEXT,
-            "Bấm công tắc để kích hoạt kết nối an toàn WireGuard".to_owned(),
+            "Gạt công tắc hoặc chạm quốc gia trên địa cầu".to_owned(),
             C_TEXT_MUTED,
         )
     };
+
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(0))
+        .unwrap_or(0);
+    let (tone, timer_full_text) = state.formatted_session_timer(now_unix);
+    if state.tunnel_verified && state.window_visible {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(1));
+    }
+    let timer_color = match tone {
+        "success" => C_SUCCESS,
+        "warning" => C_WARNING,
+        _ => C_TEXT_DIM,
+    };
+    let badge_text = if state.tunnel_verified {
+        let hhmmss = timer_full_text
+            .split_whitespace()
+            .last()
+            .unwrap_or("00:00:00");
+        format!("● {hhmmss}")
+    } else if state.is_connecting_vpn && !state.is_disconnecting_vpn {
+        "● Đang kết nối".to_owned()
+    } else if state.is_disconnecting_vpn {
+        "● Đang ngắt".to_owned()
+    } else if state.tunnel_running {
+        "● Chưa xác minh".to_owned()
+    } else {
+        "● Sẵn sàng".to_owned()
+    };
+
+    let top_toggle_w = if compact { 64.0 } else { 72.0 };
+    let top_toggle_h = if compact { 34.0 } else { 38.0 };
+    let top_pad_y = if compact { 8 } else { 10 };
+    let mut toggle_clicked = false;
+    let toggle_on =
+        state.tunnel_running || (state.is_connecting_vpn && !state.is_disconnecting_vpn);
 
     rounded_card(
         ui,
         C_CARD,
         status_border,
         14,
-        Margin::symmetric(12, 11),
+        Margin::symmetric(12, top_pad_y),
         |ui| {
-            ui.set_width(ui.available_width());
-            ui.set_min_height(86.0);
-            ui.label(
-                RichText::new("KẾT NỐI CỦA BẠN")
-                    .size(10.5)
-                    .strong()
-                    .color(C_TEXT_DIM),
-            );
-            ui.add_space(2.0);
-            ui.label(
-                RichText::new(status_title)
-                    .size(19.0)
-                    .strong()
-                    .color(status_title_color),
-            );
-            ui.add_space(2.0);
-            ui.label(RichText::new(status_sub).size(11.0).color(status_sub_color));
+            let row_w = ui.available_width();
+            ui.set_width(row_w);
+            let gap_x = 10.0;
+            let left_w = (row_w - top_toggle_w - gap_x).max(140.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap_x;
+                ui.allocate_ui_with_layout(
+                    Vec2::new(left_w, 0.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(left_w);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(
+                                RichText::new("KẾT NỐI CỦA BẠN")
+                                    .size(10.0)
+                                    .strong()
+                                    .color(C_TEXT_DIM),
+                            );
+                            let badge_style = PillStyle {
+                                bg: C_CARD_HIGH,
+                                fg: timer_color,
+                                border: timer_color,
+                                hover_bg: C_CARD_HIGH,
+                                hover_fg: timer_color,
+                                hover_border: timer_color,
+                                radius: 6,
+                                height: 18.0,
+                                font_size: 9.5,
+                                bold: true,
+                                pad_x: 6.0,
+                            };
+                            let _ = pill_button(ui, &badge_text, None, badge_style);
+                        });
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(status_title)
+                                    .size(if compact { 16.5 } else { 17.5 })
+                                    .strong()
+                                    .color(status_title_color),
+                            )
+                            .wrap(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(status_sub)
+                                    .size(10.5)
+                                    .color(status_sub_color),
+                            )
+                            .wrap(),
+                        );
+                    },
+                );
+
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width().max(top_toggle_w), top_toggle_h),
+                    Layout::right_to_left(Align::Center),
+                    |ui| {
+                        if ios_toggle_switch(
+                            ui,
+                            toggle_on,
+                            state.is_connecting_vpn,
+                            state.client_config.animations_enabled,
+                            Vec2::new(top_toggle_w, top_toggle_h),
+                        )
+                        .clicked()
+                        {
+                            toggle_clicked = true;
+                        }
+                    },
+                );
+            });
         },
     );
+    if toggle_clicked {
+        state.toggle_vpn();
+    }
 
     if matches!(state.service_health, ServiceHealthStatus::Unavailable(_)) && !state.closing {
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         let repair_pill = PillStyle {
             bg: Color32::from_rgb(0x2b, 0x22, 0x16),
             fg: C_WARNING,
@@ -148,7 +252,7 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
             hover_fg: C_TEXT,
             hover_border: C_WARNING,
             radius: 9,
-            height: 28.0,
+            height: 26.0,
             font_size: 11.0,
             bold: true,
             pad_x: 10.0,
@@ -165,99 +269,37 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
         }
     }
 
-    // 2. Central Giant iOS Pill Switch Area + 3. Location Card + 4. Bottom Action Chips
-    // Measure/reserve footer cleanly so bottom buttons never clip below CentralPanel bounds, even
-    // when top banners (toast, loading bar, or UAC service repair) reduce available height.
+    // 2. Central Interactive 3D Globe Area + 3. Location Card + 4. Bottom Action Chips
     let available_after_status = ui.available_height().max(0.0);
-    let compact = available_after_status < 330.0;
+    let spacing_y = ui.spacing().item_spacing.y;
     let footer_chips_h = 34.0;
     let footer_bottom_pad = 2.0;
-    let server_card_est_h = if compact { 88.0 } else { 96.0 };
+    let server_card_est_h = if compact { 90.0 } else { 98.0 };
     let between_card_and_chips = if compact { 6.0 } else { 8.0 };
     let reserved_bottom =
         server_card_est_h + between_card_and_chips + footer_chips_h + footer_bottom_pad;
+    let globe_h = (available_after_status - reserved_bottom - spacing_y * 2.0).max(96.0);
 
-    let toggle_h = if compact { 62.0 } else { 70.0 };
-    let toggle_w = if compact { 122.0 } else { 136.0 };
-    let inner_gap_1 = if compact { 8.0 } else { 12.0 };
-    let inner_gap_2 = if compact { 8.0 } else { 12.0 };
-    let toggle_group_h = 30.0 + inner_gap_1 + toggle_h + inner_gap_2 + 16.0;
-
-    let center_room = (available_after_status - reserved_bottom).max(toggle_group_h);
-    let extra_center = (center_room - toggle_group_h).max(0.0);
-    let top_center_pad = (extra_center * 0.5).round();
-    let bottom_center_pad = (extra_center - top_center_pad).round();
-
-    ui.allocate_ui_with_layout(
-        Vec2::new(
-            ui.available_width(),
-            top_center_pad + toggle_group_h + bottom_center_pad,
-        ),
-        Layout::top_down(Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            if top_center_pad > 0.0 {
-                ui.add_space(top_center_pad);
-            }
-
-            let now_unix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| i64::try_from(d.as_secs()).unwrap_or(0))
-                .unwrap_or(0);
-            let (tone, timer_text) = state.formatted_session_timer(now_unix);
-            if state.tunnel_verified {
-                // Request 1s repaint so HH:MM:SS ticks smoothly.
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_secs(1));
-            }
-            let timer_color = match tone {
-                "success" => C_SUCCESS,
-                "warning" => C_WARNING,
-                _ => C_TEXT_DIM,
-            };
-
-            let timer_style = PillStyle {
-                bg: C_CARD,
-                fg: timer_color,
-                border: timer_color,
-                hover_bg: C_CARD,
-                hover_fg: timer_color,
-                hover_border: timer_color,
-                radius: 10,
-                height: 30.0,
-                font_size: 11.5,
-                bold: true,
-                pad_x: 14.0,
-            };
-            let _ = pill_button(ui, &timer_text, None, timer_style);
-
-            ui.add_space(inner_gap_1);
-
-            let toggle_on =
-                state.tunnel_running || (state.is_connecting_vpn && !state.is_disconnecting_vpn);
-            if ios_toggle_switch(
-                ui,
-                toggle_on,
-                state.is_connecting_vpn,
-                state.client_config.animations_enabled,
-                Vec2::new(toggle_w, toggle_h),
-            )
-            .clicked()
-            {
-                state.toggle_vpn();
-            }
-
-            ui.add_space(inner_gap_2);
-            ui.label(
-                RichText::new("WIREGUARD  /  KẾT NỐI MÃ HÓA")
-                    .size(10.5)
-                    .color(C_TEXT_DIM),
-            );
-            if bottom_center_pad > 0.0 {
-                ui.add_space(bottom_center_pad);
-            }
-        },
-    );
+    let globe_action = {
+        let inputs = GlobeRenderInputs {
+            servers: &state.all_free_servers,
+            selected_server: state.selected_server.as_ref(),
+            connected_server: state.connected_server.as_ref(),
+            is_connecting: state.is_connecting_vpn,
+            is_disconnecting: state.is_disconnecting_vpn,
+            tunnel_running: state.tunnel_running,
+            tunnel_verified: state.tunnel_verified,
+            animations_enabled: state.client_config.animations_enabled,
+            window_visible: state.window_visible,
+        };
+        render_globe_widget(
+            ui,
+            &inputs,
+            &mut state.globe,
+            Vec2::new(ui.available_width(), globe_h),
+        )
+    };
+    handle_globe_action(state, globe_action);
 
     // 3. Selected Server / Location Card (smooth hover-in / hover-out border & fill highlight)
     let anim_dur = if state.client_config.animations_enabled {
@@ -282,23 +324,30 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
         14,
         Margin::symmetric(12, card_pad_y),
         |ui| {
-            ui.set_width(ui.available_width());
+            let card_inner_w = ui.available_width();
+            ui.set_width(card_inner_w);
             ui.spacing_mut().item_spacing.y = 3.0;
             ui.horizontal(|ui| {
-                ui.label(
+                let lbl_resp = ui.label(
                     RichText::new("VỊ TRÍ MÁY CHỦ")
                         .size(10.0)
                         .strong()
                         .color(C_TEXT_DIM),
                 );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new("Đổi vị trí ❯")
-                            .size(11.0)
-                            .strong()
-                            .color(C_ACCENT),
-                    );
-                });
+                let rem_w =
+                    (card_inner_w - lbl_resp.rect.width() - ui.spacing().item_spacing.x).max(40.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(rem_w, 16.0),
+                    Layout::right_to_left(Align::Center),
+                    |ui| {
+                        ui.label(
+                            RichText::new("Đổi vị trí ❯")
+                                .size(11.0)
+                                .strong()
+                                .color(C_ACCENT),
+                        );
+                    },
+                );
             });
 
             let (title, ping_text, ping_color, load_text, load_color) =
@@ -617,43 +666,101 @@ mod tests {
 
             let mut max_widget_bottom = 0.0f32;
             let mut max_text_bottom = 0.0f32;
+            let mut max_right = 0.0f32;
+            let mut offenders = Vec::new();
+            let panel_inner_bottom = crate::ui::WINDOW_HEIGHT - 12.0;
+            let panel_inner_right = crate::ui::WINDOW_WIDTH - 14.0;
             fn visit_bounds(
                 shape: &egui::epaint::Shape,
                 max_widget_bottom: &mut f32,
                 max_text_bottom: &mut f32,
+                max_right: &mut f32,
+                offenders: &mut Vec<String>,
+                panel_inner_right: f32,
+                panel_inner_bottom: f32,
             ) {
                 match shape {
                     egui::epaint::Shape::Text(t) => {
-                        let bottom = t.pos.y + t.galley.size().y;
+                        let rect = t.galley.rect.translate(t.pos.to_vec2());
+                        let bottom = rect.max.y;
+                        let right = rect.max.x;
                         *max_text_bottom = max_text_bottom.max(bottom);
                         *max_widget_bottom = max_widget_bottom.max(bottom);
+                        *max_right = max_right.max(right);
+                        if right > panel_inner_right + 0.5 || bottom > panel_inner_bottom + 0.5 {
+                            offenders.push(format!(
+                                "Text({:?}, x={:.1}..{:.1}, y={:.1}..{:.1})",
+                                t.galley.text(),
+                                rect.min.x,
+                                right,
+                                rect.min.y,
+                                bottom
+                            ));
+                        }
                     }
                     egui::epaint::Shape::Rect(r) => {
+                        if r.rect.width() < crate::ui::WINDOW_WIDTH - 2.0 {
+                            *max_right = max_right.max(r.rect.max.x);
+                            if r.rect.max.x > panel_inner_right + 0.5 {
+                                offenders.push(format!("RectX({:?})", r.rect));
+                            }
+                        }
                         // Exclude the full-window CentralPanel background/border rect itself (height == 610).
                         if r.rect.height() < crate::ui::WINDOW_HEIGHT - 2.0 {
                             *max_widget_bottom = max_widget_bottom.max(r.rect.max.y);
+                            if r.rect.max.y > panel_inner_bottom + 0.5 {
+                                offenders.push(format!("RectY({:?})", r.rect));
+                            }
+                        }
+                    }
+                    egui::epaint::Shape::Circle(c) => {
+                        *max_widget_bottom = max_widget_bottom.max(c.center.y + c.radius);
+                        *max_right = max_right.max(c.center.x + c.radius);
+                        if c.center.x + c.radius > panel_inner_right + 0.5
+                            || c.center.y + c.radius > panel_inner_bottom + 0.5
+                        {
+                            offenders.push(format!("Circle({:?}, r={:.1})", c.center, c.radius));
                         }
                     }
                     egui::epaint::Shape::Vec(items) => {
                         for item in items {
-                            visit_bounds(item, max_widget_bottom, max_text_bottom);
+                            visit_bounds(
+                                item,
+                                max_widget_bottom,
+                                max_text_bottom,
+                                max_right,
+                                offenders,
+                                panel_inner_right,
+                                panel_inner_bottom,
+                            );
                         }
                     }
                     _ => {}
                 }
             }
             for clipped in &out.shapes {
-                visit_bounds(&clipped.shape, &mut max_widget_bottom, &mut max_text_bottom);
+                visit_bounds(
+                    &clipped.shape,
+                    &mut max_widget_bottom,
+                    &mut max_text_bottom,
+                    &mut max_right,
+                    &mut offenders,
+                    panel_inner_right,
+                    panel_inner_bottom,
+                );
             }
 
-            let panel_inner_bottom = crate::ui::WINDOW_HEIGHT - 12.0;
+            assert!(
+                max_right <= panel_inner_right + 0.5,
+                "{label}: right widget edge {max_right:.1} exceeds panel right {panel_inner_right:.1}; offenders={offenders:?}"
+            );
             assert!(
                 max_widget_bottom <= panel_inner_bottom + 0.5,
-                "{label}: bottom widget edge {max_widget_bottom:.1} exceeds panel bottom {panel_inner_bottom:.1}"
+                "{label}: bottom widget edge {max_widget_bottom:.1} exceeds panel bottom {panel_inner_bottom:.1}; offenders={offenders:?}"
             );
             assert!(
                 max_text_bottom <= panel_inner_bottom,
-                "{label}: bottom text edge {max_text_bottom:.1} exceeds panel bottom {panel_inner_bottom:.1}"
+                "{label}: bottom text edge {max_text_bottom:.1} exceeds panel bottom {panel_inner_bottom:.1}; offenders={offenders:?}"
             );
         }
 
@@ -685,6 +792,22 @@ mod tests {
         clean_state.window_visible = true;
         assert_fits_without_clipping(clean_state, "clean home");
 
+        let mut connected_state = AppState::new(
+            true,
+            Some("pishun@duck.com".to_owned()),
+            clean_cfg.clone(),
+            None,
+            vec![sample_server.clone()],
+        );
+        connected_state.selected_server = Some(sample_server.clone());
+        connected_state.connected_server = Some(sample_server.clone());
+        connected_state.tunnel_running = true;
+        connected_state.tunnel_verified = true;
+        connected_state.live_public_ip = Some("149.40.50.10".to_owned());
+        connected_state.vpn_connect_time_unix = Some(1_700_000_000);
+        connected_state.window_visible = true;
+        assert_fits_without_clipping(connected_state, "connected home");
+
         let mut busy_state = AppState::new(
             true,
             Some("pishun@duck.com".to_owned()),
@@ -710,5 +833,235 @@ mod tests {
             level: NoticeLevel::Warning,
         });
         assert_fits_without_clipping(busy_state, "busy stacked-banner home");
+    }
+
+    #[test]
+    fn test_home_globe_click_respects_auth_and_connecting_guards() {
+        use crate::state::AppView;
+        use crate::ui::globe::GlobeAction;
+        use freeton_core::api::ServerNode;
+
+        let srv_jp = ServerNode {
+            name: "JP-FREE#1".to_owned(),
+            country: "JP".to_owned(),
+            ..ServerNode::default()
+        };
+        let srv_sg = ServerNode {
+            name: "SG-FREE#1".to_owned(),
+            country: "SG".to_owned(),
+            ..ServerNode::default()
+        };
+
+        let mut logged_out = AppState::new(
+            false,
+            None,
+            ClientConfig::default(),
+            None,
+            vec![srv_jp.clone()],
+        );
+        logged_out.current_view = AppView::Home;
+        handle_globe_action(&mut logged_out, GlobeAction::ConnectCountry(srv_sg.clone()));
+        assert_eq!(logged_out.current_view, AppView::Login);
+        assert!(!logged_out.is_connecting_vpn);
+
+        let mut connecting = AppState::new(
+            true,
+            Some("u@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            vec![srv_jp.clone()],
+        );
+        let _ = connecting.drain_commands();
+        connecting.is_connecting_vpn = true;
+        handle_globe_action(&mut connecting, GlobeAction::ConnectCountry(srv_sg.clone()));
+        assert_eq!(
+            connecting.selected_server.as_ref().map(|s| s.name.as_str()),
+            Some("JP-FREE#1")
+        );
+        assert!(connecting.drain_commands().is_empty());
+
+        let mut closing = AppState::new(
+            true,
+            Some("u@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            vec![srv_jp.clone()],
+        );
+        let _ = closing.drain_commands();
+        closing.closing = true;
+        handle_globe_action(&mut closing, GlobeAction::ConnectCountry(srv_sg.clone()));
+        assert_eq!(
+            closing.selected_server.as_ref().map(|s| s.name.as_str()),
+            Some("JP-FREE#1")
+        );
+        assert!(closing.drain_commands().is_empty());
+
+        let mut ready = AppState::new(
+            true,
+            Some("u@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            vec![srv_jp.clone()],
+        );
+        let _ = ready.drain_commands();
+        handle_globe_action(&mut ready, GlobeAction::ConnectCountry(srv_sg));
+        assert_eq!(
+            ready.selected_server.as_ref().map(|s| s.name.as_str()),
+            Some("SG-FREE#1")
+        );
+        assert!(ready.is_connecting_vpn);
+    }
+
+    #[test]
+    fn test_home_globe_requests_no_short_repaint_when_hidden_or_animations_disabled() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let store = NoopStore;
+        let raw_input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(crate::ui::WINDOW_WIDTH, crate::ui::WINDOW_HEIGHT),
+            )),
+            ..Default::default()
+        };
+
+        // Case 1: Hidden window (loading bar hidden so we isolate Home/Globe repaint policy)
+        let ctx_hidden = egui::Context::default();
+        let mut hidden_state = AppState::new(
+            true,
+            Some("u@proton.me".to_owned()),
+            ClientConfig {
+                animations_enabled: true,
+                ..Default::default()
+            },
+            None,
+            Vec::new(),
+        );
+        hidden_state.loading.visible = false;
+        hidden_state.window_visible = false;
+        let mut warm = ctx_hidden.run_ui(
+            egui::RawInput {
+                time: Some(0.0),
+                ..raw_input.clone()
+            },
+            |ui| {
+                crate::ui::render_root(ui, &mut hidden_state, &store);
+            },
+        );
+        warm.textures_delta.clear();
+
+        let hidden_delays = Arc::new(Mutex::new(Vec::new()));
+        ctx_hidden.set_repaint_observer({
+            let hidden_delays = Arc::clone(&hidden_delays);
+            move |info| hidden_delays.lock().unwrap().push(info.delay)
+        });
+
+        let mut out_hidden = ctx_hidden.run_ui(
+            egui::RawInput {
+                time: Some(0.25),
+                ..raw_input.clone()
+            },
+            |ui| {
+                hidden_delays.lock().unwrap().clear();
+                crate::ui::render_root(ui, &mut hidden_state, &store);
+            },
+        );
+        out_hidden.textures_delta.clear();
+        for delay in hidden_delays.lock().unwrap().iter() {
+            assert!(
+                *delay >= Duration::from_millis(100),
+                "hidden window must not request short animation repaint, got {delay:?}"
+            );
+        }
+
+        // Case 2: Animations disabled
+        let ctx_static = egui::Context::default();
+        let mut static_state = AppState::new(
+            true,
+            Some("u@proton.me".to_owned()),
+            ClientConfig {
+                animations_enabled: false,
+                ..Default::default()
+            },
+            None,
+            Vec::new(),
+        );
+        static_state.loading.visible = false;
+        static_state.window_visible = true;
+        let mut warm2 = ctx_static.run_ui(
+            egui::RawInput {
+                time: Some(0.0),
+                ..raw_input.clone()
+            },
+            |ui| {
+                crate::ui::render_root(ui, &mut static_state, &store);
+            },
+        );
+        warm2.textures_delta.clear();
+
+        let static_delays = Arc::new(Mutex::new(Vec::new()));
+        ctx_static.set_repaint_observer({
+            let static_delays = Arc::clone(&static_delays);
+            move |info| static_delays.lock().unwrap().push(info.delay)
+        });
+
+        let mut out_static = ctx_static.run_ui(
+            egui::RawInput {
+                time: Some(0.25),
+                ..raw_input.clone()
+            },
+            |ui| {
+                static_delays.lock().unwrap().clear();
+                crate::ui::render_root(ui, &mut static_state, &store);
+            },
+        );
+        out_static.textures_delta.clear();
+        for delay in static_delays.lock().unwrap().iter() {
+            assert!(
+                *delay >= Duration::from_millis(100),
+                "disabled animations must not request short animation repaint, got {delay:?}"
+            );
+        }
+
+        // Case 3 (positive control): visible + animations enabled DOES schedule globe repaint
+        let ctx_live = egui::Context::default();
+        let mut live_state = AppState::new(
+            true,
+            Some("u@proton.me".to_owned()),
+            ClientConfig {
+                animations_enabled: true,
+                ..Default::default()
+            },
+            None,
+            Vec::new(),
+        );
+        live_state.loading.visible = false;
+        live_state.window_visible = true;
+        let live_delays = Arc::new(Mutex::new(Vec::new()));
+        ctx_live.set_repaint_observer({
+            let live_delays = Arc::clone(&live_delays);
+            move |info| live_delays.lock().unwrap().push(info.delay)
+        });
+        let mut out_live = ctx_live.run_ui(
+            egui::RawInput {
+                time: Some(0.25),
+                ..raw_input
+            },
+            |ui| {
+                live_delays.lock().unwrap().clear();
+                crate::ui::render_root(ui, &mut live_state, &store);
+            },
+        );
+        out_live.textures_delta.clear();
+        assert!(
+            live_delays
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|d| *d == Duration::from_millis(33)),
+            "visible animated globe should schedule a 33ms smooth repaint, got {:?}",
+            *live_delays.lock().unwrap()
+        );
     }
 }

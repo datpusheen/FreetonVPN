@@ -472,7 +472,8 @@ pub fn render_globe_widget(
 
     let caption_h = 18.0;
     let globe_h = (rect.height() - caption_h).max(76.0);
-    let base_radius = (rect.width().min(globe_h) * 0.445).clamp(36.0, 106.0);
+    let max_fit_radius = ((rect.width().min(globe_h) * 0.5 - 7.0) / TARGET_ZOOM_ACTIVE).max(32.0);
+    let base_radius = max_fit_radius.min(104.0);
     let center = Pos2::new(rect.center().x, rect.top() + globe_h * 0.5);
 
     let now_time = ui.ctx().input(|i| i.time);
