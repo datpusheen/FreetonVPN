@@ -723,6 +723,8 @@ mod tests {
             active_physical_servers: 1,
             ping_target: "192.0.2.1".to_owned(),
             ping_ms: Some(25.0),
+            latitude: None,
+            longitude: None,
         }
     }
 

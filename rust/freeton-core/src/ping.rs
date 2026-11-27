@@ -402,6 +402,8 @@ mod tests {
             active_physical_servers: 1,
             ping_target: ping_target.to_owned(),
             ping_ms,
+            latitude: None,
+            longitude: None,
         }
     }
 

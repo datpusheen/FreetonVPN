@@ -206,6 +206,10 @@ pub struct ServerNode {
         deserialize_with = "deserialize_null_f64_opt"
     )]
     pub ping_ms: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_null_f64_opt")]
+    pub latitude: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_null_f64_opt")]
+    pub longitude: Option<f64>,
 }
 
 /// Solved CAPTCHA / human verification token passed when retrying `ProtonClient::login_srp`.
@@ -336,6 +340,22 @@ pub fn select_free_servers_with_wg(
         let x25519_public_key = first_non_empty(&[phys_x25519, phys_pubkey]);
 
         let load_val = server.get("Load").and_then(Value::as_f64).unwrap_or(0.0);
+        let location = server.get("Location");
+        let raw_lat = location.and_then(|loc| loc.get("Lat")).and_then(Value::as_f64);
+        let raw_lon = location
+            .and_then(|loc| loc.get("Long"))
+            .and_then(Value::as_f64);
+        let (latitude, longitude) = match (raw_lat, raw_lon) {
+            (Some(lat), Some(lon))
+                if lat.is_finite()
+                    && lon.is_finite()
+                    && (-90.0..=90.0).contains(&lat)
+                    && (-180.0..=180.0).contains(&lon) =>
+            {
+                (Some(lat), Some(lon))
+            }
+            _ => (None, None),
+        };
 
         selected.push(ServerNode {
             name: server
@@ -359,6 +379,8 @@ pub fn select_free_servers_with_wg(
             active_physical_servers: active_physicals.len(),
             ping_target: entry_ip,
             ping_ms: None,
+            latitude,
+            longitude,
         });
     }
 
@@ -1291,6 +1313,69 @@ mod tests {
         assert_eq!(with_down.len(), 3);
         assert_eq!(with_down[0].name, "SG-DOWN#1");
         assert_eq!(with_down[0].active_physical_servers, 0);
+    }
+
+    #[test]
+    fn test_select_free_servers_parses_valid_location_and_rejects_invalid() {
+        let payload = serde_json::json!({
+            "LogicalServers": [
+                {
+                    "Name": "JP-FREE#1",
+                    "Tier": 0,
+                    "Status": 1,
+                    "ExitCountry": "JP",
+                    "EntryCountry": "JP",
+                    "City": "Tokyo",
+                    "Load": 20.0,
+                    "Domain": "jp-1.protonvpn.net",
+                    "Location": { "Lat": 35.6762, "Long": 139.6503 },
+                    "Servers": [{ "Status": 1, "ServicesDown": 0, "EntryIP": "198.51.100.1", "X25519PublicKey": "k1" }]
+                },
+                {
+                    "Name": "US-FREE#1",
+                    "Tier": 0,
+                    "Status": 1,
+                    "ExitCountry": "US",
+                    "EntryCountry": "US",
+                    "City": "New York",
+                    "Load": 30.0,
+                    "Domain": "us-1.protonvpn.net",
+                    "Location": { "Lat": 120.0, "Long": -74.0 },
+                    "Servers": [{ "Status": 1, "ServicesDown": 0, "EntryIP": "198.51.100.2", "X25519PublicKey": "k2" }]
+                },
+                {
+                    "Name": "SG-FREE#1",
+                    "Tier": 0,
+                    "Status": 1,
+                    "ExitCountry": "SG",
+                    "EntryCountry": "SG",
+                    "City": "Singapore",
+                    "Load": 40.0,
+                    "Domain": "sg-1.protonvpn.net",
+                    "Servers": [{ "Status": 1, "ServicesDown": 0, "EntryIP": "198.51.100.3", "X25519PublicKey": "k3" }]
+                }
+            ]
+        });
+        let nodes = select_free_servers_with_wg(&payload, None, false).expect("valid payload");
+        let jp = nodes.iter().find(|n| n.name == "JP-FREE#1").unwrap();
+        assert_eq!(jp.latitude, Some(35.6762));
+        assert_eq!(jp.longitude, Some(139.6503));
+
+        let us = nodes.iter().find(|n| n.name == "US-FREE#1").unwrap();
+        assert_eq!(us.latitude, None);
+        assert_eq!(us.longitude, None);
+
+        let sg = nodes.iter().find(|n| n.name == "SG-FREE#1").unwrap();
+        assert_eq!(sg.latitude, None);
+        assert_eq!(sg.longitude, None);
+    }
+
+    #[test]
+    fn test_server_node_deserializes_legacy_json_without_coordinates() {
+        let legacy = r#"{"name":"SG-FREE#1","country":"SG","entryCountry":"SG","city":"Singapore","load":50.0,"status":1,"domain":"d","entryIP":"1.1.1.1","exitIP":"1.1.1.1","x25519PublicKey":"k","activePhysicalServers":1,"pingTarget":"1.1.1.1","pingMs":40.0}"#;
+        let node: ServerNode = serde_json::from_str(legacy).expect("legacy json deserializes");
+        assert_eq!(node.latitude, None);
+        assert_eq!(node.longitude, None);
     }
 
     #[test]

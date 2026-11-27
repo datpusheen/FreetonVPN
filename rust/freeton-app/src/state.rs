@@ -2660,6 +2660,8 @@ impl AppState {
             active_physical_servers: 1,
             ping_target: info.entry_ip.clone(),
             ping_ms: None,
+            latitude: None,
+            longitude: None,
         });
 
         self.connected_server = Some(node.clone());
@@ -4188,6 +4190,8 @@ mod tests {
             active_physical_servers: 1,
             ping_target: "198.51.100.10".to_owned(),
             ping_ms,
+            latitude: None,
+            longitude: None,
         }
     }
 

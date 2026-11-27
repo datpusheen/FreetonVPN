@@ -1026,6 +1026,8 @@ mod tests {
             active_physical_servers: 1,
             ping_target: "198.51.100.10".to_owned(),
             ping_ms: Some(42.5),
+            latitude: None,
+            longitude: None,
         };
         ServerCacheManager::save(&path, Some(&raw_payload), std::slice::from_ref(&node))
             .expect("save cache");
