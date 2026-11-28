@@ -612,6 +612,7 @@ fn render_settings_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ios_toggle_switch(
                             ui,
+                            "settings_startup_toggle",
                             state.settings_draft.startup_enabled,
                             false,
                             anim,
@@ -643,6 +644,7 @@ fn render_settings_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ios_toggle_switch(
                             ui,
+                            "settings_animations_toggle",
                             state.settings_draft.animations_enabled,
                             false,
                             anim,
@@ -673,6 +675,7 @@ fn render_settings_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ios_toggle_switch(
                             ui,
+                            "settings_auto_update_toggle",
                             state.settings_draft.auto_check_update,
                             false,
                             anim,
@@ -960,6 +963,7 @@ fn render_settings_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ios_toggle_switch(
                             ui,
+                            "settings_allow_lan_toggle",
                             state.settings_draft.allow_lan_access,
                             false,
                             anim,

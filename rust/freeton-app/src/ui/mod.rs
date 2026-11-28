@@ -408,11 +408,16 @@ fn render_collapsible_slot(
         let row_w = ui.available_width();
         let (slot, _) = ui.allocate_exact_size(Vec2::new(row_w, vis_h), Sense::hover());
         let inner_rect = Rect::from_min_size(slot.min, Vec2::new(slot.width(), cached_h));
-        ui.scope_builder(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
-            ui.set_clip_rect(slot);
-            ui.set_opacity(opacity_frac);
-            add_contents(ui)
-        })
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .id_salt(("collapsible_slot", height_id))
+                .max_rect(inner_rect),
+            |ui| {
+                ui.set_clip_rect(slot);
+                ui.set_opacity(opacity_frac);
+                add_contents(ui)
+            },
+        )
         .inner
     };
     if measured_h > 1.0 {
@@ -424,6 +429,15 @@ fn render_collapsible_slot(
 pub fn open_external_url(url: &str) {
     if let Err(err) = WindowsShellLauncher::open_https_url_direct(url) {
         warn!(url = %url, error = %err, "rejected or failed opening external URL");
+    }
+}
+
+fn view_id_salt(view: AppView) -> &'static str {
+    match view {
+        AppView::Login => "login",
+        AppView::Srp => "srp",
+        AppView::Home => "home",
+        AppView::Drawer => "drawer",
     }
 }
 
@@ -642,12 +656,17 @@ pub fn render_root(ui: &mut Ui, state: &mut AppState, store: &dyn CredentialStor
                 if let Some(prev_view) = state.previous_view.filter(|&p| p != state.current_view) {
                     let exit_px = -34.0 * dir_sign * progress;
                     let exit_rect = avail.translate(Vec2::new(exit_px, 0.0));
-                    ui.scope_builder(egui::UiBuilder::new().max_rect(exit_rect), |ui| {
-                        ui.set_clip_rect(avail);
-                        ui.disable();
-                        ui.set_opacity((1.0 - progress).powf(1.2));
-                        render_view_contents(prev_view, ui, state, store);
-                    });
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .id_salt(("view_exit", view_id_salt(prev_view)))
+                            .max_rect(exit_rect),
+                        |ui| {
+                            ui.set_clip_rect(avail);
+                            ui.disable();
+                            ui.set_opacity((1.0 - progress).powf(1.2));
+                            render_view_contents(prev_view, ui, state, store);
+                        },
+                    );
                 }
             }
 
@@ -657,13 +676,18 @@ pub fn render_root(ui: &mut Ui, state: &mut AppState, store: &dyn CredentialStor
                 0.0
             };
             let shifted = avail.translate(Vec2::new(enter_px, 0.0));
-            ui.scope_builder(egui::UiBuilder::new().max_rect(shifted), |ui| {
-                ui.set_clip_rect(avail);
-                if progress < 1.0 {
-                    ui.set_opacity(progress.clamp(0.0, 1.0));
-                }
-                render_view_contents(state.current_view, ui, state, store);
-            });
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .id_salt(("view_active", view_id_salt(state.current_view)))
+                    .max_rect(shifted),
+                |ui| {
+                    ui.set_clip_rect(avail);
+                    if progress < 1.0 {
+                        ui.set_opacity(progress.clamp(0.0, 1.0));
+                    }
+                    render_view_contents(state.current_view, ui, state, store);
+                },
+            );
         });
 
     dialogs::render_dialog_overlay(&ctx, state, store);

@@ -154,7 +154,7 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
     let top_pad_y = if compact { 8 } else { 10 };
     let mut toggle_clicked = false;
     let toggle_on =
-        state.tunnel_running || (state.is_connecting_vpn && !state.is_disconnecting_vpn);
+        (state.tunnel_running || state.is_connecting_vpn) && !state.is_disconnecting_vpn;
 
     rounded_card(
         ui,
@@ -229,6 +229,7 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
                     |ui| {
                         if ios_toggle_switch(
                             ui,
+                            "home_vpn_toggle",
                             toggle_on,
                             state.is_connecting_vpn,
                             state.client_config.animations_enabled,
@@ -506,6 +507,7 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
 
 pub fn ios_toggle_switch(
     ui: &mut Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
     on: bool,
     connecting: bool,
     animations_enabled: bool,
@@ -515,10 +517,9 @@ pub fn ios_toggle_switch(
     let response = response.on_hover_cursor(CursorIcon::PointingHand);
 
     let anim_time = if animations_enabled { 0.16 } else { 0.0 };
-    let target = on || connecting;
-    let t = ui
-        .ctx()
-        .animate_bool_with_time(response.id.with("ios_toggle"), target, anim_time);
+    let target = on;
+    let anim_id = egui::Id::unique("freeton_ios_toggle").with(id_salt);
+    let t = ui.ctx().animate_bool_with_time(anim_id, target, anim_time);
 
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
@@ -1173,5 +1174,132 @@ mod tests {
             "toggle switch should be vertically centered inside status card (knob_y={knob_y:.1}, card_cy={:.1})",
             card.center().y
         );
+    }
+
+    #[test]
+    fn test_vpn_toggle_keeps_off_state_when_toast_and_loading_collapse() {
+        use crate::state::{NoticeLevel, StatusNotice};
+
+        fn find_toggle_knob_x(shapes: &[egui::epaint::ClippedShape]) -> f32 {
+            fn collect(shape: &egui::epaint::Shape, out: &mut Vec<f32>) {
+                match shape {
+                    egui::epaint::Shape::Circle(c) => {
+                        if c.fill == Color32::WHITE && c.radius >= 12.0 {
+                            out.push(c.center.x);
+                        }
+                    }
+                    egui::epaint::Shape::Vec(items) => {
+                        for item in items {
+                            collect(item, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut xs = Vec::new();
+            for clipped in shapes {
+                collect(&clipped.shape, &mut xs);
+            }
+            assert_eq!(
+                xs.len(),
+                1,
+                "expected exactly 1 VPN toggle knob circle, found {}",
+                xs.len()
+            );
+            xs[0]
+        }
+
+        let ctx = egui::Context::default();
+        let store = NoopStore;
+        let mut config = ClientConfig::default();
+        config.animations_enabled = true;
+        let mut state = AppState::new(
+            true,
+            Some("pishun@duck.com".to_owned()),
+            config,
+            None,
+            Vec::new(),
+        );
+        state.window_visible = true;
+        state.loading.visible = false;
+        state.tunnel_running = true;
+
+        let make_input = |time: f64| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(crate::ui::WINDOW_WIDTH, crate::ui::WINDOW_HEIGHT),
+            )),
+            time: Some(time),
+            ..Default::default()
+        };
+
+        // 1. Connected & idle -> settle at ON position.
+        let mut out = ctx.run_ui(make_input(0.0), |ui| {
+            crate::ui::render_root(ui, &mut state, &store);
+        });
+        out.textures_delta.clear();
+        let mut out = ctx.run_ui(make_input(0.40), |ui| {
+            crate::ui::render_root(ui, &mut state, &store);
+        });
+        out.textures_delta.clear();
+        let x_on = find_toggle_knob_x(&out.shapes);
+
+        // 2. While disconnecting (both connecting & disconnecting flags set), knob must slide
+        // left toward OFF immediately rather than staying pinned ON.
+        state.is_connecting_vpn = true;
+        state.is_disconnecting_vpn = true;
+        state.loading.visible = true;
+        state.loading.text = "Đang ngắt kết nối...".to_owned();
+        let mut disc_start = ctx.run_ui(make_input(0.41), |ui| {
+            crate::ui::render_root(ui, &mut state, &store);
+        });
+        disc_start.textures_delta.clear();
+        let mut disc_mid = ctx.run_ui(make_input(0.48), |ui| {
+            crate::ui::render_root(ui, &mut state, &store);
+        });
+        disc_mid.textures_delta.clear();
+        let x_disconnecting = find_toggle_knob_x(&disc_mid.shapes);
+        assert!(
+            x_disconnecting < x_on - 2.0,
+            "toggle knob must slide toward OFF while disconnecting (x_on={x_on:.1}, x_disconnecting={x_disconnecting:.1})"
+        );
+
+        // 3. Disconnected with toast + loading banner visible -> settle at OFF position.
+        state.tunnel_running = false;
+        state.is_connecting_vpn = false;
+        state.is_disconnecting_vpn = false;
+        state.info_toast = Some(StatusNotice {
+            text: "Đã ngắt kết nối VPN".to_owned(),
+            level: NoticeLevel::Info,
+        });
+        let mut off_start = ctx.run_ui(make_input(0.60), |ui| {
+            crate::ui::render_root(ui, &mut state, &store);
+        });
+        off_start.textures_delta.clear();
+        let mut off_settled = ctx.run_ui(make_input(1.10), |ui| {
+            crate::ui::render_root(ui, &mut state, &store);
+        });
+        off_settled.textures_delta.clear();
+        let x_off = find_toggle_knob_x(&off_settled.shapes);
+        assert!(
+            x_off < x_on - 15.0,
+            "OFF knob position must be clearly left of ON position (x_off={x_off:.1}, x_on={x_on:.1})"
+        );
+
+        // 4. Dismiss both banners -> across every collapse and post-unmount frame, the knob
+        // must stay pinned at x_off and NEVER snap back toward x_on.
+        state.info_toast = None;
+        state.loading.visible = false;
+        for t in [1.15_f64, 1.22, 1.30, 1.45, 1.80] {
+            let mut frame = ctx.run_ui(make_input(t), |ui| {
+                crate::ui::render_root(ui, &mut state, &store);
+            });
+            frame.textures_delta.clear();
+            let knob_x = find_toggle_knob_x(&frame.shapes);
+            assert!(
+                (knob_x - x_off).abs() < 1.0,
+                "toggle knob bounced during banner collapse at t={t:.2}: knob_x={knob_x:.2}, expected x_off={x_off:.2} (x_on={x_on:.2})"
+            );
+        }
     }
 }
