@@ -5,16 +5,17 @@
     "changelog":  [
                       "▸ Giao diện Địa cầu 3D tương tác",
                       "Bản đồ địa cầu dot-matrix 3D ngay màn hình chính: Xoay tự do, tự động căn giữa về node đang chọn và vẽ đường cung bay trực tiếp tới máy chủ VPN.",
-                      "Ghim vị trí người dùng màu xanh dương & nút node thông minh: Tự động lấy tọa độ từ Proton API (dự phòng Geo Windows), làm xám các node chưa kết nối nhưng vẫn cho chọn nhanh.",
-                      "▸ Split Tunneling (Mạng LAN & IP loại trừ)",
+                      "Ghim vị trí người dùng màu xanh dương \u0026 nút node thông minh: Tự động lấy tọa độ từ Proton API (dự phòng Geo Windows), làm xám các node chưa kết nối nhưng vẫn cho chọn nhanh.",
+                      "▸ Split Tunneling (Mạng LAN \u0026 IP loại trừ)",
                       "Cho phép truy cập mạng LAN nội bộ: Một công tắc bật/tắt bỏ qua VPN cho các dải IP nội bộ (192.168.0.0/16, 172.16.0.0/12, 10.0.0.0/8, 169.254.0.0/16) mà vẫn giữ nguyên DNS VPN an toàn.",
                       "Danh sách IP / CIDR không qua VPN tùy chỉnh: Hỗ trợ nhập thêm IP đơn lẻ hoặc subnet theo dấu phẩy/dòng mới, kiểm tra định dạng ngay trong Cài đặt.",
-                      "▸ Tối ưu giao diện, hiệu ứng & độ ổn định",
-                      "Sửa lỗi giật/nhảy lại trạng thái công tắc VPN khi thông báo hoặc thanh tải thu gọn; đồng bộ hiệu ứng đóng/mở mượt và căn thẳng hàng thẻ trạng thái trên cùng."
+                      "▸ Tối ưu giao diện, hiệu ứng \u0026 độ ổn định",
+                      "Sửa lỗi giật/nhảy lại trạng thái công tắc VPN khi thông báo hoặc thanh tải thu gọn; đồng bộ hiệu ứng đóng/mở mượt và căn thẳng hàng thẻ trạng thái trên cùng.",
+                      "Ghi log xoay vòng, CLI xem log realtime (Dev Mode) \u0026 tự đăng xuất an toàn khi RefreshToken hết hạn."
                   ],
     "download_url":  "https://github.com/datpusheen/FreetonVPN/releases/download/v3.1.0/FreetonVPN-Setup-x64.exe",
-    "file_size_bytes":  0,
-    "sha256":  "",
+    "file_size_bytes":  8353798,
+    "sha256":  "42ce9ca378b19de26d08017a44156d8f013f14ca6fae6c9ce32a8542cd167a57",
     "mandatory":  false,
     "min_supported_version":  "3.0.0"
 }
