@@ -21,6 +21,10 @@ const LANDING_PULSE_SECS: f32 = 0.80;
 const DRAG_CLICK_THRESHOLD_PX: f32 = 5.0;
 const MARKER_HIT_RADIUS_PX: f32 = 14.0;
 const IDLE_SPIN_RAD_PER_SEC: f32 = 0.104_72; // ~6 deg/sec
+const AUTO_RECENTER_DELAY_SECS: f32 = 2.6;
+const RECENTER_RATE_PER_SEC: f32 = 3.2;
+const DEFAULT_REST_LAT_DEG: f32 = 16.0;
+const DEFAULT_REST_LON_DEG: f32 = 102.0;
 
 #[derive(Debug, Clone)]
 pub struct GlobeCountryMarker {
@@ -85,12 +89,14 @@ pub struct GlobeState {
     pub drag_distance: f32,
     pub is_dragging: bool,
     pub was_pointer_down: bool,
+    pub user_interacted: bool,
+    pub idle_since_interaction: f32,
     pub last_frame_time: Option<f64>,
 }
 
 impl Default for GlobeState {
     fn default() -> Self {
-        let (yaw, pitch) = camera_angles_for_lat_lon(16.0, 102.0);
+        let (yaw, pitch) = camera_angles_for_lat_lon(DEFAULT_REST_LAT_DEG, DEFAULT_REST_LON_DEG);
         Self {
             yaw,
             pitch,
@@ -104,6 +110,8 @@ impl Default for GlobeState {
             drag_distance: 0.0,
             is_dragging: false,
             was_pointer_down: false,
+            user_interacted: false,
+            idle_since_interaction: 0.0,
             last_frame_time: None,
         }
     }
@@ -361,6 +369,8 @@ pub fn sync_and_advance_globe(
                 globe.last_synced_target = Some(cc.to_owned());
                 globe.vel_yaw = 0.0;
                 globe.vel_pitch = 0.0;
+                globe.user_interacted = false;
+                globe.idle_since_interaction = 0.0;
             }
         }
         globe.was_active_tunnel = true;
@@ -423,6 +433,10 @@ pub fn sync_and_advance_globe(
         }
     }
 
+    if globe.is_dragging || hovering_marker {
+        globe.idle_since_interaction = 0.0;
+    }
+
     if !globe.is_dragging && animations_enabled {
         if globe.vel_yaw.abs() > 0.002 || globe.vel_pitch.abs() > 0.002 {
             globe.yaw = normalize_angle(globe.yaw + globe.vel_yaw * dt);
@@ -430,10 +444,52 @@ pub fn sync_and_advance_globe(
             let damp = (-dt * 5.0).exp();
             globe.vel_yaw *= damp;
             globe.vel_pitch *= damp;
+            globe.idle_since_interaction = 0.0;
         } else {
             globe.vel_yaw = 0.0;
             globe.vel_pitch = 0.0;
-            if !is_active_or_connecting && !hovering_marker {
+            if globe.user_interacted {
+                if !hovering_marker {
+                    globe.idle_since_interaction += dt;
+                    if globe.idle_since_interaction >= AUTO_RECENTER_DELAY_SECS {
+                        let (rest_lat, rest_lon) = if is_active_or_connecting {
+                            globe
+                                .flight
+                                .as_ref()
+                                .map(|f| f.target)
+                                .or_else(|| target_country.map(|(_, coords)| coords))
+                                .unwrap_or((DEFAULT_REST_LAT_DEG, DEFAULT_REST_LON_DEG))
+                        } else {
+                            target_country
+                                .map(|(_, coords)| coords)
+                                .unwrap_or((DEFAULT_REST_LAT_DEG, DEFAULT_REST_LON_DEG))
+                        };
+                        let (ty, tp) = camera_angles_for_lat_lon(rest_lat, rest_lon);
+                        let alpha = 1.0 - (-RECENTER_RATE_PER_SEC * dt).exp();
+                        let dy = shortest_angle_delta(globe.yaw, ty);
+                        let dp = tp - globe.pitch;
+
+                        globe.yaw = normalize_angle(globe.yaw + dy * alpha);
+                        globe.pitch =
+                            (globe.pitch + dp * alpha).clamp(-MAX_PITCH_RAD, MAX_PITCH_RAD);
+                        if is_active_or_connecting {
+                            globe.zoom += (TARGET_ZOOM_ACTIVE - globe.zoom) * alpha;
+                        }
+
+                        if dy.abs() < 0.006 && dp.abs() < 0.006 {
+                            globe.yaw = ty;
+                            globe.pitch = tp;
+                            globe.user_interacted = false;
+                            globe.idle_since_interaction = 0.0;
+                            if is_active_or_connecting {
+                                if let Some(flight) = &mut globe.flight {
+                                    flight.camera_locked = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if !is_active_or_connecting && !hovering_marker {
                 globe.yaw = normalize_angle(globe.yaw + IDLE_SPIN_RAD_PER_SEC * dt);
             }
         }
@@ -525,6 +581,8 @@ pub fn render_globe_widget(
 
     if response.drag_started() {
         globe.is_dragging = true;
+        globe.user_interacted = true;
+        globe.idle_since_interaction = 0.0;
         globe.vel_yaw = 0.0;
         globe.vel_pitch = 0.0;
         if let Some(flight) = &mut globe.flight {
@@ -532,6 +590,8 @@ pub fn render_globe_widget(
         }
     }
     if response.dragged() {
+        globe.user_interacted = true;
+        globe.idle_since_interaction = 0.0;
         let delta = response.drag_delta();
         let sens = (1.6 / base_radius.max(32.0)).clamp(0.008, 0.032);
         let dyaw = delta.x * sens;
@@ -1073,7 +1133,8 @@ pub fn render_globe_widget(
                 .as_ref()
                 .is_some_and(|f| f.progress < 1.0 || f.landing_pulse > 0.0)
             || (!is_active_or_connecting && globe.arc_alpha > 0.01)
-            || (globe.zoom - 1.0).abs() > 0.005 && !is_active_or_connecting;
+            || (globe.zoom - 1.0).abs() > 0.005 && !is_active_or_connecting
+            || (globe.user_interacted && globe.idle_since_interaction >= AUTO_RECENTER_DELAY_SECS);
 
         if fast_anim {
             ui.ctx()
@@ -1536,6 +1597,73 @@ mod tests {
         assert!(
             (shortest_angle_delta(target_yaw, globe.yaw) - 0.55).abs() < 1e-3,
             "connected static globe must not snap camera back after user rotation"
+        );
+    }
+
+    #[test]
+    fn test_globe_auto_recenters_after_user_inactivity_for_connected_and_idle() {
+        let sg = fallback_country_coords("SG").unwrap();
+        let (sg_yaw, sg_pitch) = camera_angles_for_lat_lon(sg.0, sg.1);
+
+        // 1. Connected state: user drags away, stays untouched briefly (no immediate snap),
+        //    then after inactivity delay smoothly returns to target country angle.
+        let mut connected = GlobeState::default();
+        sync_and_advance_globe(&mut connected, Some(("SG", sg)), true, true, false, 1.2);
+        connected.user_interacted = true;
+        connected.idle_since_interaction = 0.0;
+        connected.yaw = normalize_angle(sg_yaw + 1.1);
+        connected.pitch = -0.65;
+        if let Some(f) = &mut connected.flight {
+            f.camera_locked = false;
+        }
+
+        // Before delay (0.5s): should NOT recenter yet
+        for _ in 0..5 {
+            sync_and_advance_globe(&mut connected, Some(("SG", sg)), true, true, false, 0.1);
+        }
+        assert!(
+            shortest_angle_delta(connected.yaw, sg_yaw).abs() > 0.9,
+            "globe must wait before recentering"
+        );
+
+        // Hovering a marker resets inactivity timer and holds angle
+        sync_and_advance_globe(&mut connected, Some(("SG", sg)), true, true, true, 5.0);
+        assert!(
+            shortest_angle_delta(connected.yaw, sg_yaw).abs() > 0.9,
+            "hovering a marker must pause auto-recenter"
+        );
+
+        // After delay (~4.5s total untouched): smoothly returns to SG angle
+        for _ in 0..45 {
+            sync_and_advance_globe(&mut connected, Some(("SG", sg)), true, true, false, 0.1);
+        }
+        assert!(
+            shortest_angle_delta(connected.yaw, sg_yaw).abs() < 0.05
+                && (connected.pitch - sg_pitch).abs() < 0.05,
+            "connected globe should recenter to target after inactivity: yaw_err={}, pitch_err={}",
+            shortest_angle_delta(connected.yaw, sg_yaw),
+            connected.pitch - sg_pitch
+        );
+
+        // 2. Idle state: user tilts globe to extreme pitch and far yaw, waits, then recenter restores angle
+        let mut idle = GlobeState {
+            yaw: normalize_angle(sg_yaw - 1.4),
+            pitch: -0.9,
+            user_interacted: true,
+            ..Default::default()
+        };
+        for _ in 0..45 {
+            sync_and_advance_globe(&mut idle, Some(("SG", sg)), false, true, false, 0.1);
+        }
+        assert!(
+            (idle.pitch - sg_pitch).abs() < 0.08,
+            "idle globe pitch should recenter toward resting angle, got {} vs {}",
+            idle.pitch,
+            sg_pitch
+        );
+        assert!(
+            !idle.user_interacted,
+            "user_interacted flag should clear once recenter completes"
         );
     }
 }
