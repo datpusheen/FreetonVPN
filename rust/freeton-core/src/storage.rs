@@ -52,6 +52,28 @@ pub const STARTUP_REG_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Ru
 /// Registry value name under `HKCU\...\Run` for Freeton VPN.
 pub const STARTUP_REG_VALUE_NAME: &str = "FreetonVPN";
 
+/// Registry subkey under `HKCU` holding the user's Windows region ISO country code.
+pub const WINDOWS_GEO_REG_KEY: &str = r"Control Panel\International\Geo";
+
+/// Registry value name under `HKCU\Control Panel\International\Geo`.
+pub const WINDOWS_GEO_NAME_VALUE: &str = "Name";
+
+/// Normalizes a candidate ISO 3166-1 alpha-2 country code (e.g. `" vn "` -> `Some("VN")`).
+pub fn normalize_iso_country_code(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() == 2 && trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
+        Some(trimmed.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
+/// Reads the user's configured Windows region ISO alpha-2 country code offline from HKCU.
+pub fn read_windows_geo_country_code() -> Option<String> {
+    read_reg_sz_in(WINDOWS_GEO_REG_KEY, WINDOWS_GEO_NAME_VALUE)
+        .and_then(|raw| normalize_iso_country_code(&raw))
+}
+
 /// Errors returned by credential storage, cache persistence, and Windows startup registry helpers.
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -703,59 +725,7 @@ impl StartupManager {
     }
 
     fn is_enabled_in(subkey: &str, value_name: &str) -> bool {
-        let subkey_w = to_wide_nul(subkey);
-        let value_w = to_wide_nul(value_name);
-        let mut hkey = HKEY::default();
-
-        // SAFETY: `subkey_w` is null-terminated UTF-16 and `hkey` receives an open registry handle on ERROR_SUCCESS.
-        let open_err = unsafe {
-            RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                PCWSTR(subkey_w.as_ptr()),
-                Some(0),
-                KEY_READ,
-                &mut hkey,
-            )
-        };
-        if open_err != WIN32_ERROR(0) {
-            return false;
-        }
-        let _guard = RegKeyGuard(hkey);
-
-        let mut value_type = REG_VALUE_TYPE(0);
-        let mut byte_len: u32 = 0;
-        // SAFETY: Querying required buffer size first with null output pointer.
-        let query_len_err = unsafe {
-            RegQueryValueExW(
-                hkey,
-                PCWSTR(value_w.as_ptr()),
-                None,
-                Some(&mut value_type),
-                None,
-                Some(&mut byte_len),
-            )
-        };
-        if query_len_err != WIN32_ERROR(0) || byte_len == 0 {
-            return false;
-        }
-
-        let mut buf = vec![0u8; byte_len as usize];
-        // SAFETY: `buf` has size `byte_len` as reported by `RegQueryValueExW`.
-        let query_err = unsafe {
-            RegQueryValueExW(
-                hkey,
-                PCWSTR(value_w.as_ptr()),
-                None,
-                Some(&mut value_type),
-                Some(buf.as_mut_ptr()),
-                Some(&mut byte_len),
-            )
-        };
-        if query_err != WIN32_ERROR(0) || value_type != REG_SZ {
-            return false;
-        }
-
-        decode_reg_sz(&buf[..byte_len as usize])
+        read_reg_sz_in(subkey, value_name)
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false)
     }
@@ -834,6 +804,62 @@ impl Drop for RegKeyGuard {
             }
         }
     }
+}
+
+fn read_reg_sz_in(subkey: &str, value_name: &str) -> Option<String> {
+    let subkey_w = to_wide_nul(subkey);
+    let value_w = to_wide_nul(value_name);
+    let mut hkey = HKEY::default();
+
+    // SAFETY: `subkey_w` is null-terminated UTF-16 and `hkey` receives an open registry handle on ERROR_SUCCESS.
+    let open_err = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey_w.as_ptr()),
+            Some(0),
+            KEY_READ,
+            &mut hkey,
+        )
+    };
+    if open_err != WIN32_ERROR(0) {
+        return None;
+    }
+    let _guard = RegKeyGuard(hkey);
+
+    let mut value_type = REG_VALUE_TYPE(0);
+    let mut byte_len: u32 = 0;
+    // SAFETY: Querying required buffer size first with null output pointer.
+    let query_len_err = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(value_w.as_ptr()),
+            None,
+            Some(&mut value_type),
+            None,
+            Some(&mut byte_len),
+        )
+    };
+    if query_len_err != WIN32_ERROR(0) || byte_len == 0 {
+        return None;
+    }
+
+    let mut buf = vec![0u8; byte_len as usize];
+    // SAFETY: `buf` has size `byte_len` as reported by `RegQueryValueExW`.
+    let query_err = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(value_w.as_ptr()),
+            None,
+            Some(&mut value_type),
+            Some(buf.as_mut_ptr()),
+            Some(&mut byte_len),
+        )
+    };
+    if query_err != WIN32_ERROR(0) || value_type != REG_SZ {
+        return None;
+    }
+
+    decode_reg_sz(&buf[..byte_len as usize])
 }
 
 fn to_wide_nul(value: &str) -> Vec<u16> {
@@ -1169,5 +1195,18 @@ mod tests {
             decoded.custom_update_url,
             "http://127.0.0.1:8080/version-rust.json"
         );
+    }
+
+    #[test]
+    fn test_normalize_iso_country_code_and_windows_geo_read() {
+        assert_eq!(normalize_iso_country_code("vn").as_deref(), Some("VN"));
+        assert_eq!(normalize_iso_country_code(" us ").as_deref(), Some("US"));
+        assert_eq!(normalize_iso_country_code(""), None);
+        assert_eq!(normalize_iso_country_code("VNM"), None);
+        assert_eq!(normalize_iso_country_code("12"), None);
+        if let Some(code) = read_windows_geo_country_code() {
+            assert_eq!(code.len(), 2);
+            assert!(code.chars().all(|c| c.is_ascii_uppercase()));
+        }
     }
 }

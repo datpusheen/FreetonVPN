@@ -212,6 +212,48 @@ pub struct ServerNode {
     pub longitude: Option<f64>,
 }
 
+/// User's physical/un-tunneled geographic coordinates resolved from Proton `/vpn/v1/location`
+/// (or offline Windows region fallback).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserLocation {
+    pub country: Option<String>,
+    pub lat: f32,
+    pub lon: f32,
+}
+
+/// Parses Proton's `/vpn/v1/location` payload into validated geographic coordinates.
+pub fn parse_user_location_payload(payload: &Value) -> Result<UserLocation, ApiError> {
+    let raw_lat = payload
+        .get("Lat")
+        .or_else(|| payload.get("Latitude"))
+        .and_then(Value::as_f64);
+    let raw_lon = payload
+        .get("Long")
+        .or_else(|| payload.get("Longitude"))
+        .and_then(Value::as_f64);
+    let (Some(lat), Some(lon)) = (raw_lat, raw_lon) else {
+        return Err(ApiError::InvalidResponse(
+            "Location payload missing finite Lat/Long coordinates".to_owned(),
+        ));
+    };
+    if !lat.is_finite() || !lon.is_finite() || !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return Err(ApiError::InvalidResponse(format!(
+            "Location payload coordinates out of range: ({lat}, {lon})"
+        )));
+    }
+    let country = payload
+        .get("Country")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_uppercase());
+    Ok(UserLocation {
+        country,
+        lat: lat as f32,
+        lon: lon as f32,
+    })
+}
+
 /// Solved CAPTCHA / human verification token passed when retrying `ProtonClient::login_srp`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HumanVerificationToken {
@@ -939,6 +981,14 @@ impl ProtonClient {
     pub async fn fetch_logicals(&self) -> Result<Vec<ServerNode>, ApiError> {
         let (_, servers) = self.fetch_logicals_raw().await?;
         Ok(servers)
+    }
+
+    /// Queries Proton `/vpn/v1/location` for the client's current IP geolocation.
+    pub async fn fetch_user_location(&self) -> Result<UserLocation, ApiError> {
+        let payload = self
+            .api_request("vpn/v1/location", Method::GET, None)
+            .await?;
+        parse_user_location_payload(&payload)
     }
 
     /// Ensures a valid WireGuard client key is registered and stored in `ClientConfig`,
@@ -1969,5 +2019,92 @@ mod tests {
             !transient.is_session_expired(),
             "5xx outage must NOT mark session expired: {transient:?}"
         );
+    }
+
+    #[test]
+    fn test_parse_user_location_payload_valid_and_invalid() {
+        let valid = serde_json::json!({
+            "Code": 1000,
+            "Lat": 10.8231,
+            "Long": 106.6297,
+            "Country": " vn "
+        });
+        let parsed = parse_user_location_payload(&valid).expect("valid location");
+        assert_eq!(parsed.country.as_deref(), Some("VN"));
+        assert!((parsed.lat - 10.8231).abs() < 1e-4);
+        assert!((parsed.lon - 106.6297).abs() < 1e-4);
+
+        let no_country = serde_json::json!({
+            "Latitude": 21.0278,
+            "Longitude": 105.8342,
+            "Country": "   "
+        });
+        let parsed2 = parse_user_location_payload(&no_country).expect("fallback keys");
+        assert_eq!(parsed2.country, None);
+        assert!((parsed2.lat - 21.0278).abs() < 1e-4);
+
+        for invalid in [
+            serde_json::json!({"Lat": 95.0, "Long": 106.0}),
+            serde_json::json!({"Lat": 10.0, "Long": 181.0}),
+            serde_json::json!({"Lat": 10.0}),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                parse_user_location_payload(&invalid).is_err(),
+                "invalid location payload must fail: {invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_user_location_calls_vpn_v1_location() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let seen_location_req = Arc::new(AtomicUsize::new(0));
+        let seen_clone = Arc::clone(&seen_location_req);
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let sc = Arc::clone(&seen_clone);
+                tokio::spawn(async move {
+                    let req = read_http_request(&mut socket).await;
+                    let first_line = req.lines().next().unwrap_or("");
+                    let (status, body) = if first_line.starts_with("GET /vpn/v1/location") {
+                        sc.fetch_add(1, Ordering::SeqCst);
+                        (
+                            "200 OK",
+                            r#"{"Code":1000,"IP":"203.113.152.1","Lat":21.0278,"Long":105.8342,"Country":"VN"}"#,
+                        )
+                    } else {
+                        ("404 Not Found", r#"{"Code":404}"#)
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let session = StoredAuthSession {
+            uid: "uid-loc".to_owned(),
+            access_token: "acc-loc".to_owned(),
+            refresh_token: "ref-loc".to_owned(),
+            scopes: vec!["full".to_owned()],
+        };
+        let store = Arc::new(MockCredentialStore::with_session("loc@proton.me", &session));
+        let base = format!("http://{addr}");
+        let client = ProtonClient::with_endpoints(store, base.clone(), vec![base.clone()], base);
+
+        let loc = client.fetch_user_location().await.expect("fetch user location");
+        assert_eq!(seen_location_req.load(Ordering::SeqCst), 1);
+        assert_eq!(loc.country.as_deref(), Some("VN"));
+        assert!((loc.lat - 21.0278).abs() < 1e-4);
+        assert!((loc.lon - 105.8342).abs() < 1e-4);
+        server_task.abort();
     }
 }
