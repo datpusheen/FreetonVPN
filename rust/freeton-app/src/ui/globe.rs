@@ -7,7 +7,8 @@ use egui::{
 use freeton_core::api::ServerNode;
 use freeton_core::ping::{get_country_display, sort_and_filter_servers, SortMode};
 
-use crate::ui::globe_data::{fallback_country_coords, land_dots, DEFAULT_ORIGIN_COORDS};
+use crate::ui::globe_data::fallback_country_coords;
+use crate::ui::globe_data::land_dots;
 use crate::ui::{
     lerp_color, ping_status_color, C_ACCENT, C_BORDER, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT_DIM,
     C_WARNING,
@@ -20,11 +21,23 @@ const ARC_FADE_OUT_SECS: f32 = 0.30;
 const LANDING_PULSE_SECS: f32 = 0.80;
 const DRAG_CLICK_THRESHOLD_PX: f32 = 5.0;
 const MARKER_HIT_RADIUS_PX: f32 = 14.0;
+const USER_ORIGIN_HIT_RADIUS_PX: f32 = 12.0;
 const IDLE_SPIN_RAD_PER_SEC: f32 = 0.104_72; // ~6 deg/sec
 const AUTO_RECENTER_DELAY_SECS: f32 = 2.6;
 const RECENTER_RATE_PER_SEC: f32 = 3.2;
 const DEFAULT_REST_LAT_DEG: f32 = 16.0;
 const DEFAULT_REST_LON_DEG: f32 = 102.0;
+
+pub const C_USER_ORIGIN_BLUE: Color32 = Color32::from_rgb(0x38, 0xbd, 0xf8);
+pub const C_NODE_GREYED: Color32 = Color32::from_rgb(0x64, 0x74, 0x8b);
+
+pub fn format_server_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 server".to_owned()
+    } else {
+        format!("{count} servers")
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct GlobeCountryMarker {
@@ -54,6 +67,8 @@ pub struct GlobeRenderInputs<'a> {
     pub servers: &'a [ServerNode],
     pub selected_server: Option<&'a ServerNode>,
     pub connected_server: Option<&'a ServerNode>,
+    pub user_origin: (f32, f32),
+    pub user_country: Option<&'a str>,
     pub is_connecting: bool,
     pub is_disconnecting: bool,
     pub tunnel_running: bool,
@@ -335,6 +350,7 @@ pub fn hit_test_marker(
 pub fn sync_and_advance_globe(
     globe: &mut GlobeState,
     target_country: Option<(&str, (f32, f32))>,
+    user_origin: (f32, f32),
     is_active_or_connecting: bool,
     animations_enabled: bool,
     hovering_marker: bool,
@@ -346,17 +362,8 @@ pub fn sync_and_advance_globe(
         if let Some((cc, target_coords)) = target_country {
             let target_changed = globe.last_synced_target.as_deref() != Some(cc);
             if !globe.was_active_tunnel || target_changed {
-                let origin = if globe.was_active_tunnel {
-                    globe
-                        .flight
-                        .as_ref()
-                        .map(|f| f.target)
-                        .unwrap_or(DEFAULT_ORIGIN_COORDS)
-                } else {
-                    DEFAULT_ORIGIN_COORDS
-                };
                 globe.flight = Some(GlobeFlight {
-                    origin,
+                    origin: user_origin,
                     target: target_coords,
                     target_country: cc.to_owned(),
                     progress: if animations_enabled { 0.0 } else { 1.0 },
@@ -371,6 +378,8 @@ pub fn sync_and_advance_globe(
                 globe.vel_pitch = 0.0;
                 globe.user_interacted = false;
                 globe.idle_since_interaction = 0.0;
+            } else if let Some(flight) = &mut globe.flight {
+                flight.origin = user_origin;
             }
         }
         globe.was_active_tunnel = true;
@@ -462,7 +471,7 @@ pub fn sync_and_advance_globe(
                         } else {
                             target_country
                                 .map(|(_, coords)| coords)
-                                .unwrap_or((DEFAULT_REST_LAT_DEG, DEFAULT_REST_LON_DEG))
+                                .unwrap_or(user_origin)
                         };
                         let (ty, tp) = camera_angles_for_lat_lon(rest_lat, rest_lon);
                         let alpha = 1.0 - (-RECENTER_RATE_PER_SEC * dt).exp();
@@ -621,6 +630,17 @@ pub fn render_globe_widget(
     let hovered_pre = hover_pos
         .filter(|pos| rect.contains(*pos))
         .and_then(|pos| hit_test_marker(&projected_pre, pos, MARKER_HIT_RADIUS_PX));
+    let user_rot_pre = rotate_point(
+        lat_lon_to_unit(inputs.user_origin.0, inputs.user_origin.1),
+        globe.yaw,
+        globe.pitch,
+    );
+    let (user_pos_pre, user_z_pre) = project_unit(user_rot_pre, center, scale_pre);
+    let hovered_user_pre = hovered_pre.is_none()
+        && user_z_pre > 0.08
+        && hover_pos.is_some_and(|pos| {
+            rect.contains(pos) && (user_pos_pre - pos).length() <= USER_ORIGIN_HIT_RADIUS_PX
+        });
 
     let target_info = target_coords_for_inputs(inputs, &markers);
     let target_ref = target_info
@@ -630,9 +650,10 @@ pub fn render_globe_widget(
     sync_and_advance_globe(
         globe,
         target_ref,
+        inputs.user_origin,
         is_active_or_connecting,
         inputs.animations_enabled,
-        hovered_pre.is_some(),
+        hovered_pre.is_some() || hovered_user_pre,
         dt,
     );
 
@@ -647,12 +668,26 @@ pub fn render_globe_widget(
         })
         .collect();
 
+    let user_rot = rotate_point(
+        lat_lon_to_unit(inputs.user_origin.0, inputs.user_origin.1),
+        globe.yaw,
+        globe.pitch,
+    );
+    let (user_pos, user_z) = project_unit(user_rot, center, scale);
+
     let hovered_idx = if globe.is_dragging {
         None
     } else {
         hover_pos
             .filter(|pos| rect.contains(*pos))
             .and_then(|pos| hit_test_marker(&projected, pos, MARKER_HIT_RADIUS_PX))
+    };
+    let hovered_user = if globe.is_dragging || hovered_idx.is_some() || user_z <= 0.08 {
+        false
+    } else {
+        hover_pos.is_some_and(|pos| {
+            rect.contains(pos) && (user_pos - pos).length() <= USER_ORIGIN_HIT_RADIUS_PX
+        })
     };
 
     if hovered_idx.is_some() {
@@ -878,32 +913,6 @@ pub fn render_globe_widget(
                     ));
                 }
 
-                // Origin anchor dot
-                let orig_rot = rotate_point(
-                    lat_lon_to_unit(flight.origin.0, flight.origin.1),
-                    globe.yaw,
-                    globe.pitch,
-                );
-                if orig_rot[2] > -0.05 {
-                    let (orig_pos, _) = project_unit(orig_rot, center, scale);
-                    let oa = (globe.arc_alpha * 190.0).round() as u8;
-                    p.circle_filled(
-                        orig_pos,
-                        5.2,
-                        Color32::from_rgba_unmultiplied(
-                            C_ACCENT.r(),
-                            C_ACCENT.g(),
-                            C_ACCENT.b(),
-                            (globe.arc_alpha * 55.0).round() as u8,
-                        ),
-                    );
-                    p.circle_filled(
-                        orig_pos,
-                        2.4,
-                        Color32::from_rgba_unmultiplied(C_TEXT.r(), C_TEXT.g(), C_TEXT.b(), oa),
-                    );
-                }
-
                 // Comet tip during flight OR traveling packet pulse after landing
                 let tip_idx = if flight.progress < 1.0 {
                     (flight.progress * (arc_3d.len() - 1) as f32)
@@ -944,7 +953,57 @@ pub fn render_globe_widget(
             }
         }
 
-        // 5. Country Markers (sorted back-to-front by depth z)
+        // 5. Persistent Blue User-Location Dot
+        if user_z > -0.06 {
+            let depth_fade: f32 = if user_z > 0.08 { 1.0 } else { 0.5 };
+            let glow_r = if hovered_user { 9.5 } else { 8.0 };
+            let core_r = if hovered_user { 4.2 } else { 3.5 };
+            p.circle_filled(
+                user_pos,
+                glow_r,
+                Color32::from_rgba_unmultiplied(
+                    C_USER_ORIGIN_BLUE.r(),
+                    C_USER_ORIGIN_BLUE.g(),
+                    C_USER_ORIGIN_BLUE.b(),
+                    ((if hovered_user { 80.0 } else { 52.0 }) * depth_fade).round() as u8,
+                ),
+            );
+            p.circle_filled(
+                user_pos,
+                core_r,
+                Color32::from_rgba_unmultiplied(
+                    C_USER_ORIGIN_BLUE.r(),
+                    C_USER_ORIGIN_BLUE.g(),
+                    C_USER_ORIGIN_BLUE.b(),
+                    (245.0 * depth_fade).round() as u8,
+                ),
+            );
+            p.circle_filled(
+                user_pos,
+                1.5,
+                Color32::from_rgba_unmultiplied(
+                    255,
+                    255,
+                    255,
+                    (235.0 * depth_fade).round() as u8,
+                ),
+            );
+            p.circle_stroke(
+                user_pos,
+                if hovered_user { 7.5 } else { 5.8 },
+                Stroke::new(
+                    1.2,
+                    Color32::from_rgba_unmultiplied(
+                        if hovered_user { 248 } else { C_USER_ORIGIN_BLUE.r() },
+                        if hovered_user { 250 } else { C_USER_ORIGIN_BLUE.g() },
+                        if hovered_user { 252 } else { C_USER_ORIGIN_BLUE.b() },
+                        (210.0 * depth_fade).round() as u8,
+                    ),
+                ),
+            );
+        }
+
+        // 6. Country Markers (sorted back-to-front by depth z)
         let mut draw_order: Vec<ProjectedMarker> =
             projected.iter().copied().filter(|m| m.z > -0.06).collect();
         draw_order.sort_by(|a, b| a.z.total_cmp(&b.z));
@@ -954,10 +1013,17 @@ pub fn render_globe_widget(
             let marker = &markers[pm.idx];
             let is_hovered = hovered_idx == Some(pm.idx);
             let is_target = active_country_code == Some(marker.country_code.as_str());
+            let is_greyed_inactive = is_active_or_connecting && !is_target;
             let depth_fade: f32 = if pm.z > 0.08 { 1.0 } else { 0.45 };
 
             let base_col = if is_target && is_active_or_connecting {
                 accent_tone
+            } else if is_greyed_inactive {
+                if is_hovered {
+                    lerp_color(C_NODE_GREYED, C_TEXT, 0.55)
+                } else {
+                    C_NODE_GREYED
+                }
             } else {
                 marker
                     .best_ping_ms
@@ -965,23 +1031,17 @@ pub fn render_globe_widget(
                     .unwrap_or(C_ACCENT)
             };
 
-            let halo_r = if is_hovered {
-                9.5
+            let (halo_r, core_r, halo_base_a, core_base_a) = if is_greyed_inactive && !is_hovered {
+                (4.6, 2.4, 22.0, 145.0)
+            } else if is_hovered {
+                (9.5, 4.4, 72.0, 245.0)
             } else if is_target {
-                8.0
+                (8.0, 3.8, 72.0, 245.0)
             } else {
-                6.0
+                (6.0, 2.8, 42.0, 245.0)
             };
-            let core_r = if is_hovered {
-                4.4
-            } else if is_target {
-                3.8
-            } else {
-                2.8
-            };
-            let halo_alpha = ((if is_hovered || is_target { 72.0 } else { 42.0 }) * depth_fade)
-                .round() as u8;
-            let core_alpha = (245.0 * depth_fade).round() as u8;
+            let halo_alpha = (halo_base_a * depth_fade).round() as u8;
+            let core_alpha = (core_base_a * depth_fade).round() as u8;
 
             p.circle_filled(
                 pm.pos,
@@ -1055,7 +1115,7 @@ pub fn render_globe_widget(
             }
         }
 
-        // 6. Clamped Floating Hover Tooltip
+        // 7. Clamped Floating Hover Tooltip
         if let Some(idx) = hovered_idx {
             let marker = &markers[idx];
             let pm = projected[idx];
@@ -1064,60 +1124,64 @@ pub fn render_globe_widget(
                 None => "-- ms".to_owned(),
             };
             let tip_text = format!(
-                "{} • {} • {} sv",
-                marker.display_name, ping_txt, marker.server_count
+                "{} • {} • {}",
+                marker.display_name,
+                ping_txt,
+                format_server_count_label(marker.server_count)
             );
-            let font = FontId::proportional(11.0);
-            let galley = p.layout_no_wrap(tip_text, font, C_TEXT);
-            let pad = Vec2::new(8.0, 5.0);
-            let tip_size = galley.size() + pad * 2.0;
-
-            let raw_x = pm.pos.x - tip_size.x * 0.5;
-            let raw_y = if pm.pos.y - tip_size.y - 12.0 >= rect.top() + 2.0 {
-                pm.pos.y - tip_size.y - 12.0
-            } else {
-                pm.pos.y + 12.0
+            paint_clamped_tooltip(&p, rect, caption_h, pm.pos, tip_text, C_ACCENT);
+        } else if hovered_user {
+            let tip_text = match inputs
+                .user_country
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            {
+                Some(cc) => format!("Vị trí của bạn • {}", get_country_display(cc)),
+                None => "Vị trí hiện tại của bạn".to_owned(),
             };
-            let max_x = (rect.right() - tip_size.x - 2.0).max(rect.left() + 2.0);
-            let max_y = (rect.bottom() - caption_h - tip_size.y - 2.0).max(rect.top() + 2.0);
-            let tip_pos = Pos2::new(
-                raw_x.clamp(rect.left() + 2.0, max_x),
-                raw_y.clamp(rect.top() + 2.0, max_y),
-            );
-            let tip_rect = Rect::from_min_size(tip_pos, tip_size);
-            p.rect_filled(tip_rect, CornerRadius::same(7), C_SURFACE);
-            p.rect_stroke(
-                tip_rect,
-                CornerRadius::same(7),
-                Stroke::new(1.0, C_ACCENT),
-                egui::StrokeKind::Inside,
-            );
-            p.galley(tip_pos + pad, galley, C_TEXT);
+            paint_clamped_tooltip(&p, rect, caption_h, user_pos, tip_text, C_USER_ORIGIN_BLUE);
         }
 
-        // 7. Bottom 1-line instruction / status caption inside arena
-        let caption = if let Some(idx) = hovered_idx {
-            format!(
-                "Bấm để kết nối tới {} ({})",
-                markers[idx].display_name, markers[idx].best_server.name
+        // 8. Bottom 1-line instruction / status caption inside arena
+        let (caption, caption_color) = if let Some(idx) = hovered_idx {
+            (
+                format!(
+                    "Bấm để kết nối tới {} ({})",
+                    markers[idx].display_name, markers[idx].best_server.name
+                ),
+                C_ACCENT,
+            )
+        } else if hovered_user {
+            (
+                "VỊ TRÍ CỦA BẠN  •  Điểm xuất phát đường hầm".to_owned(),
+                C_USER_ORIGIN_BLUE,
             )
         } else if inputs.tunnel_verified {
             if let Some(srv) = inputs.connected_server {
-                format!("WIREGUARD  •  Đang mã hóa qua {}", get_country_display(&srv.country))
+                (
+                    format!("WIREGUARD  •  Đang mã hóa qua {}", get_country_display(&srv.country)),
+                    C_TEXT_DIM,
+                )
             } else {
-                "WIREGUARD  •  KẾT NỐI MÃ HÓA".to_owned()
+                ("WIREGUARD  •  KẾT NỐI MÃ HÓA".to_owned(), C_TEXT_DIM)
             }
         } else if inputs.is_connecting {
-            "WIREGUARD  •  Đang thiết lập đường hầm 3D...".to_owned()
+            (
+                "WIREGUARD  •  Đang thiết lập đường hầm 3D...".to_owned(),
+                C_TEXT_DIM,
+            )
         } else {
-            "WIREGUARD  •  Kéo để xoay, bấm nước để kết nối".to_owned()
+            (
+                "WIREGUARD  •  Kéo để xoay, bấm nước để kết nối".to_owned(),
+                C_TEXT_DIM,
+            )
         };
         p.text(
             Pos2::new(rect.center().x, rect.bottom() - 3.0),
             Align2::CENTER_BOTTOM,
             caption,
             FontId::proportional(10.0),
-            if hovered_idx.is_some() { C_ACCENT } else { C_TEXT_DIM },
+            caption_color,
         );
     }
 
@@ -1146,6 +1210,42 @@ pub fn render_globe_widget(
     }
 
     action
+}
+
+fn paint_clamped_tooltip(
+    p: &egui::Painter,
+    rect: Rect,
+    caption_h: f32,
+    anchor: Pos2,
+    tip_text: String,
+    border: Color32,
+) {
+    let font = FontId::proportional(11.0);
+    let galley = p.layout_no_wrap(tip_text, font, C_TEXT);
+    let pad = Vec2::new(8.0, 5.0);
+    let tip_size = galley.size() + pad * 2.0;
+
+    let raw_x = anchor.x - tip_size.x * 0.5;
+    let raw_y = if anchor.y - tip_size.y - 12.0 >= rect.top() + 2.0 {
+        anchor.y - tip_size.y - 12.0
+    } else {
+        anchor.y + 12.0
+    };
+    let max_x = (rect.right() - tip_size.x - 2.0).max(rect.left() + 2.0);
+    let max_y = (rect.bottom() - caption_h - tip_size.y - 2.0).max(rect.top() + 2.0);
+    let tip_pos = Pos2::new(
+        raw_x.clamp(rect.left() + 2.0, max_x),
+        raw_y.clamp(rect.top() + 2.0, max_y),
+    );
+    let tip_rect = Rect::from_min_size(tip_pos, tip_size);
+    p.rect_filled(tip_rect, CornerRadius::same(7), C_SURFACE);
+    p.rect_stroke(
+        tip_rect,
+        CornerRadius::same(7),
+        Stroke::new(1.0, border),
+        egui::StrokeKind::Inside,
+    );
+    p.galley(tip_pos + pad, galley, C_TEXT);
 }
 
 #[cfg(test)]
@@ -1268,24 +1368,57 @@ mod tests {
         let mut globe = GlobeState::default();
         let sg = fallback_country_coords("SG").unwrap();
         let jp = fallback_country_coords("JP").unwrap();
+        let origin = (21.0278, 105.8342);
 
-        sync_and_advance_globe(&mut globe, Some(("SG", sg)), true, true, false, 0.016);
+        sync_and_advance_globe(
+            &mut globe,
+            Some(("SG", sg)),
+            origin,
+            true,
+            true,
+            false,
+            0.016,
+        );
         let flight = globe.flight.as_ref().expect("flight started");
-        assert_eq!(flight.origin, DEFAULT_ORIGIN_COORDS);
+        assert_eq!(flight.origin, origin);
         assert_eq!(flight.target_country, "SG");
         assert!(flight.progress < 1.0);
 
-        sync_and_advance_globe(&mut globe, Some(("JP", jp)), true, true, false, 0.016);
+        sync_and_advance_globe(
+            &mut globe,
+            Some(("JP", jp)),
+            origin,
+            true,
+            true,
+            false,
+            0.016,
+        );
         let flight2 = globe.flight.as_ref().expect("switch flight started");
-        assert_eq!(flight2.origin, sg);
+        assert_eq!(flight2.origin, origin);
         assert_eq!(flight2.target_country, "JP");
 
         let mut instant = GlobeState::default();
-        sync_and_advance_globe(&mut instant, Some(("SG", sg)), true, false, false, 0.016);
+        sync_and_advance_globe(
+            &mut instant,
+            Some(("SG", sg)),
+            origin,
+            true,
+            false,
+            false,
+            0.016,
+        );
         assert_eq!(instant.flight.as_ref().unwrap().progress, 1.0);
         assert!((instant.zoom - 1.16).abs() < 1e-4);
 
-        sync_and_advance_globe(&mut instant, Some(("SG", sg)), false, true, false, 0.40);
+        sync_and_advance_globe(
+            &mut instant,
+            Some(("SG", sg)),
+            origin,
+            false,
+            true,
+            false,
+            0.40,
+        );
         assert!(instant.arc_alpha < 0.05);
         assert!(instant.zoom < 1.10);
     }
@@ -1319,6 +1452,8 @@ mod tests {
             servers: &servers,
             selected_server: None,
             connected_server: None,
+            user_origin: DEFAULT_ORIGIN_COORDS,
+            user_country: Some("VN"),
             is_connecting: false,
             is_disconnecting: false,
             tunnel_running: false,
@@ -1462,7 +1597,7 @@ mod tests {
     fn test_server_switch_while_connected_launches_flight_immediately() {
         let sg_srv = mk_srv("SG-FREE#1", "SG", Some(30.0), Some(20.0), None, None);
         let jp_srv = mk_srv("JP-FREE#1", "JP", Some(45.0), Some(30.0), None, None);
-        let sg = fallback_country_coords("SG").unwrap();
+        let origin = DEFAULT_ORIGIN_COORDS;
         let servers = vec![sg_srv.clone(), jp_srv.clone()];
 
         let ctx = egui::Context::default();
@@ -1471,6 +1606,8 @@ mod tests {
             servers: &servers,
             selected_server: Some(&sg_srv),
             connected_server: Some(&sg_srv),
+            user_origin: origin,
+            user_country: Some("VN"),
             is_connecting: false,
             is_disconnecting: false,
             tunnel_running: true,
@@ -1485,6 +1622,8 @@ mod tests {
             servers: &servers,
             selected_server: Some(&jp_srv),
             connected_server: Some(&sg_srv),
+            user_origin: origin,
+            user_country: Some("VN"),
             is_connecting: true,
             is_disconnecting: false,
             tunnel_running: true,
@@ -1495,7 +1634,7 @@ mod tests {
         let _ = run_globe_frame(&ctx, 0.05, vec![], &switching_to_jp, &mut globe);
 
         let flight = globe.flight.as_ref().expect("switch flight must start");
-        assert_eq!(flight.origin, sg);
+        assert_eq!(flight.origin, origin);
         assert_eq!(flight.target_country, "JP");
     }
 
@@ -1507,6 +1646,8 @@ mod tests {
             servers: &servers,
             selected_server: None,
             connected_server: None,
+            user_origin: DEFAULT_ORIGIN_COORDS,
+            user_country: Some("VN"),
             is_connecting: false,
             is_disconnecting: false,
             tunnel_running: false,
@@ -1586,14 +1727,15 @@ mod tests {
     fn test_connected_static_globe_allows_user_drag_without_snapping_back() {
         let mut globe = GlobeState::default();
         let sg = fallback_country_coords("SG").unwrap();
+        let origin = DEFAULT_ORIGIN_COORDS;
         let (target_yaw, _) = camera_angles_for_lat_lon(sg.0, sg.1);
 
-        sync_and_advance_globe(&mut globe, Some(("SG", sg)), true, false, false, 0.016);
+        sync_and_advance_globe(&mut globe, Some(("SG", sg)), origin, true, false, false, 0.016);
         assert!((globe.yaw - target_yaw).abs() < 1e-4);
 
         // User rotates globe while connected with animations disabled
         globe.yaw = normalize_angle(target_yaw + 0.55);
-        sync_and_advance_globe(&mut globe, Some(("SG", sg)), true, false, false, 0.016);
+        sync_and_advance_globe(&mut globe, Some(("SG", sg)), origin, true, false, false, 0.016);
         assert!(
             (shortest_angle_delta(target_yaw, globe.yaw) - 0.55).abs() < 1e-3,
             "connected static globe must not snap camera back after user rotation"
@@ -1603,12 +1745,13 @@ mod tests {
     #[test]
     fn test_globe_auto_recenters_after_user_inactivity_for_connected_and_idle() {
         let sg = fallback_country_coords("SG").unwrap();
+        let origin = DEFAULT_ORIGIN_COORDS;
         let (sg_yaw, sg_pitch) = camera_angles_for_lat_lon(sg.0, sg.1);
 
         // 1. Connected state: user drags away, stays untouched briefly (no immediate snap),
         //    then after inactivity delay smoothly returns to target country angle.
         let mut connected = GlobeState::default();
-        sync_and_advance_globe(&mut connected, Some(("SG", sg)), true, true, false, 1.2);
+        sync_and_advance_globe(&mut connected, Some(("SG", sg)), origin, true, true, false, 1.2);
         connected.user_interacted = true;
         connected.idle_since_interaction = 0.0;
         connected.yaw = normalize_angle(sg_yaw + 1.1);
@@ -1619,7 +1762,15 @@ mod tests {
 
         // Before delay (0.5s): should NOT recenter yet
         for _ in 0..5 {
-            sync_and_advance_globe(&mut connected, Some(("SG", sg)), true, true, false, 0.1);
+            sync_and_advance_globe(
+                &mut connected,
+                Some(("SG", sg)),
+                origin,
+                true,
+                true,
+                false,
+                0.1,
+            );
         }
         assert!(
             shortest_angle_delta(connected.yaw, sg_yaw).abs() > 0.9,
@@ -1627,7 +1778,15 @@ mod tests {
         );
 
         // Hovering a marker resets inactivity timer and holds angle
-        sync_and_advance_globe(&mut connected, Some(("SG", sg)), true, true, true, 5.0);
+        sync_and_advance_globe(
+            &mut connected,
+            Some(("SG", sg)),
+            origin,
+            true,
+            true,
+            true,
+            5.0,
+        );
         assert!(
             shortest_angle_delta(connected.yaw, sg_yaw).abs() > 0.9,
             "hovering a marker must pause auto-recenter"
@@ -1635,7 +1794,15 @@ mod tests {
 
         // After delay (~4.5s total untouched): smoothly returns to SG angle
         for _ in 0..45 {
-            sync_and_advance_globe(&mut connected, Some(("SG", sg)), true, true, false, 0.1);
+            sync_and_advance_globe(
+                &mut connected,
+                Some(("SG", sg)),
+                origin,
+                true,
+                true,
+                false,
+                0.1,
+            );
         }
         assert!(
             shortest_angle_delta(connected.yaw, sg_yaw).abs() < 0.05
@@ -1653,7 +1820,7 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..45 {
-            sync_and_advance_globe(&mut idle, Some(("SG", sg)), false, true, false, 0.1);
+            sync_and_advance_globe(&mut idle, Some(("SG", sg)), origin, false, true, false, 0.1);
         }
         assert!(
             (idle.pitch - sg_pitch).abs() < 0.08,
@@ -1664,6 +1831,286 @@ mod tests {
         assert!(
             !idle.user_interacted,
             "user_interacted flag should clear once recenter completes"
+        );
+    }
+
+    fn collect_shapes_text(shapes: &[egui::epaint::ClippedShape]) -> String {
+        let mut out = String::new();
+        fn visit(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for item in v {
+                        visit(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for c in shapes {
+            visit(&c.shape, &mut out);
+        }
+        out
+    }
+
+    fn has_circle_matching_rgb(shapes: &[egui::epaint::ClippedShape], target: Color32) -> bool {
+        fn unpremul(chan: u8, alpha: u8) -> i16 {
+            ((f32::from(chan) * 255.0) / f32::from(alpha)).round() as i16
+        }
+        fn matches(fill: Color32, target: Color32) -> bool {
+            let a = fill.a();
+            if a == 0 {
+                return false;
+            }
+            (unpremul(fill.r(), a) - i16::from(target.r())).abs() <= 4
+                && (unpremul(fill.g(), a) - i16::from(target.g())).abs() <= 4
+                && (unpremul(fill.b(), a) - i16::from(target.b())).abs() <= 4
+        }
+        fn visit(s: &egui::epaint::Shape, target: Color32) -> bool {
+            match s {
+                egui::epaint::Shape::Circle(c) => matches(c.fill, target),
+                egui::epaint::Shape::Vec(v) => v.iter().any(|item| visit(item, target)),
+                _ => false,
+            }
+        }
+        shapes.iter().any(|c| visit(&c.shape, target))
+    }
+
+    #[test]
+    fn test_format_server_count_label_singular_and_plural() {
+        assert_eq!(format_server_count_label(1), "1 server");
+        assert_eq!(format_server_count_label(4), "4 servers");
+        assert_eq!(format_server_count_label(0), "0 servers");
+    }
+
+    #[test]
+    fn test_blue_user_origin_dot_always_renders_and_hover_does_not_connect() {
+        let sg_srv = mk_srv("SG-FREE#1", "SG", Some(35.0), Some(20.0), None, None);
+        let servers = vec![sg_srv.clone()];
+        let vn_origin = (14.0583, 108.2772);
+        let (yaw, pitch) = camera_angles_for_lat_lon(vn_origin.0, vn_origin.1);
+        let mut globe = GlobeState {
+            yaw,
+            pitch,
+            ..Default::default()
+        };
+        let inputs = GlobeRenderInputs {
+            servers: &servers,
+            selected_server: None,
+            connected_server: None,
+            user_origin: vn_origin,
+            user_country: Some("VN"),
+            is_connecting: false,
+            is_disconnecting: false,
+            tunnel_running: false,
+            tunnel_verified: false,
+            animations_enabled: false,
+            window_visible: true,
+        };
+
+        let ctx = egui::Context::default();
+        // Warm up widget rect so egui registers hover hit-testing, then hover center
+        let _ = run_globe_frame(&ctx, 0.0, vec![], &inputs, &mut globe);
+        let center = Pos2::new(180.0, 121.0);
+        let (_, idle_out) = run_globe_frame(
+            &ctx,
+            0.1,
+            vec![egui::Event::PointerMoved(center)],
+            &inputs,
+            &mut globe,
+        );
+        assert!(
+            has_circle_matching_rgb(&idle_out.shapes, C_USER_ORIGIN_BLUE),
+            "blue user origin dot must render on front hemisphere in idle mode"
+        );
+        let tip_text = collect_shapes_text(&idle_out.shapes);
+        assert!(
+            tip_text.contains("Vị trí của bạn"),
+            "hovering blue dot should show user location tooltip, got: {tip_text}"
+        );
+
+        let _ = run_globe_frame(
+            &ctx,
+            0.15,
+            vec![egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &inputs,
+            &mut globe,
+        );
+        let (click_action, _) = run_globe_frame(
+            &ctx,
+            0.20,
+            vec![egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &inputs,
+            &mut globe,
+        );
+        assert!(
+            matches!(click_action, GlobeAction::None),
+            "clicking blue user dot must not emit ConnectCountry"
+        );
+    }
+
+    #[test]
+    fn test_connected_globe_greys_out_unconnected_nodes_and_keeps_blue_to_target_arc() {
+        let sg_srv = mk_srv("SG-FREE#1", "SG", Some(40.0), Some(20.0), None, None);
+        let jp_srv = mk_srv("JP-FREE#1", "JP", Some(65.0), Some(30.0), None, None);
+        let servers = vec![sg_srv.clone(), jp_srv.clone()];
+        let origin = (14.0583, 108.2772);
+        let jp = fallback_country_coords("JP").unwrap();
+
+        let (yaw, pitch) = camera_angles_for_lat_lon(origin.0, origin.1);
+        let mut globe = GlobeState {
+            yaw,
+            pitch,
+            ..Default::default()
+        };
+        let connected = GlobeRenderInputs {
+            servers: &servers,
+            selected_server: Some(&sg_srv),
+            connected_server: Some(&sg_srv),
+            user_origin: origin,
+            user_country: Some("VN"),
+            is_connecting: false,
+            is_disconnecting: false,
+            tunnel_running: true,
+            tunnel_verified: true,
+            animations_enabled: false,
+            window_visible: true,
+        };
+
+        let ctx = egui::Context::default();
+        let (_, out) = run_globe_frame(&ctx, 0.0, vec![], &connected, &mut globe);
+        assert!(
+            has_circle_matching_rgb(&out.shapes, C_USER_ORIGIN_BLUE),
+            "blue user origin dot must still render while connected"
+        );
+        assert!(
+            has_circle_matching_rgb(&out.shapes, C_NODE_GREYED),
+            "unconnected country node (JP) must render greyed out while connected to SG"
+        );
+        assert_eq!(globe.flight.as_ref().unwrap().origin, origin);
+
+        // Clicking a greyed-out marker (JP) still triggers a country switch
+        let (jp_yaw, jp_pitch) = camera_angles_for_lat_lon(jp.0, jp.1);
+        globe.yaw = jp_yaw;
+        globe.pitch = jp_pitch;
+        let center = Pos2::new(180.0, 121.0);
+        let _ = run_globe_frame(
+            &ctx,
+            0.1,
+            vec![
+                egui::Event::PointerMoved(center),
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &connected,
+            &mut globe,
+        );
+        let (switch_action, _) = run_globe_frame(
+            &ctx,
+            0.15,
+            vec![egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &connected,
+            &mut globe,
+        );
+        assert!(
+            matches!(switch_action, GlobeAction::ConnectCountry(ref s) if s.name == "JP-FREE#1"),
+            "clicking greyed marker must still switch server: got {switch_action:?}"
+        );
+    }
+
+    #[test]
+    fn test_marker_hover_tooltip_uses_servers_wording() {
+        let mut servers = Vec::new();
+        for i in 1..=4 {
+            servers.push(mk_srv(
+                &format!("JP-FREE#{i}"),
+                "JP",
+                Some(50.0 + i as f64),
+                Some(20.0),
+                None,
+                None,
+            ));
+        }
+        servers.push(mk_srv("SG-FREE#1", "SG", Some(35.0), Some(20.0), None, None));
+
+        let ctx = egui::Context::default();
+        let center = Pos2::new(180.0, 121.0);
+
+        let jp = fallback_country_coords("JP").unwrap();
+        let (jy, jp_pitch) = camera_angles_for_lat_lon(jp.0, jp.1);
+        let mut globe_jp = GlobeState {
+            yaw: jy,
+            pitch: jp_pitch,
+            ..Default::default()
+        };
+        let inputs = GlobeRenderInputs {
+            servers: &servers,
+            selected_server: None,
+            connected_server: None,
+            user_origin: DEFAULT_ORIGIN_COORDS,
+            user_country: Some("VN"),
+            is_connecting: false,
+            is_disconnecting: false,
+            tunnel_running: false,
+            tunnel_verified: false,
+            animations_enabled: false,
+            window_visible: true,
+        };
+        let _ = run_globe_frame(&ctx, 0.0, vec![], &inputs, &mut globe_jp);
+        let (_, jp_out) = run_globe_frame(
+            &ctx,
+            0.1,
+            vec![egui::Event::PointerMoved(center)],
+            &inputs,
+            &mut globe_jp,
+        );
+        let jp_text = collect_shapes_text(&jp_out.shapes);
+        assert!(
+            jp_text.contains("4 servers") && !jp_text.contains("4 sv"),
+            "tooltip must display '4 servers', got: {jp_text}"
+        );
+
+        let sg = fallback_country_coords("SG").unwrap();
+        let (sy, sp) = camera_angles_for_lat_lon(sg.0, sg.1);
+        let mut globe_sg = GlobeState {
+            yaw: sy,
+            pitch: sp,
+            ..Default::default()
+        };
+        let _ = run_globe_frame(&ctx, 0.15, vec![], &inputs, &mut globe_sg);
+        let (_, sg_out) = run_globe_frame(
+            &ctx,
+            0.2,
+            vec![egui::Event::PointerMoved(center)],
+            &inputs,
+            &mut globe_sg,
+        );
+        let sg_text = collect_shapes_text(&sg_out.shapes);
+        assert!(
+            sg_text.contains("1 server") && !sg_text.contains("1 servers"),
+            "singular tooltip must display '1 server', got: {sg_text}"
         );
     }
 }

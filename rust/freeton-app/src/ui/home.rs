@@ -285,6 +285,8 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
             servers: &state.all_free_servers,
             selected_server: state.selected_server.as_ref(),
             connected_server: state.connected_server.as_ref(),
+            user_origin: (state.user_location.lat, state.user_location.lon),
+            user_country: state.user_location.country.as_deref(),
             is_connecting: state.is_connecting_vpn,
             is_disconnecting: state.is_disconnecting_vpn,
             tunnel_running: state.tunnel_running,
