@@ -7,7 +7,7 @@ pub mod updater;
 pub mod wg;
 
 /// Application version string for Freeton VPN.
-pub const APP_VERSION: &str = "3.0.3";
+pub const APP_VERSION: &str = "3.1.0";
 
 /// Application display name for Freeton VPN.
 pub const APP_NAME: &str = "Freeton VPN";

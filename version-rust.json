@@ -1,23 +1,20 @@
 {
-    "version":  "3.0.3",
-    "release_date":  "2026-11-27",
-    "title":  "Freeton VPN Desktop Client v3.0.3",
+    "version":  "3.1.0",
+    "release_date":  "2026-11-28",
+    "title":  "Freeton VPN Desktop Client v3.1.0",
     "changelog":  [
-                      "▸ Tối ưu RAM \u0026 hiệu năng",
-                      "OpenGL mặc định \u0026 tinh gọn crate: Giảm đáng kể RAM/thread, loại bỏ driver DX12 nặng khi chạy trên GPU rời.",
-                      "Thu dọn bộ nhớ thông minh: Tự động cắt working set sau khởi tạo và khi ẩn khay, giãn nhịp vẽ lại lúc nhàn rỗi.",
-                      "▸ Khởi chạy đa máy, VM \u0026 hiển thị",
-                      "CRT tĩnh (+crt-static): Chạy trực tiếp trên Windows mới cài mà không cần cài thêm Visual C++ Redistributable.",
-                      "Dự phòng đồ họa 3 tầng \u0026 WARP cho VM/RDP: Tự động ưu tiên render phần mềm WARP trong máy ảo để tránh đen màn hình.",
-                      "Chữ sắc nét \u0026 Emoji đủ màu: Bật font hinting rõ nét và khôi phục rasterize emoji màu (epaint color_fonts).",
-                      "▸ Tự động hóa, ổn định \u0026 chẩn đoán",
-                      "Tự logout khi RefreshToken hết hạn: Gặp Invalid refresh token sẽ xóa phiên cũ, ngắt tunnel (nếu đang bật) và đưa về màn hình Đăng nhập.",
-                      "Kiểm tra \u0026 đồng bộ sẵn DLL WireGuard: Tự động stage tunnel.dll / wireguard.dll và báo lỗi rõ nếu thiếu DLL dịch vụ.",
-                      "Ghi log xoay vòng \u0026 CLI Realtime (Dev Mode): Lưu file log có giới hạn dung lượng cho App \u0026 Service, kèm nút mở cửa sổ CLI xem log trực tiếp."
+                      "▸ Giao diện Địa cầu 3D tương tác",
+                      "Bản đồ địa cầu dot-matrix 3D ngay màn hình chính: Xoay tự do, tự động căn giữa về node đang chọn và vẽ đường cung bay trực tiếp tới máy chủ VPN.",
+                      "Ghim vị trí người dùng màu xanh dương & nút node thông minh: Tự động lấy tọa độ từ Proton API (dự phòng Geo Windows), làm xám các node chưa kết nối nhưng vẫn cho chọn nhanh.",
+                      "▸ Split Tunneling (Mạng LAN & IP loại trừ)",
+                      "Cho phép truy cập mạng LAN nội bộ: Một công tắc bật/tắt bỏ qua VPN cho các dải IP nội bộ (192.168.0.0/16, 172.16.0.0/12, 10.0.0.0/8, 169.254.0.0/16) mà vẫn giữ nguyên DNS VPN an toàn.",
+                      "Danh sách IP / CIDR không qua VPN tùy chỉnh: Hỗ trợ nhập thêm IP đơn lẻ hoặc subnet theo dấu phẩy/dòng mới, kiểm tra định dạng ngay trong Cài đặt.",
+                      "▸ Tối ưu giao diện, hiệu ứng & độ ổn định",
+                      "Sửa lỗi giật/nhảy lại trạng thái công tắc VPN khi thông báo hoặc thanh tải thu gọn; đồng bộ hiệu ứng đóng/mở mượt và căn thẳng hàng thẻ trạng thái trên cùng."
                   ],
-    "download_url":  "https://github.com/datpusheen/FreetonVPN/releases/download/v3.0.3/FreetonVPN-Setup-x64.exe",
-    "file_size_bytes":  8316894,
-    "sha256":  "da21b3f13e317e1a5d5f5471aaae9d1be240c372cf9d41d11f7dfaac520fbb51",
+    "download_url":  "https://github.com/datpusheen/FreetonVPN/releases/download/v3.1.0/FreetonVPN-Setup-x64.exe",
+    "file_size_bytes":  0,
+    "sha256":  "",
     "mandatory":  false,
     "min_supported_version":  "3.0.0"
 }
