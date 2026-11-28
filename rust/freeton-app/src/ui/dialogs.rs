@@ -945,6 +945,64 @@ fn render_settings_dialog(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState
                         });
                     });
                 });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let lbl = ui
+                        .label(
+                            RichText::new("Cho phép truy cập mạng LAN nội bộ")
+                                .size(11.5)
+                                .color(C_TEXT),
+                        )
+                        .interact(Sense::click())
+                        .on_hover_cursor(CursorIcon::PointingHand);
+                    let mut toggled = lbl.clicked();
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ios_toggle_switch(
+                            ui,
+                            state.settings_draft.allow_lan_access,
+                            false,
+                            anim,
+                            Vec2::new(40.0, 22.0),
+                        )
+                        .clicked()
+                        {
+                            toggled = true;
+                        }
+                    });
+                    if toggled {
+                        state.settings_draft.allow_lan_access =
+                            !state.settings_draft.allow_lan_access;
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "Bỏ qua VPN cho 192.168.0.0/16, 172.16.0.0/12, 10.0.0.0/8, 169.254.0.0/16 (giữ DNS VPN).",
+                    )
+                    .size(9.5)
+                    .color(C_TEXT_DIM),
+                );
+
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("IP / CIDR KHÔNG QUA VPN (BỔ SUNG)")
+                        .size(9.5)
+                        .strong()
+                        .color(C_TEXT_MUTED),
+                );
+                ui.add_space(2.0);
+                rounded_card(ui, C_BG, C_BORDER, 8, Margin::symmetric(8, 5), |ui| {
+                    let excl_w = ui.available_width().max(80.0);
+                    ui.add_sized(
+                        Vec2::new(excl_w, 20.0),
+                        TextEdit::singleline(&mut state.settings_draft.excluded_ips)
+                            .frame(egui::Frame::NONE)
+                            .font(TextStyle::Monospace)
+                            .desired_width(excl_w)
+                            .hint_text("Vd: 192.168.1.0/24, 100.64.0.0/10")
+                            .text_color(C_TEXT),
+                    );
+                });
             });
         });
 
@@ -1896,6 +1954,58 @@ mod tests {
         assert!(state.drain_commands().iter().any(
             |c| matches!(c, UiCommand::SaveClientConfig { config } if config.private_key.is_empty() && config.expiration == 0)
         ));
+    }
+
+    #[test]
+    fn test_settings_save_validates_and_persists_lan_bypass_and_excluded_ips() {
+        let mut state = AppState::new(
+            true,
+            Some("u@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            Vec::new(),
+        );
+        state.open_settings_dialog();
+        let _ = state.drain_commands();
+
+        for bad_excl in ["0.0.0.0/0", "not-an-ip", "2001:db8::/32"] {
+            state.settings_draft.excluded_ips = bad_excl.to_owned();
+            state.save_settings_dialog();
+            assert_eq!(
+                state.active_dialog,
+                ActiveDialog::Settings,
+                "invalid excluded IP {bad_excl:?} must keep Settings open"
+            );
+            assert!(state.client_config.excluded_ips.is_empty());
+            assert!(state.settings_status_msg.is_some());
+            assert!(state.drain_commands().is_empty());
+        }
+
+        state.tunnel_running = true;
+        state.settings_draft.allow_lan_access = true;
+        state.settings_draft.excluded_ips = "192.168.1.50, 100.64.0.0/10".to_owned();
+        state.save_settings_dialog();
+
+        assert_eq!(state.active_dialog, ActiveDialog::None);
+        assert!(state.client_config.allow_lan_access);
+        assert_eq!(
+            state.client_config.excluded_ips,
+            "192.168.1.50/32, 100.64.0.0/10"
+        );
+        let toast_text = state
+            .info_toast
+            .as_ref()
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(
+            toast_text.contains("kết nối lại"),
+            "active tunnel save should prompt user to reconnect: {toast_text}"
+        );
+        assert!(state.drain_commands().iter().any(|c| matches!(
+            c,
+            UiCommand::SaveClientConfig { config }
+                if config.allow_lan_access && config.excluded_ips == "192.168.1.50/32, 100.64.0.0/10"
+        )));
     }
 
     #[test]

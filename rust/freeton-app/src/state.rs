@@ -29,9 +29,9 @@ use freeton_core::updater::{
     UpdateInfo,
 };
 use freeton_core::wg::{
-    validate_address_list, validate_and_build_conf, validate_dns_list, validate_port_str,
-    validate_wg_key, ActiveTunnelInfo, ServiceRequest, ServiceResponse, TunnelHealthState,
-    DEFAULT_TUNNEL_NAME, SERVICE_PIPE_NAME,
+    compute_allowed_ips, validate_address_list, validate_and_build_conf, validate_dns_list,
+    validate_excluded_ips_list, validate_port_str, validate_wg_key, ActiveTunnelInfo,
+    ServiceRequest, ServiceResponse, TunnelHealthState, DEFAULT_TUNNEL_NAME, SERVICE_PIPE_NAME,
 };
 use freeton_core::{APP_NAME, APP_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -614,6 +614,8 @@ pub struct SettingsDraft {
     pub address: String,
     pub dns: String,
     pub port: String,
+    pub allow_lan_access: bool,
+    pub excluded_ips: String,
     pub custom_update_url: String,
     pub original_private_key: String,
     pub imported_from_conf: bool,
@@ -632,6 +634,8 @@ impl SettingsDraft {
             address: cfg.address.clone(),
             dns: cfg.dns.clone(),
             port: cfg.port.clone(),
+            allow_lan_access: cfg.allow_lan_access,
+            excluded_ips: cfg.excluded_ips.clone(),
             custom_update_url: cfg.custom_update_url.clone(),
             original_private_key: cfg.private_key.clone(),
             imported_from_conf: false,
@@ -1380,6 +1384,44 @@ impl AppState {
             }
         };
 
+        let normalized_excluded = match validate_excluded_ips_list(&self.settings_draft.excluded_ips)
+        {
+            Ok(list) => list,
+            Err(err) => {
+                let msg = format!(
+                    "❌ Danh sách IP/CIDR loại trừ không hợp lệ (vd 192.168.1.0/24, 100.64.0.0/10): {err}"
+                );
+                self.settings_status_msg = Some(StatusNotice {
+                    text: msg.clone(),
+                    level: NoticeLevel::Error,
+                });
+                self.info_toast = Some(StatusNotice {
+                    text: msg,
+                    level: NoticeLevel::Error,
+                });
+                return;
+            }
+        };
+        if let Err(err) =
+            compute_allowed_ips(self.settings_draft.allow_lan_access, &normalized_excluded, &cfg.dns)
+        {
+            let msg = format!("❌ Cấu hình định tuyến AllowedIPs không hợp lệ: {err}");
+            self.settings_status_msg = Some(StatusNotice {
+                text: msg.clone(),
+                level: NoticeLevel::Error,
+            });
+            self.info_toast = Some(StatusNotice {
+                text: msg,
+                level: NoticeLevel::Error,
+            });
+            return;
+        }
+
+        let routing_changed = cfg.allow_lan_access != self.settings_draft.allow_lan_access
+            || cfg.excluded_ips != normalized_excluded;
+        cfg.allow_lan_access = self.settings_draft.allow_lan_access;
+        cfg.excluded_ips = normalized_excluded;
+
         let custom_update_raw = self.settings_draft.custom_update_url.trim();
         cfg.custom_update_url = if custom_update_raw.is_empty() {
             String::new()
@@ -1417,8 +1459,13 @@ impl AppState {
         self.settings_status_msg = None;
         self.return_dialog = None;
         self.active_dialog = ActiveDialog::None;
+        let toast_text = if self.tunnel_running && routing_changed {
+            "Đã lưu cài đặt! Ngắt và kết nối lại VPN để áp dụng dải IP loại trừ mới.".to_owned()
+        } else {
+            "Đã lưu và áp dụng cài đặt thành công!".to_owned()
+        };
         self.info_toast = Some(StatusNotice {
-            text: "Đã lưu và áp dụng cài đặt thành công!".to_owned(),
+            text: toast_text,
             level: NoticeLevel::Success,
         });
         info!(
@@ -1427,6 +1474,8 @@ impl AppState {
             auto_check_update = self.client_config.auto_check_update,
             port = %self.client_config.port,
             dns = %self.client_config.dns,
+            allow_lan_access = self.client_config.allow_lan_access,
+            excluded_ips = %self.client_config.excluded_ips,
             dev_mode = self.client_config.debug_mode,
             "Settings saved"
         );
