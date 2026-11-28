@@ -1608,6 +1608,7 @@ mod tests {
             address: "10.2.0.2/32".to_owned(),
             dns: "10.2.0.1, 1.1.1.1".to_owned(),
             port: 51820,
+            allowed_ips: "0.0.0.0/0".to_owned(),
         }
     }
 

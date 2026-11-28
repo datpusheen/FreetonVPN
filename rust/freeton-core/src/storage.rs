@@ -244,6 +244,10 @@ pub struct ClientConfig {
     pub debug_mode: bool,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub custom_update_url: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub allow_lan_access: bool,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub excluded_ips: String,
 }
 
 impl Default for ClientConfig {
@@ -259,6 +263,8 @@ impl Default for ClientConfig {
             auto_check_update: true,
             debug_mode: false,
             custom_update_url: String::new(),
+            allow_lan_access: false,
+            excluded_ips: String::new(),
         }
     }
 }
@@ -1195,6 +1201,21 @@ mod tests {
             decoded.custom_update_url,
             "http://127.0.0.1:8080/version-rust.json"
         );
+    }
+
+    #[test]
+    fn test_client_config_lan_bypass_and_excluded_ips_roundtrip_and_default() {
+        let legacy: ClientConfig = serde_json::from_str("{}").expect("deserialize empty legacy");
+        assert!(!legacy.allow_lan_access);
+        assert!(legacy.excluded_ips.is_empty());
+
+        let mut cfg = ClientConfig::default();
+        cfg.allow_lan_access = true;
+        cfg.excluded_ips = "192.168.1.0/24, 100.64.0.0/10".to_owned();
+        let encoded = serde_json::to_string(&cfg).expect("serialize");
+        let decoded: ClientConfig = serde_json::from_str(&encoded).expect("deserialize");
+        assert!(decoded.allow_lan_access);
+        assert_eq!(decoded.excluded_ips, "192.168.1.0/24, 100.64.0.0/10");
     }
 
     #[test]

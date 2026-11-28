@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::io;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
@@ -24,6 +24,18 @@ pub const DEFAULT_WG_MTU: u16 = 1380;
 
 /// WireGuard `AllowedIPs` value routing IPv4 traffic through the tunnel.
 pub const DEFAULT_WG_ALLOWED_IPS: &str = "0.0.0.0/0";
+
+/// RFC1918 + link-local IPv4 ranges excluded when "Cho phép truy cập mạng LAN nội bộ" is enabled.
+pub const LAN_BYPASS_CIDRS: &[&str] = &[
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+];
+
+fn default_wg_allowed_ips() -> String {
+    DEFAULT_WG_ALLOWED_IPS.to_owned()
+}
 
 /// WireGuard `PersistentKeepalive` interval in seconds.
 pub const DEFAULT_WG_PERSISTENT_KEEPALIVE: u16 = 25;
@@ -53,6 +65,8 @@ pub struct ValidatedTunnelSpec {
     pub address: String,
     pub dns: String,
     pub port: u16,
+    #[serde(default = "default_wg_allowed_ips")]
+    pub allowed_ips: String,
 }
 
 /// Commands sent from `freeton-app` to `FreetonVPNService` over `SERVICE_PIPE_NAME`.
@@ -206,6 +220,193 @@ pub fn validate_dns_list(raw: &str) -> Result<String, WgError> {
     Ok(normalized.join(", "))
 }
 
+fn parse_ipv4_cidr_range(token: &str) -> Result<(u64, u64, String), WgError> {
+    if token.is_empty() || token.chars().any(char::is_whitespace) {
+        return Err(WgError::InvalidInput(format!(
+            "invalid IP/CIDR entry: {token:?}"
+        )));
+    }
+    let (ip, prefix) = parse_cidr_ip(token)
+        .ok_or_else(|| WgError::InvalidInput(format!("invalid IP/CIDR entry: {token:?}")))?;
+    let IpAddr::V4(v4) = ip else {
+        return Err(WgError::InvalidInput(
+            "IPv6 không được hỗ trợ trong danh sách loại trừ; chỉ nhập IPv4 hoặc CIDR IPv4"
+                .to_owned(),
+        ));
+    };
+    let prefix = prefix.unwrap_or(32);
+    let mask = if prefix == 0 {
+        0u32
+    } else {
+        !0u32 << (32 - prefix)
+    };
+    let net = u32::from(v4) & mask;
+    let start = u64::from(net);
+    let size = 1u64 << (32 - prefix);
+    Ok((start, start + size, format!("{}/{prefix}", Ipv4Addr::from(net))))
+}
+
+fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+    ranges.sort_unstable();
+    let mut merged = Vec::with_capacity(ranges.len());
+    let mut cur = ranges[0];
+    for &(s, e) in &ranges[1..] {
+        if s <= cur.1 {
+            cur.1 = cur.1.max(e);
+        } else {
+            merged.push(cur);
+            cur = (s, e);
+        }
+    }
+    merged.push(cur);
+    merged
+}
+
+fn subtract_ranges(base: (u64, u64), excluded: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut cursor = base.0;
+    for &(ex_s, ex_e) in excluded {
+        if ex_e <= cursor {
+            continue;
+        }
+        if ex_s >= base.1 {
+            break;
+        }
+        if ex_s > cursor {
+            out.push((cursor, ex_s.min(base.1)));
+        }
+        cursor = cursor.max(ex_e);
+        if cursor >= base.1 {
+            break;
+        }
+    }
+    if cursor < base.1 {
+        out.push((cursor, base.1));
+    }
+    out
+}
+
+fn ranges_to_cidrs(ranges: &[(u64, u64)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for &(mut start, end) in ranges {
+        while start < end {
+            let remaining = end - start;
+            let max_align = if start == 0 {
+                1u64 << 32
+            } else {
+                1u64 << start.trailing_zeros().min(32)
+            };
+            let max_fit = 1u64 << (63 - remaining.leading_zeros());
+            let block = max_align.min(max_fit);
+            let prefix = 32 - block.trailing_zeros();
+            out.push(format!("{}/{prefix}", Ipv4Addr::from(start as u32)));
+            start += block;
+        }
+    }
+    out
+}
+
+/// Validates and normalizes comma-separated IPv4/CIDR entries that bypass the VPN tunnel.
+pub fn validate_excluded_ips_list(raw: &str) -> Result<String, WgError> {
+    reject_control_chars("excluded_ips", raw)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    let mut normalized = Vec::new();
+    for item in trimmed.split(',') {
+        let token = item.trim();
+        let (start, end, canonical) = parse_ipv4_cidr_range(token)?;
+        if start == 0 && end == (1u64 << 32) {
+            return Err(WgError::InvalidInput(
+                "Không thể loại trừ toàn bộ 0.0.0.0/0".to_owned(),
+            ));
+        }
+        normalized.push(canonical);
+    }
+    Ok(normalized.join(", "))
+}
+
+/// Validates a comma-separated WireGuard `AllowedIPs` CIDR list against malformed tokens or injection.
+pub fn validate_allowed_ips_list(raw: &str) -> Result<String, WgError> {
+    reject_control_chars("allowed_ips", raw)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(WgError::InvalidInput(
+            "allowed_ips must contain at least one CIDR".to_owned(),
+        ));
+    }
+    let mut normalized = Vec::new();
+    for item in trimmed.split(',') {
+        let token = item.trim();
+        let (ip, prefix) = parse_cidr_ip(token).ok_or_else(|| {
+            WgError::InvalidInput(format!("invalid WireGuard AllowedIPs entry: {token:?}"))
+        })?;
+        match (ip, prefix) {
+            (IpAddr::V4(v4), p) => {
+                let len = p.unwrap_or(32);
+                let mask = if len == 0 { 0u32 } else { !0u32 << (32 - len) };
+                let net = Ipv4Addr::from(u32::from(v4) & mask);
+                normalized.push(format!("{net}/{len}"));
+            }
+            (IpAddr::V6(v6), p) => {
+                let len = p.unwrap_or(128);
+                normalized.push(format!("{v6}/{len}"));
+            }
+        }
+    }
+    Ok(normalized.join(", "))
+}
+
+/// Computes the WireGuard `AllowedIPs` CIDR list from LAN bypass + custom exclusions, while always
+/// keeping configured IPv4 DNS resolvers (e.g. Proton's `10.2.0.1`) inside the tunnel.
+pub fn compute_allowed_ips(
+    allow_lan_access: bool,
+    excluded_ips: &str,
+    dns_list: &str,
+) -> Result<String, WgError> {
+    let normalized_excluded = validate_excluded_ips_list(excluded_ips)?;
+    if !allow_lan_access && normalized_excluded.is_empty() {
+        return Ok(DEFAULT_WG_ALLOWED_IPS.to_owned());
+    }
+
+    let mut excluded_ranges = Vec::new();
+    if allow_lan_access {
+        for &cidr in LAN_BYPASS_CIDRS {
+            let (s, e, _) = parse_ipv4_cidr_range(cidr)?;
+            excluded_ranges.push((s, e));
+        }
+    }
+    if !normalized_excluded.is_empty() {
+        for item in normalized_excluded.split(',') {
+            let (s, e, _) = parse_ipv4_cidr_range(item.trim())?;
+            excluded_ranges.push((s, e));
+        }
+    }
+
+    let merged_excluded = merge_ranges(excluded_ranges);
+    let mut allowed_ranges = subtract_ranges((0, 1u64 << 32), &merged_excluded);
+    if allowed_ranges.is_empty() {
+        return Err(WgError::InvalidInput(
+            "Danh sách IP loại trừ không được phủ toàn bộ 0.0.0.0/0".to_owned(),
+        ));
+    }
+
+    // Re-include configured IPv4 DNS servers (such as Proton's internal 10.2.0.1 inside 10.0.0.0/8)
+    // so VPN DNS queries and tunnel health checks still traverse WireGuard.
+    for token in dns_list.split(',') {
+        if let Ok(v4) = token.trim().parse::<Ipv4Addr>() {
+            let u = u64::from(u32::from(v4));
+            allowed_ranges.push((u, u + 1));
+        }
+    }
+    let merged_allowed = merge_ranges(allowed_ranges);
+    Ok(ranges_to_cidrs(&merged_allowed).join(", "))
+}
+
 pub fn validate_port_str(raw: &str) -> Result<u16, WgError> {
     reject_control_chars("port", raw)?;
     let trimmed = raw.trim();
@@ -313,6 +514,11 @@ fn normalize_and_validate_spec(
     let private_key = validate_wg_key("private_key", &spec.private_key)?;
     let address = validate_address_list(&spec.address)?;
     let dns = validate_dns_list(&spec.dns)?;
+    let allowed_ips = if spec.allowed_ips.trim().is_empty() {
+        DEFAULT_WG_ALLOWED_IPS.to_owned()
+    } else {
+        validate_allowed_ips_list(&spec.allowed_ips)?
+    };
 
     let normalized = ValidatedTunnelSpec {
         server_name,
@@ -324,6 +530,7 @@ fn normalize_and_validate_spec(
         address,
         dns,
         port: spec.port,
+        allowed_ips,
     };
 
     let display_server_name = if normalized.server_name.is_empty() {
@@ -352,7 +559,7 @@ fn normalize_and_validate_spec(
          \n\
          [Peer]\n\
          PublicKey = {}\n\
-         AllowedIPs = {DEFAULT_WG_ALLOWED_IPS}\n\
+         AllowedIPs = {}\n\
          Endpoint = {endpoint}\n\
          PersistentKeepalive = {DEFAULT_WG_PERSISTENT_KEEPALIVE}\n",
         normalized.domain,
@@ -361,6 +568,7 @@ fn normalize_and_validate_spec(
         normalized.address,
         normalized.dns,
         normalized.server_pubkey,
+        normalized.allowed_ips,
     );
 
     Ok((normalized, conf))
@@ -391,6 +599,7 @@ pub fn validate_and_build_conf(
     reject_control_chars("config.address", &config.address)?;
     reject_control_chars("config.dns", &config.dns)?;
     reject_control_chars("config.port", &config.port)?;
+    reject_control_chars("config.excluded_ips", &config.excluded_ips)?;
 
     let endpoint_raw = if !server.entry_ip.trim().is_empty() {
         server.entry_ip.trim()
@@ -418,6 +627,7 @@ pub fn validate_and_build_conf(
         config.port.trim()
     };
     let port = validate_port_str(port_raw)?;
+    let allowed_ips = compute_allowed_ips(config.allow_lan_access, &config.excluded_ips, dns_raw)?;
 
     let candidate = ValidatedTunnelSpec {
         server_name: server.name.clone(),
@@ -429,6 +639,7 @@ pub fn validate_and_build_conf(
         address: address_raw.to_owned(),
         dns: dns_raw.to_owned(),
         port,
+        allowed_ips,
     };
 
     normalize_and_validate_spec(&candidate)
@@ -1293,5 +1504,120 @@ mod tests {
                 serde_json::from_str(&json).expect("deserialize response");
             assert_eq!(decoded, resp);
         }
+    }
+
+    fn cidr_list_contains(list: &str, ip: Ipv4Addr) -> bool {
+        let addr = u32::from(ip);
+        list.split(',').any(|tok| {
+            let tok = tok.trim();
+            let Some((ip_s, p_s)) = tok.split_once('/') else {
+                return false;
+            };
+            let Ok(net) = ip_s.parse::<Ipv4Addr>() else {
+                return false;
+            };
+            let Ok(prefix) = p_s.parse::<u32>() else {
+                return false;
+            };
+            let mask = if prefix == 0 {
+                0
+            } else {
+                !0u32 << (32 - prefix)
+            };
+            (addr & mask) == (u32::from(net) & mask)
+        })
+    }
+
+    #[test]
+    fn test_compute_allowed_ips_default_and_lan_bypass_preserves_proton_dns() {
+        assert_eq!(
+            compute_allowed_ips(false, "", "10.2.0.1, 1.1.1.1").expect("default"),
+            "0.0.0.0/0"
+        );
+
+        let allowed =
+            compute_allowed_ips(true, "", "10.2.0.1, 1.1.1.1").expect("lan bypass allowed IPs");
+        assert_ne!(allowed, "0.0.0.0/0");
+        // Private LAN subnets are excluded
+        for lan_ip in [
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(172, 16, 0, 10),
+            Ipv4Addr::new(169, 254, 1, 2),
+        ] {
+            assert!(
+                !cidr_list_contains(&allowed, lan_ip),
+                "{lan_ip} must bypass VPN in AllowedIPs: {allowed}"
+            );
+        }
+        // Proton internal DNS inside 10.0.0.0/8 + public internet MUST remain routed via VPN
+        for vpn_ip in [
+            Ipv4Addr::new(10, 2, 0, 1),
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(8, 8, 8, 8),
+        ] {
+            assert!(
+                cidr_list_contains(&allowed, vpn_ip),
+                "{vpn_ip} must stay routed via VPN: {allowed}"
+            );
+        }
+
+        // Verify conf generation emits computed AllowedIPs
+        let mut cfg = sample_config();
+        cfg.allow_lan_access = true;
+        let (spec, conf) =
+            validate_and_build_conf(&sample_server(), &cfg).expect("build with LAN bypass");
+        assert_eq!(spec.allowed_ips, allowed);
+        assert!(conf.contains(&format!("AllowedIPs = {allowed}\n")));
+    }
+
+    #[test]
+    fn test_compute_allowed_ips_custom_cidrs_and_rejects_full_exclusion_or_ipv6() {
+        let allowed = compute_allowed_ips(false, "192.168.1.50, 100.64.0.0/10", "10.2.0.1")
+            .expect("custom excluded IPs");
+        assert!(!cidr_list_contains(&allowed, Ipv4Addr::new(192, 168, 1, 50)));
+        assert!(!cidr_list_contains(&allowed, Ipv4Addr::new(100, 64, 5, 1)));
+        assert!(cidr_list_contains(&allowed, Ipv4Addr::new(192, 168, 1, 51)));
+        assert!(cidr_list_contains(&allowed, Ipv4Addr::new(10, 2, 0, 1)));
+
+        for bad in [
+            "0.0.0.0/0",
+            "0.0.0.0/1, 128.0.0.0/1",
+            "::1/128",
+            "192.168.1.1\nPostUp = calc.exe",
+            "192.168.1.1, ",
+        ] {
+            assert!(
+                compute_allowed_ips(false, bad, "10.2.0.1").is_err(),
+                "invalid excluded_ips {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validated_tunnel_spec_legacy_json_defaults_allowed_ips_and_rejects_injection() {
+        let legacy_json = serde_json::json!({
+            "server_name": "JP-FREE#1",
+            "country": "JP",
+            "domain": "node-jp-01.protonvpn.net",
+            "entry_ip": "192.0.2.1",
+            "server_pubkey": sample_b64_key(0xAB),
+            "private_key": sample_b64_key(0x22),
+            "address": "10.2.0.2/32",
+            "dns": "10.2.0.1",
+            "port": 51820
+        })
+        .to_string();
+        let spec: ValidatedTunnelSpec =
+            serde_json::from_str(&legacy_json).expect("legacy spec deserializes");
+        assert_eq!(spec.allowed_ips, "0.0.0.0/0");
+        assert!(validate_tunnel_spec(&spec).is_ok());
+
+        let mut injected = spec;
+        injected.allowed_ips = "0.0.0.0/0\nPostUp = evil".to_owned();
+        assert!(matches!(
+            validate_tunnel_spec(&injected),
+            Err(WgError::InvalidInput(_))
+        ));
     }
 }
