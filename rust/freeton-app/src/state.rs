@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use freeton_core::api::{
     ApiError, HumanVerificationChallenge, HumanVerificationToken, LoginOutcome, ProtonClient,
-    ServerNode,
+    ServerNode, UserLocation,
 };
 use freeton_core::logging::{
     app_log_dir, build_realtime_log_viewer_script, clean_display_path,
@@ -19,9 +19,9 @@ use freeton_core::logging::{
 };
 use freeton_core::ping::{ping_servers, score_server, sort_and_filter_servers, SortMode};
 use freeton_core::storage::{
-    ClientConfig, CredentialStore, ServerCacheManager, StartupManager, StorageError,
-    StoredAuthSession, WindowsCredentialStore, DEFAULT_WG_ADDRESS, DEFAULT_WG_DNS, DEFAULT_WG_PORT,
-    KEYRING_ACCOUNT_WG_CONFIG, KEYRING_SERVICE_WG,
+    read_windows_geo_country_code, ClientConfig, CredentialStore, ServerCacheManager,
+    StartupManager, StorageError, StoredAuthSession, WindowsCredentialStore, DEFAULT_WG_ADDRESS,
+    DEFAULT_WG_DNS, DEFAULT_WG_PORT, KEYRING_ACCOUNT_WG_CONFIG, KEYRING_SERVICE_WG,
 };
 use freeton_core::updater::{
     download_and_verify_update, expected_part_filename, fetch_custom_update_info,
@@ -58,6 +58,27 @@ pub const LOADING_HIDE_DELAY: Duration = Duration::from_millis(1400);
 pub const DEFAULT_PING_TIMEOUT_MS: u32 = 800;
 pub const DEFAULT_PING_WORKERS: usize = 16;
 pub const MAX_IPC_RESPONSE_BYTES: usize = 256 * 1024;
+
+pub fn resolve_offline_user_location(geo_country: Option<&str>) -> UserLocation {
+    if let Some(raw) = geo_country {
+        let code = raw.trim().to_ascii_uppercase();
+        if !code.is_empty() {
+            if let Some((lat, lon)) = crate::ui::globe_data::fallback_country_coords(&code) {
+                return UserLocation {
+                    country: Some(code),
+                    lat,
+                    lon,
+                };
+            }
+        }
+    }
+    let (lat, lon) = crate::ui::globe_data::DEFAULT_ORIGIN_COORDS;
+    UserLocation {
+        country: Some("VN".to_owned()),
+        lat,
+        lon,
+    }
+}
 const PIPE_CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 const PIPE_CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 const PIPE_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -663,6 +684,7 @@ pub enum UiCommand {
     },
     StartScan {
         auth_generation: u64,
+        fetch_location: bool,
     },
     EnsureWgKey {
         auth_generation: u64,
@@ -757,6 +779,10 @@ pub enum WorkerEvent {
     },
     ScanNeedsLogin {
         auth_generation: u64,
+    },
+    UserLocationDetected {
+        auth_generation: u64,
+        location: UserLocation,
     },
     SessionExpired {
         auth_generation: u64,
@@ -972,6 +998,7 @@ pub struct AppState {
     pub user_has_custom_dragged: bool,
     pub drawer_scroll_to_top: bool,
     pub globe: crate::ui::globe::GlobeState,
+    pub user_location: UserLocation,
     auth_generation_shared: Arc<AtomicU64>,
     last_status_poll: Instant,
     startup_update_checked: bool,
@@ -1077,6 +1104,9 @@ impl AppState {
             user_has_custom_dragged: false,
             drawer_scroll_to_top: false,
             globe: crate::ui::globe::GlobeState::default(),
+            user_location: resolve_offline_user_location(
+                read_windows_geo_country_code().as_deref(),
+            ),
             auth_generation_shared,
             last_status_poll: now,
             startup_update_checked: false,
@@ -1602,6 +1632,9 @@ impl AppState {
         self.show_loading_status("● Đang kết nối Proton API & lấy danh sách máy chủ...", 0.1);
         self.pending_commands.push(UiCommand::StartScan {
             auth_generation: self.auth_generation,
+            fetch_location: !self.tunnel_running
+                && !self.is_connecting_vpn
+                && !self.is_disconnecting_vpn,
         });
     }
 
@@ -1731,6 +1764,8 @@ impl AppState {
         self.active_account = None;
         self.live_public_ip = None;
         self.vpn_connect_time_unix = None;
+        self.user_location =
+            resolve_offline_user_location(read_windows_geo_country_code().as_deref());
         self.active_dialog = ActiveDialog::None;
         self.info_toast = Some(toast);
         self.show_login_view();
@@ -2104,6 +2139,20 @@ impl AppState {
                     detail,
                 });
                 self.active_dialog = ActiveDialog::ErrorDetail;
+            }
+            WorkerEvent::UserLocationDetected {
+                auth_generation,
+                location,
+            } => {
+                if auth_generation == self.auth_generation
+                    && self.is_logged_in
+                    && !self.tunnel_running
+                    && !self.is_connecting_vpn
+                    && !self.is_disconnecting_vpn
+                    && !self.closing
+                {
+                    self.user_location = location;
+                }
             }
             WorkerEvent::ScanNeedsLogin { auth_generation } => {
                 if auth_generation != self.auth_generation || self.closing {
@@ -2852,8 +2901,11 @@ pub async fn handle_ui_command(
             )
             .await;
         }
-        UiCommand::StartScan { auth_generation } => {
-            handle_scan(&deps, auth_generation, tx, wake).await;
+        UiCommand::StartScan {
+            auth_generation,
+            fetch_location,
+        } => {
+            handle_scan(&deps, auth_generation, fetch_location, tx, wake).await;
         }
         UiCommand::EnsureWgKey {
             auth_generation,
@@ -3277,6 +3329,7 @@ fn handle_session_expired(
 async fn handle_scan(
     deps: &WorkerDeps,
     auth_generation: u64,
+    fetch_location: bool,
     tx: &mpsc::UnboundedSender<WorkerEvent>,
     wake: &(dyn Fn() + Send + Sync),
 ) {
@@ -3325,6 +3378,26 @@ async fn handle_scan(
 
     if !deps.is_auth_current(auth_generation) {
         return;
+    }
+
+    if fetch_location {
+        match deps.proton.fetch_user_location().await {
+            Ok(location) => {
+                if deps.is_auth_current(auth_generation) {
+                    emit(
+                        tx,
+                        wake,
+                        WorkerEvent::UserLocationDetected {
+                            auth_generation,
+                            location,
+                        },
+                    );
+                }
+            }
+            Err(err) => {
+                debug!(error = %err, "fetch_user_location skipped; keeping fallback");
+            }
+        }
     }
 
     let last_emit = std::sync::Mutex::new(Instant::now() - Duration::from_secs(1));
@@ -5014,7 +5087,10 @@ mod tests {
         let scan_task = tokio::spawn(async move {
             handle_ui_command(
                 deps_scan,
-                UiCommand::StartScan { auth_generation: 1 },
+                UiCommand::StartScan {
+                    auth_generation: 1,
+                    fetch_location: false,
+                },
                 &tx_scan,
                 &|| {},
             )
@@ -5791,7 +5867,7 @@ mod tests {
         let auth_gen = deps.auth_generation.load(Ordering::Acquire);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        handle_scan(&deps, auth_gen, &tx, &|| {}).await;
+        handle_scan(&deps, auth_gen, false, &tx, &|| {}).await;
         server_task.abort();
 
         let mut events = Vec::new();
@@ -5871,5 +5947,102 @@ mod tests {
         let dir_calls = shell.opened_dirs.lock().expect("dir calls");
         assert_eq!(dir_calls.len(), 1);
         assert_eq!(dir_calls[0], app_log_dir());
+    }
+
+    #[test]
+    fn test_resolve_offline_user_location_maps_known_country_and_falls_back_to_vietnam() {
+        let jp = resolve_offline_user_location(Some("jp"));
+        assert_eq!(jp.country.as_deref(), Some("JP"));
+        assert!((jp.lat - 35.6762).abs() < 1e-2);
+
+        let unknown = resolve_offline_user_location(Some("ZZ"));
+        assert_eq!(unknown.country.as_deref(), Some("VN"));
+        assert!(
+            (unknown.lat - crate::ui::globe_data::DEFAULT_ORIGIN_COORDS.0).abs() < 1e-4
+                && (unknown.lon - crate::ui::globe_data::DEFAULT_ORIGIN_COORDS.1).abs() < 1e-4
+        );
+
+        let missing = resolve_offline_user_location(None);
+        assert_eq!(missing.country.as_deref(), Some("VN"));
+    }
+
+    #[test]
+    fn test_user_location_event_ignored_when_tunnel_running_or_connecting_or_stale_auth() {
+        let mut state = AppState::new(
+            true,
+            Some("u@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            Vec::new(),
+        );
+        let original = state.user_location.clone();
+        let exit_us = freeton_core::api::UserLocation {
+            country: Some("US".to_owned()),
+            lat: 39.8,
+            lon: -98.5,
+        };
+
+        // 1. Tunnel running -> MUST NOT overwrite real origin
+        state.tunnel_running = true;
+        state.apply_event(WorkerEvent::UserLocationDetected {
+            auth_generation: state.auth_generation,
+            location: exit_us.clone(),
+        });
+        assert_eq!(state.user_location, original);
+
+        // 2. Connecting -> MUST NOT overwrite
+        state.tunnel_running = false;
+        state.is_connecting_vpn = true;
+        state.apply_event(WorkerEvent::UserLocationDetected {
+            auth_generation: state.auth_generation,
+            location: exit_us.clone(),
+        });
+        assert_eq!(state.user_location, original);
+
+        // 3. Stale auth generation -> MUST NOT overwrite
+        state.is_connecting_vpn = false;
+        state.apply_event(WorkerEvent::UserLocationDetected {
+            auth_generation: state.auth_generation + 99,
+            location: exit_us.clone(),
+        });
+        assert_eq!(state.user_location, original);
+
+        // 4. Current auth & idle -> SHOULD update
+        state.apply_event(WorkerEvent::UserLocationDetected {
+            auth_generation: state.auth_generation,
+            location: exit_us.clone(),
+        });
+        assert_eq!(state.user_location, exit_us);
+    }
+
+    #[test]
+    fn test_start_scan_sets_fetch_location_false_while_tunnel_running() {
+        let mut state = AppState::new(
+            true,
+            Some("u@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            Vec::new(),
+        );
+        let initial_cmds = state.drain_commands();
+        assert!(initial_cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::StartScan {
+                fetch_location: true,
+                ..
+            }
+        )));
+
+        state.is_scanning = false;
+        state.tunnel_running = true;
+        state.start_scan();
+        let active_cmds = state.drain_commands();
+        assert!(active_cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::StartScan {
+                fetch_location: false,
+                ..
+            }
+        )));
     }
 }
