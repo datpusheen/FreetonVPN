@@ -252,11 +252,8 @@ pub fn render_dialog_overlay(
         state.close_dialog();
     }
 
-    let anim_dur = if state.client_config.animations_enabled {
-        0.17
-    } else {
-        0.0
-    };
+    let anim_on = state.client_config.animations_enabled;
+    let anim_dur = if anim_on { 0.17 } else { 0.0 };
     let is_open = state.active_dialog != ActiveDialog::None;
     let open_t =
         ctx.animate_bool_with_time(egui::Id::unique("freeton_dialog_open_t"), is_open, anim_dur);
@@ -280,16 +277,17 @@ pub fn render_dialog_overlay(
         return;
     };
 
-    if (is_open && open_t < 1.0) || (!is_open && open_t > 0.0) {
+    if anim_on && state.window_visible && ((is_open && open_t < 1.0) || (!is_open && open_t > 0.0)) {
         ctx.request_repaint();
     }
-    let eased = 1.0 - (1.0 - open_t).powi(3);
+    let eased = crate::ui::modal_ease(open_t, is_open);
     let backdrop_alpha = (185.0 * eased).round().clamp(0.0, 255.0) as u8;
-    let slide_y = 10.0 * (1.0 - eased);
+    let slide_y = 8.0 * (1.0 - eased);
 
     let screen_rect = ctx.content_rect();
     egui::Area::new(egui::Id::unique("dialog_backdrop"))
         .order(egui::Order::Middle)
+        .interactable(is_open)
         .fixed_pos(screen_rect.min)
         .show(ctx, |ui| {
             let sense = if is_open {
@@ -304,13 +302,11 @@ pub fn render_dialog_overlay(
 
     egui::Area::new(egui::Id::unique("dialog_card"))
         .order(egui::Order::Foreground)
+        .interactable(is_open)
         .anchor(egui::Align2::CENTER_CENTER, Vec2::new(0.0, slide_y))
         .show(ctx, |ui| {
             ui.set_max_width(356.0);
             ui.set_max_height(574.0);
-            if !is_open {
-                ui.disable();
-            }
             ui.set_opacity(eased);
             rounded_card(ui, C_CARD, C_BORDER, 14, Margin::same(14), |ui| {
                 ui.set_width(326.0);
@@ -325,6 +321,11 @@ pub fn render_dialog_overlay(
                 }
             })
         });
+
+    let still_open = state.active_dialog != ActiveDialog::None;
+    if is_open != still_open && state.window_visible && state.client_config.animations_enabled {
+        ctx.request_repaint();
+    }
 }
 
 fn render_logout_confirm_dialog(ui: &mut Ui, state: &mut AppState, store: &dyn CredentialStore) {

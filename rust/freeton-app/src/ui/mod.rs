@@ -377,6 +377,50 @@ pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     )
 }
 
+pub(crate) fn modal_ease(t: f32, entering: bool) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    if entering {
+        1.0 - (1.0 - t).powi(3)
+    } else {
+        t * t
+    }
+}
+
+/// Renders a flow banner slot whose occupied height and opacity collapse smoothly during enter/exit.
+fn render_collapsible_slot(
+    ui: &mut Ui,
+    height_id: egui::Id,
+    default_h: f32,
+    t: f32,
+    height_frac: f32,
+    opacity_frac: f32,
+    add_contents: impl FnOnce(&mut Ui) -> f32,
+) {
+    let measured_h = if t >= 0.999 {
+        add_contents(ui)
+    } else {
+        let cached_h = ui
+            .ctx()
+            .data(|d| d.get_temp::<f32>(height_id))
+            .unwrap_or(default_h)
+            .max(1.0);
+        let vis_h = (cached_h * height_frac).max(0.0);
+        let row_w = ui.available_width();
+        let (slot, _) = ui.allocate_exact_size(Vec2::new(row_w, vis_h), Sense::hover());
+        let inner_rect = Rect::from_min_size(slot.min, Vec2::new(slot.width(), cached_h));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
+            ui.set_clip_rect(slot);
+            ui.set_opacity(opacity_frac);
+            add_contents(ui)
+        })
+        .inner
+    };
+    if measured_h > 1.0 {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(height_id, measured_h));
+    }
+}
+
 pub fn open_external_url(url: &str) {
     if let Err(err) = WindowsShellLauncher::open_https_url_direct(url) {
         warn!(url = %url, error = %err, "rejected or failed opening external URL");
@@ -416,50 +460,67 @@ pub fn render_root(ui: &mut Ui, state: &mut AppState, store: &dyn CredentialStor
         .show(ui, |ui| {
             render_top_bar(&ctx, ui, state);
 
-            // Loading bar with symmetric enter/exit animation.
+            // Loading bar with smooth height collapse & symmetric enter/exit animation.
+            let loading_entering = state.loading.visible;
             let loading_t = ctx.animate_bool_with_time(
                 egui::Id::unique("freeton_loading_visible_t"),
-                state.loading.visible,
+                loading_entering,
                 if anim_on { 0.16 } else { 0.0 },
             );
             let loading_text_id = egui::Id::unique("freeton_loading_cached_text");
-            if state.loading.visible {
+            let loading_height_id = egui::Id::unique("freeton_loading_cached_height");
+            if loading_entering {
                 ctx.data_mut(|d| d.insert_temp(loading_text_id, state.loading.text.clone()));
             }
-            let loading_text = if state.loading.visible {
+            let loading_text = if loading_entering {
                 Some(state.loading.text.clone())
             } else if loading_t > 0.0 {
                 ctx.data(|d| d.get_temp::<String>(loading_text_id))
             } else {
-                ctx.data_mut(|d| d.remove::<String>(loading_text_id));
+                ctx.data_mut(|d| {
+                    d.remove::<String>(loading_text_id);
+                    d.remove::<f32>(loading_height_id);
+                });
                 None
             };
-            if (state.loading.visible && loading_t < 1.0)
-                || (!state.loading.visible && loading_t > 0.0)
+            if anim_on
+                && state.window_visible
+                && ((loading_entering && loading_t < 1.0) || (!loading_entering && loading_t > 0.0))
             {
                 ctx.request_repaint();
             }
             if let Some(text) = loading_text {
-                ui.add_space(4.0 * loading_t);
-                ui.scope(|ui| {
-                    if !state.loading.visible {
-                        ui.disable();
-                    }
-                    ui.set_opacity(loading_t);
-                    render_loading_bar(ui, &ctx, state, &text, anim_on);
-                });
-                ui.add_space(6.0 * loading_t);
+                let eased_loading = modal_ease(loading_t, loading_entering);
+                let loading_h_frac = if loading_entering { eased_loading } else { loading_t };
+                ui.add_space(4.0 * loading_h_frac);
+                render_collapsible_slot(
+                    ui,
+                    loading_height_id,
+                    24.0,
+                    loading_t,
+                    loading_h_frac,
+                    eased_loading,
+                    |ui| {
+                        ui.vertical(|ui| render_loading_bar(ui, &ctx, state, &text, anim_on))
+                            .response
+                            .rect
+                            .height()
+                    },
+                );
+                ui.add_space(6.0 * loading_h_frac);
             } else {
                 ui.add_space(4.0);
             }
 
-            // Info toast with symmetric slide + fade enter/exit animation.
+            // Info toast with symmetric padding, directional ease, and smooth height collapse.
+            let toast_entering = state.info_toast.is_some();
             let toast_t = ctx.animate_bool_with_time(
                 egui::Id::unique("freeton_info_toast_t"),
-                state.info_toast.is_some(),
+                toast_entering,
                 if anim_on { 0.18 } else { 0.0 },
             );
             let toast_cache_id = egui::Id::unique("freeton_info_toast_cache");
+            let toast_height_id = egui::Id::unique("freeton_info_toast_height");
             if let Some(toast) = &state.info_toast {
                 ctx.data_mut(|d| d.insert_temp(toast_cache_id, toast.clone()));
             }
@@ -469,68 +530,99 @@ pub fn render_root(ui: &mut Ui, state: &mut AppState, store: &dyn CredentialStor
                 ctx.data(|d| d.get_temp::<crate::state::StatusNotice>(toast_cache_id))
                     .map(|t| (t, false))
             } else {
-                ctx.data_mut(|d| d.remove::<crate::state::StatusNotice>(toast_cache_id));
+                ctx.data_mut(|d| {
+                    d.remove::<crate::state::StatusNotice>(toast_cache_id);
+                    d.remove::<f32>(toast_height_id);
+                });
                 None
             };
-            if (state.info_toast.is_some() && toast_t < 1.0)
-                || (state.info_toast.is_none() && toast_t > 0.0)
+            if anim_on
+                && state.window_visible
+                && ((toast_entering && toast_t < 1.0) || (!toast_entering && toast_t > 0.0))
             {
                 ctx.request_repaint();
             }
             if let Some((toast, interactive)) = rendered_toast {
-                let eased_toast = 1.0 - (1.0 - toast_t).powi(3);
+                let eased_toast = modal_ease(toast_t, toast_entering);
+                let toast_h_frac = if toast_entering { eased_toast } else { toast_t };
                 let color = match toast.level {
                     NoticeLevel::Success => C_SUCCESS,
                     NoticeLevel::Warning => C_WARNING,
                     NoticeLevel::Error => C_DANGER,
                     NoticeLevel::Info => C_ACCENT,
                 };
-                let toast_slide_y = -6.0 * (1.0 - eased_toast);
-                let row_rect = ui.available_rect_before_wrap();
-                let shifted_rect = row_rect.translate(Vec2::new(0.0, toast_slide_y));
-                let resp = ui.scope_builder(egui::UiBuilder::new().max_rect(shifted_rect), |ui| {
-                    ui.set_clip_rect(row_rect);
-                    if !interactive {
-                        ui.disable();
-                    }
-                    ui.set_opacity(eased_toast);
-                    rounded_card(ui, C_SURFACE, color, 8, Margin::symmetric(8, 5), |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            let close_w = 18.0;
-                            let text_w = (ui.available_width() - close_w - 6.0).max(80.0);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(text_w, 0.0),
-                                Layout::top_down(Align::Min),
-                                |ui| {
-                                    ui.set_width(text_w);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&toast.text).size(11.0).color(color),
-                                        )
-                                        .wrap(),
-                                    );
-                                },
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("✕").size(10.0).color(C_TEXT_DIM),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    state.info_toast = None;
-                                }
+                render_collapsible_slot(
+                    ui,
+                    toast_height_id,
+                    32.0,
+                    toast_t,
+                    toast_h_frac,
+                    eased_toast,
+                    |ui| {
+                        rounded_card(ui, C_SURFACE, color, 8, Margin::symmetric(10, 7), |ui| {
+                            let inner_w = ui.available_width();
+                            ui.set_width(inner_w);
+                            ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+                                let gap = 8.0;
+                                ui.spacing_mut().item_spacing.x = gap;
+                                let close_w = 18.0;
+                                let text_w = (inner_w - close_w - gap).max(80.0);
+                                let left_resp = ui.allocate_ui_with_layout(
+                                    Vec2::new(text_w, 0.0),
+                                    Layout::top_down(Align::Min),
+                                    |ui| {
+                                        ui.set_width(text_w);
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&toast.text).size(11.0).color(color),
+                                            )
+                                            .wrap(),
+                                        );
+                                    },
+                                );
+                                let row_h = left_resp.response.rect.height().max(16.0);
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(close_w, row_h),
+                                    Layout::right_to_left(Align::Center),
+                                    |ui| {
+                                        if interactive {
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new("✕")
+                                                            .size(10.0)
+                                                            .color(C_TEXT_DIM),
+                                                    )
+                                                    .frame(false),
+                                                )
+                                                .on_hover_cursor(CursorIcon::PointingHand)
+                                                .clicked()
+                                            {
+                                                state.info_toast = None;
+                                                if anim_on && state.window_visible {
+                                                    ctx.request_repaint();
+                                                }
+                                            }
+                                        } else {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new("✕")
+                                                        .size(10.0)
+                                                        .color(C_TEXT_DIM),
+                                                )
+                                                .selectable(false),
+                                            );
+                                        }
+                                    },
+                                );
                             });
-                        });
-                    });
-                });
-                let _ = resp;
-                ui.add_space(4.0 * eased_toast);
+                        })
+                        .response
+                        .rect
+                        .height()
+                    },
+                );
+                ui.add_space(4.0 * toast_h_frac);
             }
 
             let now = std::time::Instant::now();
@@ -1279,6 +1371,291 @@ mod tests {
         assert!(
             chromatic_pixel_count > 10,
             "expected color emoji rasterization in font atlas (epaint color_fonts), found only {chromatic_pixel_count} chromatic pixels"
+        );
+    }
+
+    #[test]
+    fn test_modal_ease_is_monotonic_and_does_not_stall_on_exit() {
+        let samples = [0.0_f32, 0.2, 0.5, 0.8, 1.0];
+        for entering in [true, false] {
+            let vals: Vec<f32> = samples.iter().map(|&t| super::modal_ease(t, entering)).collect();
+            assert!((vals[0] - 0.0).abs() < 1e-6);
+            assert!((vals[4] - 1.0).abs() < 1e-6);
+            for w in vals.windows(2) {
+                assert!(w[1] > w[0], "modal_ease(entering={entering}) must be monotonic: {vals:?}");
+            }
+        }
+        assert!(super::modal_ease(0.5, true) > 0.8);
+        assert!(
+            super::modal_ease(0.5, false) < 0.35,
+            "exit easing at t=0.5 must drop decisively instead of stalling near 1.0"
+        );
+    }
+
+    #[test]
+    fn test_toast_dismiss_collapses_height_smoothly_and_requests_repaint_immediately() {
+        use crate::state::{AppState, NoticeLevel, StatusNotice};
+        use freeton_core::storage::{ClientConfig, CredentialStore, StorageError};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        struct NoopStore;
+        impl CredentialStore for NoopStore {
+            fn get_password(&self, _: &str, _: &str) -> Result<Option<String>, StorageError> {
+                Ok(None)
+            }
+            fn set_password(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+            fn delete_password(&self, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+        }
+
+        fn find_text_rect_below(
+            shapes: &[egui::epaint::ClippedShape],
+            needle: &str,
+            min_y: f32,
+        ) -> Option<egui::Rect> {
+            fn visit(s: &egui::epaint::Shape, needle: &str, min_y: f32) -> Option<egui::Rect> {
+                match s {
+                    egui::epaint::Shape::Text(t) if t.galley.text().contains(needle) => {
+                        let r = t.galley.rect.translate(t.pos.to_vec2());
+                        (r.min.y >= min_y).then_some(r)
+                    }
+                    egui::epaint::Shape::Vec(v) => {
+                        v.iter().find_map(|item| visit(item, needle, min_y))
+                    }
+                    _ => None,
+                }
+            }
+            shapes.iter().find_map(|c| visit(&c.shape, needle, min_y))
+        }
+
+        let ctx = egui::Context::default();
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        ctx.set_repaint_observer({
+            let delays = Arc::clone(&delays);
+            move |info| delays.lock().unwrap().push(info.delay)
+        });
+
+        let store = NoopStore;
+        let mut state = AppState::new(
+            true,
+            Some("user@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            Vec::new(),
+        );
+        state.loading.visible = false;
+        state.window_visible = true;
+        state.info_toast = Some(StatusNotice {
+            text: "Đang dùng bản mới nhất v3.0.3".to_owned(),
+            level: NoticeLevel::Info,
+        });
+
+        let make_input = |time: f64, events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(super::WINDOW_WIDTH, super::WINDOW_HEIGHT),
+            )),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+
+        for t in [0.0_f64, 0.5_f64] {
+            let mut out = ctx.run_ui(make_input(t, vec![]), |ui| {
+                super::render_root(ui, &mut state, &store);
+            });
+            out.textures_delta.clear();
+        }
+
+        let mut open_out = ctx.run_ui(make_input(0.55, vec![]), |ui| {
+            super::render_root(ui, &mut state, &store);
+        });
+        open_out.textures_delta.clear();
+        let full_status_y = find_text_rect_below(&open_out.shapes, "KẾT NỐI CỦA BẠN", 0.0)
+            .expect("status heading open")
+            .min
+            .y;
+        let close_pos = find_text_rect_below(&open_out.shapes, "✕", 50.0)
+            .expect("toast close X button")
+            .center();
+
+        // Click toast close '✕': state becomes None immediately AND repaint(0) is requested on same frame
+        let _ = ctx.run_ui(
+            make_input(
+                0.60,
+                vec![
+                    egui::Event::PointerMoved(close_pos),
+                    egui::Event::PointerButton {
+                        pos: close_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            ),
+            |ui| {
+                super::render_root(ui, &mut state, &store);
+            },
+        );
+        let _ = ctx.run_ui(
+            make_input(
+                0.62,
+                vec![egui::Event::PointerButton {
+                    pos: close_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            ),
+            |ui| {
+                delays.lock().unwrap().clear();
+                super::render_root(ui, &mut state, &store);
+            },
+        );
+        assert!(state.info_toast.is_none(), "toast should dismiss on click");
+        assert!(
+            delays.lock().unwrap().contains(&Duration::ZERO),
+            "clicking toast close must request immediate repaint on click frame: {:?}",
+            *delays.lock().unwrap()
+        );
+
+        let mut mid_out = ctx.run_ui(make_input(0.69, vec![]), |ui| {
+            super::render_root(ui, &mut state, &store);
+        });
+        mid_out.textures_delta.clear();
+        let mid_status_y = find_text_rect_below(&mid_out.shapes, "KẾT NỐI CỦA BẠN", 0.0)
+            .expect("status heading mid exit")
+            .min
+            .y;
+
+        let mut done_out = ctx.run_ui(make_input(1.10, vec![]), |ui| {
+            super::render_root(ui, &mut state, &store);
+        });
+        done_out.textures_delta.clear();
+        let done_status_y = find_text_rect_below(&done_out.shapes, "KẾT NỐI CỦA BẠN", 0.0)
+            .expect("status heading post exit")
+            .min
+            .y;
+
+        assert!(
+            done_status_y < mid_status_y - 2.0 && mid_status_y < full_status_y - 2.0,
+            "toast height must collapse smoothly during exit: full={full_status_y}, mid={mid_status_y}, done={done_status_y}"
+        );
+    }
+
+    #[test]
+    fn test_dialog_close_click_requests_immediate_repaint_without_disabled_dim_snap() {
+        use crate::state::{ActiveDialog, AppState};
+        use freeton_core::storage::{ClientConfig, CredentialStore, StorageError};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        struct NoopStore;
+        impl CredentialStore for NoopStore {
+            fn get_password(&self, _: &str, _: &str) -> Result<Option<String>, StorageError> {
+                Ok(None)
+            }
+            fn set_password(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+            fn delete_password(&self, _: &str, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+        }
+
+        fn find_close_btn(shapes: &[egui::epaint::ClippedShape]) -> Option<egui::Pos2> {
+            fn visit(s: &egui::epaint::Shape) -> Option<egui::Pos2> {
+                match s {
+                    egui::epaint::Shape::Text(t) if t.galley.text() == "Đóng" => {
+                        Some(t.galley.rect.translate(t.pos.to_vec2()).center())
+                    }
+                    egui::epaint::Shape::Vec(v) => v.iter().find_map(visit),
+                    _ => None,
+                }
+            }
+            shapes.iter().find_map(|c| visit(&c.shape))
+        }
+
+        let ctx = egui::Context::default();
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        ctx.set_repaint_observer({
+            let delays = Arc::clone(&delays);
+            move |info| delays.lock().unwrap().push(info.delay)
+        });
+
+        let store = NoopStore;
+        let mut state = AppState::new(
+            true,
+            Some("user@proton.me".to_owned()),
+            ClientConfig::default(),
+            None,
+            Vec::new(),
+        );
+        state.window_visible = true;
+        state.open_about_dialog();
+
+        let make_input = |time: f64, events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(super::WINDOW_WIDTH, super::WINDOW_HEIGHT),
+            )),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+
+        for t in [0.0_f64, 0.5_f64] {
+            let mut out = ctx.run_ui(make_input(t, vec![]), |ui| {
+                super::render_root(ui, &mut state, &store);
+            });
+            out.textures_delta.clear();
+        }
+        let open_out = ctx.run_ui(make_input(0.55, vec![]), |ui| {
+            super::render_root(ui, &mut state, &store);
+        });
+        let close_btn = find_close_btn(&open_out.shapes).expect("About Đóng button");
+
+        let _ = ctx.run_ui(
+            make_input(
+                0.60,
+                vec![
+                    egui::Event::PointerMoved(close_btn),
+                    egui::Event::PointerButton {
+                        pos: close_btn,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            ),
+            |ui| {
+                super::render_root(ui, &mut state, &store);
+            },
+        );
+        let _ = ctx.run_ui(
+            make_input(
+                0.62,
+                vec![egui::Event::PointerButton {
+                    pos: close_btn,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            ),
+            |ui| {
+                delays.lock().unwrap().clear();
+                super::render_root(ui, &mut state, &store);
+            },
+        );
+        assert_eq!(state.active_dialog, ActiveDialog::None);
+        assert!(
+            delays.lock().unwrap().contains(&Duration::ZERO),
+            "closing dialog must request immediate repaint on click frame: {:?}",
+            *delays.lock().unwrap()
         );
     }
 }

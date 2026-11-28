@@ -167,37 +167,41 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
             ui.set_width(row_w);
             let gap_x = 10.0;
             let left_w = (row_w - top_toggle_w - gap_x).max(140.0);
-            ui.horizontal(|ui| {
+            ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
                 ui.spacing_mut().item_spacing.x = gap_x;
-                ui.allocate_ui_with_layout(
+                let left_resp = ui.allocate_ui_with_layout(
                     Vec2::new(left_w, 0.0),
                     Layout::top_down(Align::Min),
                     |ui| {
                         ui.set_width(left_w);
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            ui.label(
-                                RichText::new("KẾT NỐI CỦA BẠN")
-                                    .size(10.0)
-                                    .strong()
-                                    .color(C_TEXT_DIM),
-                            );
-                            let badge_style = PillStyle {
-                                bg: C_CARD_HIGH,
-                                fg: timer_color,
-                                border: timer_color,
-                                hover_bg: C_CARD_HIGH,
-                                hover_fg: timer_color,
-                                hover_border: timer_color,
-                                radius: 6,
-                                height: 18.0,
-                                font_size: 9.5,
-                                bold: true,
-                                pad_x: 6.0,
-                            };
-                            let _ = pill_button(ui, &badge_text, None, badge_style);
-                        });
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(left_w, 18.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.label(
+                                    RichText::new("KẾT NỐI CỦA BẠN")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(C_TEXT_DIM),
+                                );
+                                let badge_style = PillStyle {
+                                    bg: C_CARD_HIGH,
+                                    fg: timer_color,
+                                    border: timer_color,
+                                    hover_bg: C_CARD_HIGH,
+                                    hover_fg: timer_color,
+                                    hover_border: timer_color,
+                                    radius: 6,
+                                    height: 18.0,
+                                    font_size: 9.5,
+                                    bold: true,
+                                    pad_x: 6.0,
+                                };
+                                let _ = pill_button(ui, &badge_text, None, badge_style);
+                            },
+                        );
                         ui.add(
                             egui::Label::new(
                                 RichText::new(status_title)
@@ -218,8 +222,9 @@ pub fn render_home_view(ui: &mut Ui, state: &mut AppState, store: &dyn Credentia
                     },
                 );
 
+                let left_h = left_resp.response.rect.height();
                 ui.allocate_ui_with_layout(
-                    Vec2::new(ui.available_width().max(top_toggle_w), top_toggle_h),
+                    Vec2::new(ui.available_width().max(top_toggle_w), left_h.max(top_toggle_h)),
                     Layout::right_to_left(Align::Center),
                     |ui| {
                         if ios_toggle_switch(
@@ -1064,6 +1069,109 @@ mod tests {
                 .any(|d| *d == Duration::from_millis(33)),
             "visible animated globe should schedule a 33ms smooth repaint, got {:?}",
             *live_delays.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_top_status_card_has_symmetric_vertical_padding_and_centered_toggle() {
+        let store = NoopStore;
+        let ctx = egui::Context::default();
+        let mut state = AppState::new(
+            true,
+            Some("pishun@duck.com".to_owned()),
+            ClientConfig::default(),
+            None,
+            Vec::new(),
+        );
+        state.loading.visible = false;
+        state.window_visible = true;
+
+        let raw_input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(crate::ui::WINDOW_WIDTH, crate::ui::WINDOW_HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw_input, |ui| {
+            crate::ui::render_root(ui, &mut state, &store);
+        });
+        out.textures_delta.clear();
+
+        let mut status_card_rect: Option<Rect> = None;
+        let mut heading_rect: Option<Rect> = None;
+        let mut sub_rect: Option<Rect> = None;
+        let mut toggle_knob_center_y: Option<f32> = None;
+
+        fn scan(
+            s: &egui::epaint::Shape,
+            status_card_rect: &mut Option<Rect>,
+            heading_rect: &mut Option<Rect>,
+            sub_rect: &mut Option<Rect>,
+            toggle_knob_center_y: &mut Option<f32>,
+        ) {
+            match s {
+                egui::epaint::Shape::Rect(r) => {
+                    if r.fill == crate::ui::C_CARD
+                        && r.rect.width() > 330.0
+                        && r.rect.min.y > 40.0
+                        && r.rect.min.y < 120.0
+                    {
+                        *status_card_rect = Some(r.rect);
+                    }
+                }
+                egui::epaint::Shape::Text(t) => {
+                    let tr = t.galley.rect.translate(t.pos.to_vec2());
+                    if t.galley.text() == "KẾT NỐI CỦA BẠN" {
+                        *heading_rect = Some(tr);
+                    } else if t.galley.text().contains("Gạt công tắc") {
+                        *sub_rect = Some(tr);
+                    }
+                }
+                egui::epaint::Shape::Circle(c) => {
+                    if c.fill == Color32::WHITE && c.radius > 12.0 && c.center.y < 170.0 {
+                        *toggle_knob_center_y = Some(c.center.y);
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for item in v {
+                        scan(
+                            item,
+                            status_card_rect,
+                            heading_rect,
+                            sub_rect,
+                            toggle_knob_center_y,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        for c in &out.shapes {
+            scan(
+                &c.shape,
+                &mut status_card_rect,
+                &mut heading_rect,
+                &mut sub_rect,
+                &mut toggle_knob_center_y,
+            );
+        }
+
+        let card = status_card_rect.expect("status card rect");
+        let top_lbl = heading_rect.expect("heading rect");
+        let sub_lbl = sub_rect.expect("sub rect");
+        let knob_y = toggle_knob_center_y.expect("toggle knob circle");
+
+        let top_pad = top_lbl.min.y - card.min.y;
+        let bottom_pad = card.max.y - sub_lbl.max.y;
+        assert!(
+            (top_pad - bottom_pad).abs() <= 4.0,
+            "top status card vertical padding should be balanced (top={top_pad:.1}, bottom={bottom_pad:.1})"
+        );
+        assert!(
+            (knob_y - card.center().y).abs() <= 3.0,
+            "toggle switch should be vertically centered inside status card (knob_y={knob_y:.1}, card_cy={:.1})",
+            card.center().y
         );
     }
 }
